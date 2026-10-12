@@ -73,6 +73,7 @@ func (a *API) Routes() http.Handler {
 	route("POST /api/v1/agents/{id}/rotate", a.rotateAgent)
 	route("GET /api/v1/sessions", a.listSessions)
 	route("POST /api/v1/sessions", a.createSession)
+	route("GET /api/v1/sessions/{id}", a.getSession)
 	route("PATCH /api/v1/sessions/{id}", a.patchSession)
 	route("POST /api/v1/sessions/{id}/join", a.joinSession)
 	route("GET /api/v1/sessions/{id}/messages", a.sessionMessages)
@@ -378,6 +379,31 @@ func (a *API) createSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, sess)
 }
 
+func (a *API) getSession(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("id")
+	if _, ok := a.requireAuth(w, r); !ok {
+		return
+	}
+	sess, err := a.Store.GetSession(r.Context(), sid)
+	if err != nil {
+		a.writeStoreErr(w, err)
+		return
+	}
+	if !a.sessionReadAllowed(w, r, sid) {
+		return
+	}
+	participants, err := a.Store.Participants(r.Context(), sid)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store error")
+		return
+	}
+	out := make([]agentJSON, 0, len(participants))
+	for i := range participants {
+		out = append(out, toAgentJSON(&participants[i]))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"session": sess, "participants": out})
+}
+
 func (a *API) patchSession(w http.ResponseWriter, r *http.Request) {
 	ident, ok := a.requireAuth(w, r)
 	if !ok {
@@ -444,9 +470,23 @@ func (a *API) sessionMessages(w http.ResponseWriter, r *http.Request) {
 	if !a.sessionReadAllowed(w, r, sid) {
 		return
 	}
-	after := queryInt(r, "after", 0, 0, 1<<62)
-	limit := int(queryInt(r, "limit", 200, 1, 500))
-	msgs, err := a.Store.MessagesSince(r.Context(), "", sid, after, limit)
+	var msgs []store.Message
+	var err error
+	if raw := r.URL.Query().Get("latest"); raw != "" {
+		n, convErr := strconv.Atoi(raw)
+		if convErr != nil || n < 1 {
+			writeErr(w, http.StatusBadRequest, "latest must be a positive integer")
+			return
+		}
+		if n > 500 {
+			n = 500
+		}
+		msgs, err = a.Store.SessionLatestMessages(r.Context(), sid, n)
+	} else {
+		after := queryInt(r, "after", 0, 0, 1<<62)
+		limit := int(queryInt(r, "limit", 200, 1, 500))
+		msgs, err = a.Store.MessagesSince(r.Context(), "", sid, after, limit)
+	}
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "store error")
 		return
@@ -602,14 +642,17 @@ func (a *API) putContextItem(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "not a participant")
 		return
 	}
-	item, err := a.Store.UpsertContext(r.Context(), sid, key, req.Value, agent.ID)
+	item, notifySeq, err := a.Store.UpsertContext(r.Context(), sid, key, req.Value, agent.ID)
 	if err != nil {
 		a.writeStoreErr(w, err)
 		return
 	}
 	a.notifySession(r.Context(), sid)
 	a.Metrics.ContextUpdates.Add(1)
-	writeJSON(w, http.StatusOK, item)
+	writeJSON(w, http.StatusOK, struct {
+		store.ContextItem
+		NotifySeq int64 `json:"notify_seq"`
+	}{ContextItem: *item, NotifySeq: notifySeq})
 }
 
 func (a *API) catchupMessages(w http.ResponseWriter, r *http.Request) {

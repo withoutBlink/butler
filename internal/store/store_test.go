@@ -242,11 +242,11 @@ func TestContext(t *testing.T) {
 	if _, err := s.CreateSession(ctx, "s1", "one", "a", nil); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if _, err := s.UpsertContext(ctx, "s1", "k", "v1", "a"); err != nil {
-		t.Fatalf("upsert: %v", err)
+	if _, seq, err := s.UpsertContext(ctx, "s1", "k", "v1", "a"); err != nil || seq != 1 {
+		t.Fatalf("upsert: seq=%d err=%v", seq, err)
 	}
-	if _, err := s.UpsertContext(ctx, "s1", "k", "v2", "a"); err != nil {
-		t.Fatalf("upsert2: %v", err)
+	if _, seq, err := s.UpsertContext(ctx, "s1", "k", "v2", "a"); err != nil || seq != 2 {
+		t.Fatalf("upsert2: seq=%d err=%v", seq, err)
 	}
 	item, err := s.GetContextItem(ctx, "s1", "k")
 	if err != nil || item.Value != "v2" {

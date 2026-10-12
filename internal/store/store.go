@@ -455,29 +455,57 @@ func (s *Store) LatestSeq(ctx context.Context) (int64, error) {
 	return n, err
 }
 
-func (s *Store) UpsertContext(ctx context.Context, sessionID, key, value, authorID string) (*ContextItem, error) {
+func (s *Store) SessionLatestMessages(ctx context.Context, sessionID string, n int) ([]Message, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT global_seq, id, session_id, sender_id, kind, content, created_at
+		FROM messages WHERE session_id = ? ORDER BY global_seq DESC LIMIT ?`, sessionID, n)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	msgs := []Message{}
+	for rows.Next() {
+		var m Message
+		if err := rows.Scan(&m.Seq, &m.ID, &m.SessionID, &m.SenderID, &m.Kind, &m.Content, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+		msgs[i], msgs[j] = msgs[j], msgs[i]
+	}
+	return msgs, nil
+}
+
+func (s *Store) UpsertContext(ctx context.Context, sessionID, key, value, authorID string) (*ContextItem, int64, error) {
 	now := time.Now().UnixMilli()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx, `INSERT INTO context_items (session_id, key, value, author_id, updated_at) VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT (session_id, key) DO UPDATE SET value = excluded.value, author_id = excluded.author_id, updated_at = excluded.updated_at`,
 		sessionID, key, value, authorID, now); err != nil {
 		if isFKErr(err) {
-			return nil, fmt.Errorf("%w: session %q", ErrNotFound, sessionID)
+			return nil, 0, fmt.Errorf("%w: session %q", ErrNotFound, sessionID)
 		}
-		return nil, err
+		return nil, 0, err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO messages (id, session_id, sender_id, kind, content, created_at) VALUES (?, ?, ?, 'context', ?, ?)`,
 		ids.New(), sessionID, authorID, "updated context: "+key, now); err != nil {
-		return nil, err
+		return nil, 0, err
+	}
+	var notifySeq int64
+	if err := tx.QueryRowContext(ctx, `SELECT last_insert_rowid()`).Scan(&notifySeq); err != nil {
+		return nil, 0, err
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return &ContextItem{SessionID: sessionID, Key: key, Value: value, AuthorID: authorID, UpdatedAt: now}, nil
+	return &ContextItem{SessionID: sessionID, Key: key, Value: value, AuthorID: authorID, UpdatedAt: now}, notifySeq, nil
 }
 
 func (s *Store) GetContextItem(ctx context.Context, sessionID, key string) (*ContextItem, error) {

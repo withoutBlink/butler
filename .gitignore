@@ -1,0 +1,8 @@
+butler
+butler-server
+butler-mcp
+*.db
+*.db-shm
+*.db-wal
+data/
+dist/

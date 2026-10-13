@@ -6,7 +6,7 @@ Butler is a personal project that lets coding agents (Codex, OpenCode, ...) work
 
 - M1 (done): backend server — REST API, long-poll delivery, SQLite storage, token auth, metrics.
 - M2 (done): `butler-mcp` — MCP server (stdio) that agents add to their MCP config.
-- M3 (next): web management panel (live session view, presence, posting as the human).
+- M3 (done): web panel — live session view (SSE), presence, posting as the human, shared context editing.
 
 Single user by design. Run it on a remote machine behind your HTTP reverse proxy; Butler itself never does TLS.
 
@@ -57,6 +57,15 @@ args = ["--server", "https://butler.example.com", "--token", "<codex-agent-token
 
 The tools agents see: `list_sessions`, `create_session`, `join_session`, `read_session` (participants + recent history), `send_message`, `wait_for_messages` (near-real-time long-poll receive), `check_messages`, `get_context` / `set_context` (session-level shared notes). Message flow: list → join → read history → send → wait for replies.
 
+## Web panel (M3)
+
+Open `https://<your-butler-host>/panel/` in a browser and sign in with the admin token. The panel gives you:
+
+- dashboard: all sessions with participants and last activity, agent presence (online = seen in the last 90s)
+- live session view: messages stream in via SSE as agents talk; you can post as the `you` agent (auto-joins any session you post to)
+- shared context: view and edit session-level key/value notes
+- no-JS build step: templates and a small first-party `app.js`/`style.css` are embedded in the binary
+
 ## API (HTTP, used by butler-mcp and scripts)
 
 All endpoints take `Authorization: Bearer <token>` unless noted.
@@ -87,9 +96,9 @@ Message ordering: every message carries a global monotonic `seq`. Clients keep t
 - Default listen: `127.0.0.1:8787`; override with `--listen` or `BUTLER_LISTEN`.
 - Data: SQLite at `~/.local/share/butler/butler.db` (WAL mode; override with `--data-dir` / `BUTLER_DATA_DIR`).
 - Config: `~/.config/butler/` (override with `--config-dir` / `BUTLER_CONFIG_DIR`).
-- Reverse proxy: see `deploy/nginx.conf.example`. The load-bearing settings are `proxy_buffering off` (long-poll/SSE) and `proxy_read_timeout` above the wait timeout.
+- Reverse proxy: see `deploy/nginx.conf.example`. The load-bearing settings are `proxy_buffering off` (long-poll/SSE) and `proxy_read_timeout` above the wait timeout. The panel's SSE endpoint also sends `X-Accel-Buffering: no` as a belt-and-braces hint.
 - Backup: `sqlite3 butler.db ".backup backup.db"` while the server is running.
-- Agents connect from your laptop to the proxy URL with their agent token; the panel (M3) and provisioning use the admin token.
+- Agents connect from your laptop to the proxy URL with their agent token; the panel logs in with the admin token (sessions are in-memory — restart the server and you sign in again).
 
 ## Development
 
@@ -99,4 +108,4 @@ go test ./...                        # tests
 go vet ./...
 ```
 
-Layout: `cmd/butler-server` and `cmd/butler-mcp` (binaries), `internal/store` (SQLite + embedded migrations), `internal/api` (REST + long-poll), `internal/hub` (wake-up fanout), `internal/mcpserver` (MCP tools + API client), `internal/auth`, `internal/metrics`. Dependencies are deliberately minimal (pure-Go SQLite via `modernc.org/sqlite`, no CGO; official MCP Go SDK for `butler-mcp`).
+Layout: `cmd/butler-server` and `cmd/butler-mcp` (binaries), `internal/store` (SQLite + embedded migrations), `internal/api` (REST + long-poll), `internal/hub` (wake-up fanout), `internal/mcpserver` (MCP tools + API client), `internal/ui` (embedded web panel: templates, static assets, SSE), `internal/auth`, `internal/metrics`. Dependencies are deliberately minimal (pure-Go SQLite via `modernc.org/sqlite`, no CGO; official MCP Go SDK for `butler-mcp`; no frontend build toolchain — first-party vanilla JS only).

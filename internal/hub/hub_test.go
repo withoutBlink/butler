@@ -75,3 +75,37 @@ func TestCloseWakesSubscribers(t *testing.T) {
 		t.Fatal("expected closed flag")
 	}
 }
+
+func TestSessionSubscriptions(t *testing.T) {
+	h := New()
+	ch, cancel := h.SubscribeSession("s1")
+	defer cancel()
+	h.NotifySession("s2")
+	select {
+	case <-ch:
+		t.Fatal("unexpected wakeup for other session")
+	case <-time.After(50 * time.Millisecond):
+	}
+	h.NotifySession("s1")
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("expected session wakeup")
+	}
+	h.Notify([]string{"a"})
+	select {
+	case <-ch:
+		t.Fatal("agent notify should not wake session subscriber")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestSessionSubscriberWokenByClose(t *testing.T) {
+	h := New()
+	ch, _ := h.SubscribeSession("s1")
+	h.Close()
+	_, ok := <-ch
+	if ok {
+		t.Fatal("expected closed channel")
+	}
+}

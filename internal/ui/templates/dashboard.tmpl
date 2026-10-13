@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Butler</title>
+<link rel="stylesheet" href="/panel/static/style.css">
+</head>
+<body>
+<header>
+<span class="brand">Butler</span>
+<nav>
+<a href="/panel/">Sessions</a>
+<form method="post" action="/panel/logout" class="inline"><button type="submit" class="link">Sign out</button></form>
+</nav>
+</header>
+<main class="dashboard">
+<section class="agents">
+<h2>Agents</h2>
+<ul>
+{{range .Agents}}<li class="{{if .Online}}p-online{{else}}p-offline{{end}}">{{.ID}} <small>({{.Kind}}, seen {{.LastTxt}})</small></li>
+{{else}}<li>none</li>{{end}}
+</ul>
+</section>
+<section class="sessions">
+<h2>Sessions</h2>
+<table>
+<tr><th>Title</th><th>Status</th><th>Participants</th><th>Last activity</th></tr>
+{{range .Sessions}}
+<tr>
+<td><a href="/panel/sessions/{{.Session.ID}}">{{.Session.Title}}</a>{{if .LastPreview}}<div class="preview">{{short .LastPreview}}</div>{{end}}</td>
+<td>{{.Session.Status}}</td>
+<td>{{range .Participants}}{{.ID}} {{end}}</td>
+<td>{{if .LastAt}}{{ts .LastAt}}{{else}}—{{end}}</td>
+</tr>
+{{else}}<tr><td colspan="4">no sessions yet</td></tr>{{end}}
+</table>
+</section>
+</main>
+</body>
+</html>

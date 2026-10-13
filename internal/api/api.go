@@ -17,6 +17,7 @@ import (
 	"butler/internal/ids"
 	"butler/internal/metrics"
 	"butler/internal/store"
+	"butler/internal/ui"
 )
 
 const (
@@ -55,6 +56,7 @@ type API struct {
 	Log        *slog.Logger
 	Metrics    *metrics.Metrics
 	Done       <-chan struct{}
+	Panel      *ui.Panel
 }
 
 type agentJSON struct {
@@ -88,6 +90,9 @@ func (a *API) Routes() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	if a.Panel != nil {
+		a.Panel.RegisterRoutes(mux)
+	}
 	return mux
 }
 
@@ -208,6 +213,7 @@ func (a *API) writeStoreErr(w http.ResponseWriter, err error) {
 }
 
 func (a *API) notifySession(ctx context.Context, sid string) {
+	a.Hub.NotifySession(sid)
 	participants, err := a.Store.Participants(ctx, sid)
 	if err != nil {
 		a.Log.Error("list participants", "err", err, "session", sid)

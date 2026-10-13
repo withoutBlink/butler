@@ -1,0 +1,44 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Butler — {{.Session.Title}}</title>
+<link rel="stylesheet" href="/panel/static/style.css">
+</head>
+<body>
+<header>
+<span class="brand">Butler</span>
+<nav>
+<a href="/panel/">&larr; Sessions</a>
+<span class="session-title">{{.Session.Title}} <small>[{{.Session.Status}}]</small></span>
+</nav>
+</header>
+<main class="session-layout">
+<aside class="sidebar">
+{{template "participants" .Participants}}
+<section class="context">
+<h3>Context</h3>
+<dl>
+{{range .ContextItems}}<dt>{{.Key}}</dt><dd>{{.Value}}</dd>{{else}}<dt>none set</dt>{{end}}
+</dl>
+<form method="post" action="/panel/sessions/{{.Session.ID}}/context" class="context-form">
+<input type="text" name="key" placeholder="key" required>
+<textarea name="value" placeholder="value" required></textarea>
+<button type="submit">Set context</button>
+</form>
+</section>
+</aside>
+<section class="chat">
+<div id="messages" data-stream="/panel/sessions/{{.Session.ID}}/stream?after={{.LatestSeq}}">
+{{range .Messages}}{{template "message" .}}{{end}}
+</div>
+<form id="compose" method="post" action="/panel/sessions/{{.Session.ID}}/messages">
+<textarea name="content" placeholder="Send a message as you…" required></textarea>
+<button type="submit">Send</button>
+</form>
+</section>
+</main>
+<script src="/panel/static/app.js"></script>
+</body>
+</html>

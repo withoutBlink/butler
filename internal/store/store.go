@@ -335,9 +335,10 @@ func (s *Store) SessionsForAgent(ctx context.Context, agentID string) ([]string,
 	return sids, rows.Err()
 }
 
-// UniqueAgentName derives a short but recognizable slug from the agent kind,
-// the hostname and the basename of the working directory — e.g.
-// "opencode-t3mcenter-arm-butler" — appending a counter suffix until it is
+// UniqueAgentName derives a short but recognizable name from the agent kind,
+// the hostname and the basename of the working directory, joined by ":" so
+// the three parts stay visually distinct — e.g.
+// "opencode:t3mcenter-arm:butler" — appending a counter suffix until it is
 // unused. Parts are truncated (kind ≤16, hostname ≤20, dir ≤20, total ≤48)
 // so the name stays readable even for long hosts and paths.
 func (s *Store) UniqueAgentName(ctx context.Context, kind, hostname, workdir string) string {
@@ -352,12 +353,12 @@ func (s *Store) UniqueAgentName(ctx context.Context, kind, hostname, workdir str
 			kept = append(kept, p)
 		}
 	}
-	base := strings.Join(kept, "-")
+	base := strings.Join(kept, ":")
 	if base == "" {
 		base = "agent"
 	}
 	if len(base) > 48 {
-		base = strings.Trim(base[:48], "-")
+		base = strings.Trim(base[:48], "-:")
 	}
 	name := base
 	for i := 2; ; i++ {
@@ -367,7 +368,7 @@ func (s *Store) UniqueAgentName(ctx context.Context, kind, hostname, workdir str
 		suffix := fmt.Sprintf("-%d", i)
 		cand := base
 		if len(cand) > 48-len(suffix) {
-			cand = strings.Trim(cand[:48-len(suffix)], "-")
+			cand = strings.Trim(cand[:48-len(suffix)], "-:")
 		}
 		name = cand + suffix
 	}

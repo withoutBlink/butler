@@ -180,8 +180,8 @@ func TestUniqueAgentName(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
 
-	// kind + hostname + basename of the workdir; long host parts truncate.
-	if got := s.UniqueAgentName(ctx, "codex", "Andrews-MacBook-Pro.local", "/Users/andrew/work/butler"); got != "codex-andrews-macbook-pro-butler" {
+	// kind:hostname:basename, ":"-joined; long host parts truncate.
+	if got := s.UniqueAgentName(ctx, "codex", "Andrews-MacBook-Pro.local", "/Users/andrew/work/butler"); got != "codex:andrews-macbook-pro:butler" {
 		t.Fatalf("got %q", got)
 	}
 	first := s.UniqueAgentName(ctx, "codex", "host", "/tmp/proj")
@@ -189,11 +189,11 @@ func TestUniqueAgentName(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	// Different directory, same basename: distinct identity, suffixed name.
-	if got := s.UniqueAgentName(ctx, "codex", "host", "/other/proj"); got != "codex-host-proj-2" {
+	if got := s.UniqueAgentName(ctx, "codex", "host", "/other/proj"); got != "codex:host:proj-2" {
 		t.Fatalf("expected suffix, got %q", got)
 	}
 	// Different directories on one host get distinct names, no suffix needed.
-	if got := s.UniqueAgentName(ctx, "codex", "host", "/tmp/other"); got != "codex-host-other" {
+	if got := s.UniqueAgentName(ctx, "codex", "host", "/tmp/other"); got != "codex:host:other" {
 		t.Fatalf("got %q", got)
 	}
 	// Long parts are truncated to a total cap.

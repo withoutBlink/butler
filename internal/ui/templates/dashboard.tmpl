@@ -15,22 +15,6 @@
 </nav>
 </header>
 <main class="dashboard">
-<section class="agents">
-<h2>Agents</h2>
-<table>
-<tr><th></th><th>Name</th><th>Kind</th><th>Host</th><th>Working directory</th><th>Seen</th></tr>
-{{range .Agents}}
-<tr>
-<td><span class="dot{{if .Online}} on{{end}}"></span></td>
-<td>{{.ID}}</td>
-<td>{{.Kind}}</td>
-<td>{{if .Hostname}}{{.Hostname}}{{else}}—{{end}}</td>
-<td title="{{.Workdir}}">{{if .Workdir}}{{path .Workdir}}{{else}}—{{end}}</td>
-<td>{{.LastTxt}}</td>
-</tr>
-{{else}}<tr><td colspan="6">none</td></tr>{{end}}
-</table>
-</section>
 <section class="sessions">
 <h2>Sessions</h2>
 <table>
@@ -39,10 +23,25 @@
 <tr>
 <td><a href="/panel/sessions/{{.Session.ID}}">{{.Session.Title}}</a>{{if .LastPreview}}<div class="preview">{{short .LastPreview}}</div>{{end}}</td>
 <td>{{.Session.Status}}</td>
-<td>{{range .Participants}}{{.ID}} {{end}}</td>
+<td>{{range $i, $p := .Participants}}{{if $i}}, {{end}}<span class="id">{{$p.ID}}</span>{{end}}</td>
 <td>{{if .LastAt}}{{ts .LastAt}}{{else}}—{{end}}</td>
 </tr>
 {{else}}<tr><td colspan="4">no sessions yet</td></tr>{{end}}
+</table>
+</section>
+<section class="agents">
+<h2>Agents</h2>
+<table>
+<tr><th></th><th>Name</th><th>Host</th><th>Working directory</th><th>Seen</th></tr>
+{{range .Agents}}
+<tr>
+<td><span class="dot{{if .Online}} on{{end}}"></span></td>
+<td class="id">{{.ID}}</td>
+<td>{{if .Hostname}}{{.Hostname}}{{else}}—{{end}}</td>
+<td class="id" title="{{.Workdir}}">{{if .Workdir}}{{path .Workdir}}{{else}}—{{end}}</td>
+<td>{{.LastTxt}}</td>
+</tr>
+{{else}}<tr><td colspan="5">none</td></tr>{{end}}
 </table>
 </section>
 </main>

@@ -132,7 +132,7 @@ func TestClientRegister(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 	c1.SetToken(reg1.Token)
-	if reg1.Name != "codex-myhost-proj" || reg1.Kind != "codex" || reg1.Hostname != "myhost" || reg1.Workdir != "/tmp/proj" {
+	if reg1.Name != "codex:myhost:proj" || reg1.Kind != "codex" || reg1.Hostname != "myhost" || reg1.Workdir != "/tmp/proj" {
 		t.Fatalf("bad register result: %+v", reg1)
 	}
 	if reg1.Replaced {
@@ -201,7 +201,7 @@ func TestClientRegister(t *testing.T) {
 func TestToolE2E(t *testing.T) {
 	backend, _, kinds := newButlerBackend(t)
 	alpha, alphaName := connectMCPClient(t, backend.URL, kinds["codex"], "alpha", "/tmp/proj")
-	if alphaName != "codex-alpha-proj" {
+	if alphaName != "codex:alpha:proj" {
 		t.Fatalf("unexpected agent name %q", alphaName)
 	}
 
@@ -268,7 +268,7 @@ func TestToolE2E(t *testing.T) {
 	}
 
 	out, isErr = callTool(t, alpha, "wait_for_messages", map[string]any{"timeout_seconds": 5})
-	if isErr || !strings.Contains(out, "opencode-beta-proj: hi alpha, beta here") {
+	if isErr || !strings.Contains(out, "opencode:beta:proj: hi alpha, beta here") {
 		t.Fatalf("wait after activity: %q isErr=%v", out, isErr)
 	}
 	if !strings.Contains(out, "system") {
@@ -281,8 +281,8 @@ func TestToolE2E(t *testing.T) {
 	}
 	for _, want := range []string{
 		"e2e test",
-		"codex-alpha-proj (codex@alpha)*",
-		"opencode-beta-proj (opencode@beta)*",
+		"codex:alpha:proj (codex@alpha)*",
+		"opencode:beta:proj (opencode@beta)*",
 		"hello from alpha",
 		"hi alpha, beta here",
 	} {
@@ -306,7 +306,7 @@ func TestToolE2E(t *testing.T) {
 	}
 
 	out, isErr = callTool(t, alpha, "list_sessions", nil)
-	if isErr || !strings.Contains(out, "e2e test") || !strings.Contains(out, "you are codex-alpha-proj") {
+	if isErr || !strings.Contains(out, "e2e test") || !strings.Contains(out, "you are codex:alpha:proj") {
 		t.Fatalf("list_sessions: %q isErr=%v", out, isErr)
 	}
 

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"butler/internal/api"
@@ -191,7 +192,7 @@ func kindCmd(args []string) {
 			os.Exit(2)
 		}
 		id := positional[0]
-		if !api.ValidAgentID(id) {
+		if !api.ValidKindID(id) {
 			fmt.Fprintf(os.Stderr, "error: invalid kind id %q (lowercase letters, digits, - and _; max 32 chars)\n", id)
 			os.Exit(1)
 		}
@@ -223,10 +224,12 @@ func kindCmd(args []string) {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("%-16s %-20s %s\n", "ID", "DISPLAY", "CREATED")
+		w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+		fmt.Fprintln(w, "ID\tDISPLAY\tCREATED")
 		for _, k := range kinds {
-			fmt.Printf("%-16s %-20s %s\n", k.ID, k.DisplayName, time.Unix(k.CreatedAt, 0).UTC().Format(time.RFC3339))
+			fmt.Fprintf(w, "%s\t%s\t%s\n", k.ID, k.DisplayName, time.Unix(k.CreatedAt, 0).UTC().Format(time.RFC3339))
 		}
+		w.Flush()
 	default:
 		kindUsage()
 		os.Exit(2)
@@ -258,14 +261,16 @@ func agentCmd(args []string) {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("%-24s %-10s %-18s %-30s %s\n", "NAME", "KIND", "HOST", "WORKDIR", "LAST_SEEN")
+		w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+		fmt.Fprintln(w, "NAME\tKIND\tHOST\tWORKDIR\tLAST_SEEN")
 		for _, a := range agents {
 			last := "never"
 			if a.LastSeenAt != nil {
 				last = time.Unix(*a.LastSeenAt, 0).UTC().Format(time.RFC3339)
 			}
-			fmt.Printf("%-24s %-10s %-18s %-30s %s\n", a.ID, a.Kind, a.Hostname, a.Workdir, last)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", a.ID, a.Kind, a.Hostname, a.Workdir, last)
 		}
+		w.Flush()
 	case "revoke":
 		if len(positional) == 0 {
 			agentUsage()

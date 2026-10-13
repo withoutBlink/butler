@@ -49,7 +49,7 @@
       var input = form.querySelector('textarea[name=content]');
       var content = (input.value || '').trim();
       if (!content) return;
-      fetch(form.action, { method: 'POST', body: new FormData(form), credentials: 'same-origin' })
+      fetch(form.action, { method: 'POST', body: new URLSearchParams({ content: content }), credentials: 'same-origin' })
         .then(function (res) {
           if (!res.ok) throw new Error('send failed: ' + res.status);
           return res.text();

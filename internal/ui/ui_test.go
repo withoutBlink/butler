@@ -2,9 +2,11 @@ package ui_test
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -334,6 +336,62 @@ func readSSE(t *testing.T, r io.Reader, timeout time.Duration) []sseEvent {
 		return evs
 	case <-time.After(timeout + 500*time.Millisecond):
 		return events
+	}
+}
+
+// TestPanelPostMessageMultipart reproduces the browser's fetch(new FormData)
+// request: multipart/form-data bodies must reach PostFormValue too. Plain
+// r.ParseForm silently ignores them, which made the compose Send button fail
+// with "content is required" while urlencoded tests kept passing.
+func TestPanelPostMessageMultipart(t *testing.T) {
+	srv, st, _, adminTok := newPanel(t)
+	ctx := context.Background()
+	if _, err := st.CreateAgent(ctx, "alpha", "alpha", "codex", "alpha-host", "/tmp/proj"); err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+	if _, err := st.CreateSession(ctx, "s1", "multipart post", "alpha", nil); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	client := newBrowser(t)
+	login(t, client, srv.URL, adminTok)
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	if err := mw.WriteField("content", "sent via multipart"); err != nil {
+		t.Fatalf("write field: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	req, err := http.NewRequest("POST", srv.URL+"/panel/sessions/s1/messages", &buf)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("multipart post: %d %s", resp.StatusCode, string(body))
+	}
+	if !strings.Contains(string(body), "sent via multipart") || !strings.Contains(string(body), "you") {
+		t.Fatalf("fragment missing content: %s", string(body))
+	}
+	msgs, err := st.SessionLatestMessages(ctx, "s1", 10)
+	if err != nil {
+		t.Fatalf("latest messages: %v", err)
+	}
+	var found bool
+	for _, m := range msgs {
+		if m.SenderID == "you" && m.Content == "sent via multipart" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("message not stored: %+v", msgs)
 	}
 }
 

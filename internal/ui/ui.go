@@ -300,7 +300,7 @@ func (p *Panel) postMessage(w http.ResponseWriter, r *http.Request) {
 	sid := r.PathValue("id")
 	ctx := r.Context()
 	r.Body = http.MaxBytesReader(w, r.Body, maxPostBytes+1024)
-	if err := r.ParseForm(); err != nil {
+	if err := parsePanelForm(r); err != nil {
 		http.Error(w, "bad form", http.StatusBadRequest)
 		return
 	}
@@ -356,7 +356,7 @@ func (p *Panel) putContext(w http.ResponseWriter, r *http.Request) {
 	sid := r.PathValue("id")
 	ctx := r.Context()
 	r.Body = http.MaxBytesReader(w, r.Body, maxPostBytes+1024)
-	if err := r.ParseForm(); err != nil {
+	if err := parsePanelForm(r); err != nil {
 		http.Error(w, "bad form", http.StatusBadRequest)
 		return
 	}
@@ -538,6 +538,16 @@ func sameOrigin(r *http.Request) bool {
 		return false
 	}
 	return u.Host == r.Host
+}
+
+// parsePanelForm fills r.PostForm for both application/x-www-form-urlencoded
+// (plain form posts) and multipart/form-data (fetch with FormData) bodies.
+// r.ParseForm alone silently ignores multipart bodies, yielding an empty form.
+func parsePanelForm(r *http.Request) error {
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+		return r.ParseMultipartForm(maxPostBytes + 1024)
+	}
+	return r.ParseForm()
 }
 
 func isHTTPS(r *http.Request) bool {

@@ -46,6 +46,7 @@ const (
 
 type Identity struct {
 	Agent *store.Agent
+	Kind  *store.Kind // kind token: only authorizes registration
 	Admin bool
 }
 
@@ -61,8 +62,7 @@ type API struct {
 
 type agentJSON struct {
 	store.Agent
-	Online bool   `json:"online"`
-	Token  string `json:"token,omitempty"`
+	Online bool `json:"online"`
 }
 
 func (a *API) Routes() http.Handler {
@@ -70,9 +70,12 @@ func (a *API) Routes() http.Handler {
 	route := func(pattern string, h http.HandlerFunc) {
 		mux.HandleFunc(pattern, a.wrap(h))
 	}
+	route("POST /api/v1/register", a.registerAgent)
+	route("GET /api/v1/kinds", a.listKinds)
+	route("POST /api/v1/kinds", a.createKind)
+	route("POST /api/v1/kinds/{id}/rotate", a.rotateKind)
 	route("GET /api/v1/agents", a.listAgents)
-	route("POST /api/v1/agents", a.createAgent)
-	route("POST /api/v1/agents/{id}/rotate", a.rotateAgent)
+	route("POST /api/v1/agents/{id}/revoke", a.revokeAgentTokens)
 	route("GET /api/v1/sessions", a.listSessions)
 	route("POST /api/v1/sessions", a.createSession)
 	route("GET /api/v1/sessions/{id}", a.getSession)
@@ -117,9 +120,13 @@ func (a *API) wrap(h http.HandlerFunc) http.HandlerFunc {
 			if ident.Agent != nil {
 				agentID = ident.Agent.ID
 			}
+			kindID := ""
+			if ident.Kind != nil {
+				kindID = ident.Kind.ID
+			}
 			a.Log.Info("http", "rid", rid, "method", r.Method, "path", r.URL.Path,
 				"status", lw.status, "dur", time.Since(start).Round(time.Millisecond),
-				"agent", agentID, "admin", ident.Admin)
+				"agent", agentID, "kind", kindID, "admin", ident.Admin)
 		}
 	}
 }
@@ -132,12 +139,15 @@ func (a *API) authenticate(r *http.Request) *http.Request {
 	if auth.Equal(tok, a.AdminToken) {
 		return r.WithContext(context.WithValue(r.Context(), identityKey, Identity{Admin: true}))
 	}
-	agent, err := a.Store.GetAgentByTokenHash(r.Context(), auth.Hash(tok))
-	if err != nil {
-		return r
+	hash := auth.Hash(tok)
+	if agent, err := a.Store.GetAgentByTokenHash(r.Context(), hash); err == nil {
+		a.Store.TouchAgent(r.Context(), agent.ID)
+		return r.WithContext(context.WithValue(r.Context(), identityKey, Identity{Agent: agent}))
 	}
-	a.Store.TouchAgent(r.Context(), agent.ID)
-	return r.WithContext(context.WithValue(r.Context(), identityKey, Identity{Agent: agent}))
+	if kind, err := a.Store.GetKindByTokenHash(r.Context(), hash); err == nil {
+		return r.WithContext(context.WithValue(r.Context(), identityKey, Identity{Kind: kind}))
+	}
+	return r
 }
 
 func identity(r *http.Request) (Identity, bool) {
@@ -151,6 +161,10 @@ func (a *API) requireAuth(w http.ResponseWriter, r *http.Request) (Identity, boo
 		writeErr(w, http.StatusUnauthorized, "missing or invalid token")
 		return Identity{}, false
 	}
+	if ident.Kind != nil {
+		writeErr(w, http.StatusForbidden, "kind tokens only authorize registration (POST /api/v1/register); use the instance token it returns")
+		return Identity{}, false
+	}
 	return ident, true
 }
 
@@ -161,6 +175,10 @@ func (a *API) requireAgent(w http.ResponseWriter, r *http.Request) *store.Agent 
 		return nil
 	}
 	if ident.Agent == nil {
+		if ident.Kind != nil {
+			writeErr(w, http.StatusForbidden, "kind tokens only authorize registration (POST /api/v1/register); use the instance token it returns")
+			return nil
+		}
 		writeErr(w, http.StatusForbidden, "agent token required (admin token not accepted here)")
 		return nil
 	}
@@ -188,6 +206,10 @@ func (a *API) sessionReadAllowed(w http.ResponseWriter, r *http.Request, sid str
 	}
 	if ident.Admin {
 		return true
+	}
+	if ident.Agent == nil {
+		writeErr(w, http.StatusForbidden, "agent token required")
+		return false
 	}
 	okp, err := a.Store.IsParticipant(r.Context(), sid, ident.Agent.ID)
 	if err != nil {
@@ -261,50 +283,190 @@ func (a *API) listAgents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"agents": out})
 }
 
-func (a *API) createAgent(w http.ResponseWriter, r *http.Request) {
+// registerAgent exchanges a kind token plus hostname/workdir for a stable
+// agent identity (name) and a fresh instance token. The same registration key
+// (kind, hostname, workdir) always maps to the same name; registering again
+// REPLACES the previous instance: its token is revoked (its process gets 401
+// on its next call) and the sessions it joined get a system message.
+func (a *API) registerAgent(w http.ResponseWriter, r *http.Request) {
+	ident, ok := identity(r)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "missing or invalid token")
+		return
+	}
+	if ident.Kind == nil {
+		writeErr(w, http.StatusForbidden, "kind token required: register with a kind token to obtain an instance identity")
+		return
+	}
+	var req struct {
+		Hostname string `json:"hostname"`
+		Workdir  string `json:"workdir"`
+	}
+	if !decodeJSON(w, r, &req, 8<<10) {
+		return
+	}
+	hostname := strings.TrimSpace(req.Hostname)
+	workdir := strings.TrimSpace(req.Workdir)
+	if err := validateRegistration(hostname, workdir); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx := r.Context()
+	agent, err := a.Store.FindInstance(ctx, ident.Kind.ID, hostname, workdir)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		writeErr(w, http.StatusInternalServerError, "store error")
+		return
+	}
+	replaced := agent != nil
+	if agent == nil {
+		name := a.Store.UniqueAgentName(ctx, ident.Kind.ID, hostname, workdir)
+		agent, err = a.Store.CreateAgent(ctx, name, name, ident.Kind.ID, hostname, workdir)
+		if err != nil {
+			a.writeStoreErr(w, err)
+			return
+		}
+	}
+	tok := auth.NewToken()
+	if err := a.Store.ReplaceAgentToken(ctx, agent.ID, auth.Hash(tok)); err != nil {
+		a.writeStoreErr(w, err)
+		return
+	}
+	if replaced {
+		a.announceReplacement(ctx, agent.ID)
+		a.Log.Info("replaced agent instance", "kind", ident.Kind.ID, "name", agent.ID, "hostname", hostname, "workdir", workdir)
+	} else {
+		a.Log.Info("registered agent", "kind", ident.Kind.ID, "name", agent.ID, "hostname", hostname, "workdir", workdir)
+	}
+	a.Store.TouchAgent(ctx, agent.ID)
+	writeJSON(w, http.StatusCreated, struct {
+		Name     string `json:"name"`
+		Token    string `json:"token"`
+		Kind     string `json:"kind"`
+		Hostname string `json:"hostname"`
+		Workdir  string `json:"workdir"`
+		Replaced bool   `json:"replaced"`
+	}{Name: agent.ID, Token: tok, Kind: ident.Kind.ID, Hostname: agent.Hostname, Workdir: agent.Workdir, Replaced: replaced})
+}
+
+// announceReplacement posts a system message in every session the identity
+// participates in, so panels and waiting agents see that the previous
+// instance was kicked and this identity is now driven by a new process.
+func (a *API) announceReplacement(ctx context.Context, name string) {
+	sids, err := a.Store.SessionsForAgent(ctx, name)
+	if err != nil {
+		a.Log.Error("list sessions for agent", "err", err, "agent", name)
+		return
+	}
+	content := name + " reconnected (previous instance replaced)"
+	for _, sid := range sids {
+		if _, err := a.Store.InsertMessage(ctx, &store.Message{
+			ID: ids.New(), SessionID: sid, SenderID: name, Kind: "system", Content: content,
+		}); err != nil {
+			a.Log.Error("announce replacement", "err", err, "session", sid)
+			continue
+		}
+		a.notifySession(ctx, sid)
+	}
+}
+
+func validateRegistration(hostname, workdir string) error {
+	if hostname == "" {
+		return errors.New("hostname is required")
+	}
+	if len(hostname) > 253 {
+		return errors.New("hostname exceeds 253 characters")
+	}
+	if workdir == "" {
+		return errors.New("workdir is required")
+	}
+	if len(workdir) > 512 {
+		return errors.New("workdir exceeds 512 characters")
+	}
+	for _, s := range [2]string{hostname, workdir} {
+		for _, r := range s {
+			if r < 0x20 || r == 0x7f {
+				return errors.New("hostname and workdir must not contain control characters")
+			}
+		}
+	}
+	return nil
+}
+
+func (a *API) createKind(w http.ResponseWriter, r *http.Request) {
 	if !a.requireAdmin(w, r) {
 		return
 	}
 	var req struct {
 		ID          string `json:"id"`
 		DisplayName string `json:"display_name"`
-		Kind        string `json:"kind"`
 	}
 	if !decodeJSON(w, r, &req, 64<<10) {
 		return
 	}
 	if !ValidAgentID(req.ID) {
-		writeErr(w, http.StatusBadRequest, "invalid agent id: lowercase letters, digits, - and _, max 32 chars, must start with letter/digit")
+		writeErr(w, http.StatusBadRequest, "invalid kind id: lowercase letters, digits, - and _, max 32 chars, must start with letter/digit")
 		return
 	}
 	display := strings.TrimSpace(req.DisplayName)
 	if display == "" {
 		display = req.ID
 	}
-	kind := strings.TrimSpace(req.Kind)
-	if kind == "" {
-		kind = "other"
-	}
 	tok := auth.NewToken()
-	agent, err := a.Store.CreateAgent(r.Context(), req.ID, display, kind, auth.Hash(tok))
+	kind, err := a.Store.CreateKind(r.Context(), req.ID, display, auth.Hash(tok))
 	if err != nil {
 		a.writeStoreErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, agentJSON{Agent: *agent, Online: true, Token: tok})
+	writeJSON(w, http.StatusCreated, struct {
+		store.Kind
+		Token string `json:"token"`
+	}{Kind: *kind, Token: tok})
 }
 
-func (a *API) rotateAgent(w http.ResponseWriter, r *http.Request) {
+func (a *API) listKinds(w http.ResponseWriter, r *http.Request) {
+	if _, ok := a.requireAuth(w, r); !ok {
+		return
+	}
+	kinds, err := a.Store.ListKinds(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store error")
+		return
+	}
+	if kinds == nil {
+		kinds = []store.Kind{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"kinds": kinds})
+}
+
+func (a *API) rotateKind(w http.ResponseWriter, r *http.Request) {
 	if !a.requireAdmin(w, r) {
 		return
 	}
 	id := r.PathValue("id")
 	tok := auth.NewToken()
-	if err := a.Store.RotateAgentToken(r.Context(), id, auth.Hash(tok)); err != nil {
+	if err := a.Store.RotateKindToken(r.Context(), id, auth.Hash(tok)); err != nil {
 		a.writeStoreErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"id": id, "token": tok})
+}
+
+// revokeAgentTokens invalidates every instance token of an agent, kicking all
+// of its live processes; they stay out until each re-registers.
+func (a *API) revokeAgentTokens(w http.ResponseWriter, r *http.Request) {
+	if !a.requireAdmin(w, r) {
+		return
+	}
+	id := r.PathValue("id")
+	if _, err := a.Store.GetAgent(r.Context(), id); err != nil {
+		a.writeStoreErr(w, err)
+		return
+	}
+	if err := a.Store.RevokeAgentTokens(r.Context(), id); err != nil {
+		writeErr(w, http.StatusInternalServerError, "store error")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": id, "revoked": true})
 }
 
 func (a *API) listSessions(w http.ResponseWriter, r *http.Request) {

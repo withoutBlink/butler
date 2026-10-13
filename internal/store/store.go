@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -30,12 +31,25 @@ type Store struct {
 	db *sql.DB
 }
 
+// Agent is a registered agent instance: a (kind, hostname, workdir) triple
+// identified by a server-generated name. Multiple instance tokens may be
+// active at once (one per registration).
 type Agent struct {
 	ID          string `json:"id"`
 	DisplayName string `json:"display_name"`
 	Kind        string `json:"kind"`
+	Hostname    string `json:"hostname"`
+	Workdir     string `json:"workdir"`
 	CreatedAt   int64  `json:"created_at"`
 	LastSeenAt  *int64 `json:"last_seen_at,omitempty"`
+}
+
+// Kind is an agent kind (codex, opencode, ...) with a single token shared by
+// all instances of that kind for registration.
+type Kind struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+	CreatedAt   int64  `json:"created_at"`
 }
 
 type Session struct {
@@ -169,30 +183,225 @@ func isFKErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "FOREIGN KEY constraint failed")
 }
 
-func (s *Store) CreateAgent(ctx context.Context, id, displayName, kind, tokenHash string) (*Agent, error) {
+// ---- kinds ----
+
+func (s *Store) CreateKind(ctx context.Context, id, displayName, tokenHash string) (*Kind, error) {
 	now := time.Now().Unix()
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO agents (id, display_name, kind, token_hash, created_at) VALUES (?, ?, ?, ?, ?)`,
-		id, displayName, kind, tokenHash, now); err != nil {
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO kinds (id, display_name, token_hash, created_at) VALUES (?, ?, ?, ?)`,
+		id, displayName, tokenHash, now); err != nil {
 		if isUniqueErr(err) {
-			return nil, fmt.Errorf("%w: agent %q", ErrConflict, id)
+			return nil, fmt.Errorf("%w: kind %q", ErrConflict, id)
 		}
 		return nil, err
 	}
-	return &Agent{ID: id, DisplayName: displayName, Kind: kind, CreatedAt: now}, nil
+	return &Kind{ID: id, DisplayName: displayName, CreatedAt: now}, nil
 }
 
-func (s *Store) GetAgent(ctx context.Context, id string) (*Agent, error) {
-	return scanAgent(s.db.QueryRowContext(ctx, `SELECT id, display_name, kind, created_at, last_seen_at FROM agents WHERE id = ?`, id))
+func (s *Store) GetKind(ctx context.Context, id string) (*Kind, error) {
+	var k Kind
+	err := s.db.QueryRowContext(ctx, `SELECT id, display_name, created_at FROM kinds WHERE id = ?`, id).
+		Scan(&k.ID, &k.DisplayName, &k.CreatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &k, nil
 }
 
+func (s *Store) GetKindByTokenHash(ctx context.Context, tokenHash string) (*Kind, error) {
+	var k Kind
+	err := s.db.QueryRowContext(ctx, `SELECT id, display_name, created_at FROM kinds WHERE token_hash = ?`, tokenHash).
+		Scan(&k.ID, &k.DisplayName, &k.CreatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &k, nil
+}
+
+func (s *Store) ListKinds(ctx context.Context) ([]Kind, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, display_name, created_at FROM kinds ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	kinds := []Kind{}
+	for rows.Next() {
+		var k Kind
+		if err := rows.Scan(&k.ID, &k.DisplayName, &k.CreatedAt); err != nil {
+			return nil, err
+		}
+		kinds = append(kinds, k)
+	}
+	return kinds, rows.Err()
+}
+
+func (s *Store) RotateKindToken(ctx context.Context, id, tokenHash string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE kinds SET token_hash = ? WHERE id = ?`, tokenHash, id)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ---- agent instances ----
+
+func (s *Store) CreateAgent(ctx context.Context, name, displayName, kind, hostname, workdir string) (*Agent, error) {
+	now := time.Now().Unix()
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO agents (id, display_name, kind, hostname, workdir, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		name, displayName, kind, hostname, workdir, now); err != nil {
+		if isUniqueErr(err) {
+			return nil, fmt.Errorf("%w: agent %q", ErrConflict, name)
+		}
+		return nil, err
+	}
+	return &Agent{ID: name, DisplayName: displayName, Kind: kind, Hostname: hostname, Workdir: workdir, CreatedAt: now}, nil
+}
+
+const agentCols = `id, display_name, kind, hostname, workdir, created_at, last_seen_at`
+
+func (s *Store) GetAgent(ctx context.Context, name string) (*Agent, error) {
+	return scanAgent(s.db.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id = ?`, name))
+}
+
+// GetAgentByTokenHash resolves an instance token to its agent.
 func (s *Store) GetAgentByTokenHash(ctx context.Context, tokenHash string) (*Agent, error) {
-	return scanAgent(s.db.QueryRowContext(ctx, `SELECT id, display_name, kind, created_at, last_seen_at FROM agents WHERE token_hash = ?`, tokenHash))
+	return scanAgent(s.db.QueryRowContext(ctx, `SELECT a.id, a.display_name, a.kind, a.hostname, a.workdir, a.created_at, a.last_seen_at
+		FROM agents a JOIN agent_tokens t ON t.agent_id = a.id WHERE t.token_hash = ?`, tokenHash))
+}
+
+// FindInstance returns the agent registered for (kind, hostname, workdir), if any.
+func (s *Store) FindInstance(ctx context.Context, kind, hostname, workdir string) (*Agent, error) {
+	return scanAgent(s.db.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE kind = ? AND hostname = ? AND workdir = ?`,
+		kind, hostname, workdir))
+}
+
+// ReplaceAgentToken revokes every instance token of an agent and issues a
+// single new one. Registering again with the same identity replaces the
+// previous instance: its token stops authenticating on its next call. One
+// live instance per identity; the last registration wins.
+func (s *Store) ReplaceAgentToken(ctx context.Context, agentID, tokenHash string) error {
+	now := time.Now().Unix()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM agent_tokens WHERE agent_id = ?`, agentID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO agent_tokens (token_hash, agent_id, created_at) VALUES (?, ?, ?)`,
+		tokenHash, agentID, now); err != nil {
+		if isFKErr(err) {
+			return fmt.Errorf("%w: agent %q", ErrNotFound, agentID)
+		}
+		return err
+	}
+	return tx.Commit()
+}
+
+// RevokeAgentTokens invalidates all instance tokens of an agent.
+func (s *Store) RevokeAgentTokens(ctx context.Context, agentID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM agent_tokens WHERE agent_id = ?`, agentID)
+	return err
+}
+
+// SessionsForAgent lists the ids of the sessions the agent participates in.
+func (s *Store) SessionsForAgent(ctx context.Context, agentID string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT session_id FROM participants WHERE agent_id = ? ORDER BY session_id`, agentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	sids := []string{}
+	for rows.Next() {
+		var sid string
+		if err := rows.Scan(&sid); err != nil {
+			return nil, err
+		}
+		sids = append(sids, sid)
+	}
+	return sids, rows.Err()
+}
+
+// UniqueAgentName derives a short but recognizable slug from the agent kind,
+// the hostname and the basename of the working directory — e.g.
+// "opencode-t3mcenter-arm-butler" — appending a counter suffix until it is
+// unused. Parts are truncated (kind ≤16, hostname ≤20, dir ≤20, total ≤48)
+// so the name stays readable even for long hosts and paths.
+func (s *Store) UniqueAgentName(ctx context.Context, kind, hostname, workdir string) string {
+	parts := []string{
+		truncateSlug(sanitizeName(kind), 16),
+		truncateSlug(sanitizeName(hostname), 20),
+		truncateSlug(sanitizeName(path.Base(workdir)), 20),
+	}
+	var kept []string
+	for _, p := range parts {
+		if p != "" {
+			kept = append(kept, p)
+		}
+	}
+	base := strings.Join(kept, "-")
+	if base == "" {
+		base = "agent"
+	}
+	if len(base) > 48 {
+		base = strings.Trim(base[:48], "-")
+	}
+	name := base
+	for i := 2; ; i++ {
+		if _, err := s.GetAgent(ctx, name); errors.Is(err, ErrNotFound) {
+			return name
+		}
+		suffix := fmt.Sprintf("-%d", i)
+		cand := base
+		if len(cand) > 48-len(suffix) {
+			cand = strings.Trim(cand[:48-len(suffix)], "-")
+		}
+		name = cand + suffix
+	}
+}
+
+func truncateSlug(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return strings.Trim(s[:n], "-")
+}
+
+func sanitizeName(s string) string {
+	var b strings.Builder
+	lastDash := true // suppress leading dash
+	for _, r := range strings.ToLower(s) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			lastDash = false
+		default:
+			if !lastDash {
+				b.WriteByte('-')
+				lastDash = true
+			}
+		}
+	}
+	return strings.Trim(b.String(), "-")
 }
 
 func scanAgent(row *sql.Row) (*Agent, error) {
 	var a Agent
 	var lastSeen sql.NullInt64
-	if err := row.Scan(&a.ID, &a.DisplayName, &a.Kind, &a.CreatedAt, &lastSeen); err != nil {
+	if err := row.Scan(&a.ID, &a.DisplayName, &a.Kind, &a.Hostname, &a.Workdir, &a.CreatedAt, &lastSeen); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -205,8 +414,8 @@ func scanAgent(row *sql.Row) (*Agent, error) {
 	return &a, nil
 }
 
-func (s *Store) ListAgents(ctx context.Context) ([]Agent, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, display_name, kind, created_at, last_seen_at FROM agents ORDER BY id`)
+func (s *Store) queryAgents(ctx context.Context, q string, args ...any) ([]Agent, error) {
+	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +424,7 @@ func (s *Store) ListAgents(ctx context.Context) ([]Agent, error) {
 	for rows.Next() {
 		var a Agent
 		var lastSeen sql.NullInt64
-		if err := rows.Scan(&a.ID, &a.DisplayName, &a.Kind, &a.CreatedAt, &lastSeen); err != nil {
+		if err := rows.Scan(&a.ID, &a.DisplayName, &a.Kind, &a.Hostname, &a.Workdir, &a.CreatedAt, &lastSeen); err != nil {
 			return nil, err
 		}
 		if lastSeen.Valid {
@@ -227,19 +436,8 @@ func (s *Store) ListAgents(ctx context.Context) ([]Agent, error) {
 	return agents, rows.Err()
 }
 
-func (s *Store) RotateAgentToken(ctx context.Context, id, tokenHash string) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE agents SET token_hash = ? WHERE id = ?`, tokenHash, id)
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
+func (s *Store) ListAgents(ctx context.Context) ([]Agent, error) {
+	return s.queryAgents(ctx, `SELECT `+agentCols+` FROM agents ORDER BY id`)
 }
 
 func (s *Store) TouchAgent(ctx context.Context, id string) {
@@ -367,27 +565,9 @@ func (s *Store) IsParticipant(ctx context.Context, sessionID, agentID string) (b
 }
 
 func (s *Store) Participants(ctx context.Context, sessionID string) ([]Agent, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT a.id, a.display_name, a.kind, a.created_at, a.last_seen_at
+	return s.queryAgents(ctx, `SELECT `+agentCols+`
 		FROM agents a JOIN participants p ON p.agent_id = a.id
 		WHERE p.session_id = ? ORDER BY a.id`, sessionID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	agents := []Agent{}
-	for rows.Next() {
-		var a Agent
-		var lastSeen sql.NullInt64
-		if err := rows.Scan(&a.ID, &a.DisplayName, &a.Kind, &a.CreatedAt, &lastSeen); err != nil {
-			return nil, err
-		}
-		if lastSeen.Valid {
-			v := lastSeen.Int64
-			a.LastSeenAt = &v
-		}
-		agents = append(agents, a)
-	}
-	return agents, rows.Err()
 }
 
 func (s *Store) InsertMessage(ctx context.Context, m *Message) (*Message, error) {

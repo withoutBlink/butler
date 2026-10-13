@@ -22,6 +22,8 @@ import (
 	"butler/internal/store"
 )
 
+// newButlerBackend boots the API with codex/opencode kinds; the returned map
+// holds the single kind token of each.
 func newButlerBackend(t *testing.T) (*httptest.Server, string, map[string]string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -42,27 +44,50 @@ func newButlerBackend(t *testing.T) (*httptest.Server, string, map[string]string
 		Metrics:    &metrics.Metrics{},
 		Done:       done,
 	}
-	tokens := map[string]string{}
-	for _, id := range []string{"alpha", "beta"} {
+	kinds := map[string]string{}
+	for _, id := range []string{"codex", "opencode"} {
 		tok := auth.NewToken()
-		if _, err := st.CreateAgent(context.Background(), id, id, "test", auth.Hash(tok)); err != nil {
-			t.Fatalf("create agent %s: %v", id, err)
+		if _, err := st.CreateKind(context.Background(), id, id, auth.Hash(tok)); err != nil {
+			t.Fatalf("create kind %s: %v", id, err)
 		}
-		tokens[id] = tok
+		kinds[id] = tok
 	}
 	srv := httptest.NewServer(a.Routes())
 	t.Cleanup(srv.Close)
-	return srv, "test-admin-token", tokens
+	return srv, "test-admin-token", kinds
 }
 
-func connectMCPClient(t *testing.T, backendURL, token string) *mcp.ClientSession {
+// registerInstance exchanges a kind token for an instance token on a fresh
+// client, exactly like cmd/butler-mcp does at startup.
+func registerInstance(t *testing.T, backendURL, kindToken, hostname, workdir string) *mcpserver.Client {
 	t.Helper()
-	client, err := mcpserver.NewClient(backendURL, token)
+	client, err := mcpserver.NewClient(backendURL, kindToken)
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
+	reg, err := client.Register(context.Background(), hostname, workdir)
+	if err != nil {
+		t.Fatalf("register %s: %v", hostname, err)
+	}
+	client.SetToken(reg.Token)
+	return client
+}
+
+// connectMCPClient registers an instance and returns a connected MCP session
+// plus the server-generated agent name.
+func connectMCPClient(t *testing.T, backendURL, kindToken, hostname, workdir string) (*mcp.ClientSession, string) {
+	t.Helper()
+	client, err := mcpserver.NewClient(backendURL, kindToken)
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	reg, err := client.Register(context.Background(), hostname, workdir)
+	if err != nil {
+		t.Fatalf("register %s: %v", hostname, err)
+	}
+	client.SetToken(reg.Token)
 	server := mcp.NewServer(&mcp.Implementation{Name: "butler", Version: "test"}, nil)
-	mcpserver.RegisterTools(server, mcpserver.New(client))
+	mcpserver.RegisterTools(server, mcpserver.New(client, reg.Name))
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
 	mcpClient := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v0"}, nil)
 	go func() {
@@ -73,7 +98,7 @@ func connectMCPClient(t *testing.T, backendURL, token string) *mcp.ClientSession
 		t.Fatalf("connect: %v", err)
 	}
 	t.Cleanup(func() { session.Close() })
-	return session
+	return session, reg.Name
 }
 
 func callTool(t *testing.T, session *mcp.ClientSession, name string, args map[string]any) (string, bool) {
@@ -94,9 +119,91 @@ func callTool(t *testing.T, session *mcp.ClientSession, name string, args map[st
 	return b.String(), res.IsError
 }
 
+func TestClientRegister(t *testing.T) {
+	backend, _, kinds := newButlerBackend(t)
+	ctx := context.Background()
+
+	c1, err := mcpserver.NewClient(backend.URL, kinds["codex"])
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	reg1, err := c1.Register(ctx, "myhost", "/tmp/proj")
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	c1.SetToken(reg1.Token)
+	if reg1.Name != "codex-myhost-proj" || reg1.Kind != "codex" || reg1.Hostname != "myhost" || reg1.Workdir != "/tmp/proj" {
+		t.Fatalf("bad register result: %+v", reg1)
+	}
+	if reg1.Replaced {
+		t.Fatal("first registration should not replace anything")
+	}
+
+	// Same registration key: same name, a fresh token — and the previous
+	// instance is replaced (its token stops authenticating).
+	c2, err := mcpserver.NewClient(backend.URL, kinds["codex"])
+	if err != nil {
+		t.Fatalf("new client 2: %v", err)
+	}
+	reg2, err := c2.Register(ctx, "myhost", "/tmp/proj")
+	if err != nil {
+		t.Fatalf("register 2: %v", err)
+	}
+	c2.SetToken(reg2.Token)
+	if reg2.Name != reg1.Name {
+		t.Fatalf("name should be stable: %q vs %q", reg2.Name, reg1.Name)
+	}
+	if reg2.Token == reg1.Token {
+		t.Fatal("each registration should mint a fresh instance token")
+	}
+	if !reg2.Replaced {
+		t.Fatal("re-registration should replace the previous instance")
+	}
+	_, err = c1.Sessions(ctx, false)
+	if err == nil {
+		t.Fatal("replaced instance token should be revoked")
+	}
+	var apiErr *mcpserver.Error
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != 401 {
+		t.Fatalf("expected 401 for replaced token, got %v", err)
+	}
+	if _, err := c2.Sessions(ctx, false); err != nil {
+		t.Fatalf("new instance token should authenticate: %v", err)
+	}
+
+	// A different workdir is a different identity.
+	c3, err := mcpserver.NewClient(backend.URL, kinds["codex"])
+	if err != nil {
+		t.Fatalf("new client 3: %v", err)
+	}
+	reg3, err := c3.Register(ctx, "myhost", "/tmp/other")
+	if err != nil {
+		t.Fatalf("register 3: %v", err)
+	}
+	if reg3.Name == reg1.Name {
+		t.Fatalf("different workdir should be a different agent: %q", reg3.Name)
+	}
+
+	// Bad kind token: 401.
+	c4, err := mcpserver.NewClient(backend.URL, "bogus-token")
+	if err != nil {
+		t.Fatalf("new client 4: %v", err)
+	}
+	_, err = c4.Register(ctx, "h", "/w")
+	if err == nil {
+		t.Fatal("expected error for bad kind token")
+	}
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != 401 {
+		t.Fatalf("expected 401 Error, got %v", err)
+	}
+}
+
 func TestToolE2E(t *testing.T) {
-	backend, _, tokens := newButlerBackend(t)
-	alpha := connectMCPClient(t, backend.URL, tokens["alpha"])
+	backend, _, kinds := newButlerBackend(t)
+	alpha, alphaName := connectMCPClient(t, backend.URL, kinds["codex"], "alpha", "/tmp/proj")
+	if alphaName != "codex-alpha-proj" {
+		t.Fatalf("unexpected agent name %q", alphaName)
+	}
 
 	ctx := context.Background()
 
@@ -152,19 +259,16 @@ func TestToolE2E(t *testing.T) {
 		t.Fatalf("wait returned too fast: %v", time.Since(start))
 	}
 
-	betaClient, err := mcpserver.NewClient(backend.URL, tokens["beta"])
-	if err != nil {
-		t.Fatalf("beta client: %v", err)
-	}
-	if _, err := betaClient.JoinSession(ctx, sid); err != nil {
+	beta := registerInstance(t, backend.URL, kinds["opencode"], "beta", "/tmp/proj")
+	if _, err := beta.JoinSession(ctx, sid); err != nil {
 		t.Fatalf("beta join: %v", err)
 	}
-	if _, err := betaClient.PostMessage(ctx, sid, "hi alpha, beta here"); err != nil {
+	if _, err := beta.PostMessage(ctx, sid, "hi alpha, beta here"); err != nil {
 		t.Fatalf("beta post: %v", err)
 	}
 
 	out, isErr = callTool(t, alpha, "wait_for_messages", map[string]any{"timeout_seconds": 5})
-	if isErr || !strings.Contains(out, "beta: hi alpha, beta here") {
+	if isErr || !strings.Contains(out, "opencode-beta-proj: hi alpha, beta here") {
 		t.Fatalf("wait after activity: %q isErr=%v", out, isErr)
 	}
 	if !strings.Contains(out, "system") {
@@ -175,7 +279,13 @@ func TestToolE2E(t *testing.T) {
 	if isErr {
 		t.Fatalf("read_session: %s", out)
 	}
-	for _, want := range []string{"e2e test", "alpha*", "beta*", "hello from alpha", "hi alpha, beta here"} {
+	for _, want := range []string{
+		"e2e test",
+		"codex-alpha-proj (codex@alpha)*",
+		"opencode-beta-proj (opencode@beta)*",
+		"hello from alpha",
+		"hi alpha, beta here",
+	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("read_session missing %q in:\n%s", want, out)
 		}
@@ -196,7 +306,7 @@ func TestToolE2E(t *testing.T) {
 	}
 
 	out, isErr = callTool(t, alpha, "list_sessions", nil)
-	if isErr || !strings.Contains(out, "e2e test") {
+	if isErr || !strings.Contains(out, "e2e test") || !strings.Contains(out, "you are codex-alpha-proj") {
 		t.Fatalf("list_sessions: %q isErr=%v", out, isErr)
 	}
 

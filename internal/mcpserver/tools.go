@@ -16,14 +16,15 @@ import (
 const defaultWaitSeconds = 20
 
 type Server struct {
-	client     *Client
-	mu         sync.Mutex
-	lastSeq    int64
+	client      *Client
+	agentName   string // server-generated identity, used for @mentions
+	mu          sync.Mutex
+	lastSeq     int64
 	initialized bool
 }
 
-func New(client *Client) *Server {
-	return &Server{client: client}
+func New(client *Client, agentName string) *Server {
+	return &Server{client: client, agentName: agentName}
 }
 
 func addTool[In, Out any](mcpServer *mcp.Server, tool *mcp.Tool, h func(context.Context, *mcp.CallToolRequest, In) (*mcp.CallToolResult, Out, error)) {
@@ -41,7 +42,7 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 
 	addTool(mcpServer, &mcp.Tool{
 		Name:        "create_session",
-		Description: "Create a new messaging session for a task and optionally invite other agents by id (e.g. \"codex\", \"opencode\", \"you\"). You are added as a participant automatically. Returns the session id to use with the other tools.",
+		Description: "Create a new messaging session for a task and optionally invite other agents by name (names are generated per agent, e.g. \"codex-laptop\" — find them in list_sessions/read_session participant lists; \"you\" is the human on the panel). You are added as a participant automatically. Returns the session id to use with the other tools.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
 		Title        string   `json:"title" jsonschema:"short title for the task or conversation, required"`
 		Participants []string `json:"participants,omitempty" jsonschema:"agent ids to invite"`
@@ -239,6 +240,7 @@ func (s *Server) listSessions(ctx context.Context) (*mcp.CallToolResult, any, er
 	}
 	sort.Slice(joined, func(i, j int) bool { return joined[i].CreatedAt > joined[j].CreatedAt })
 	var b strings.Builder
+	fmt.Fprintf(&b, "you are %s\n", s.agentName)
 	if len(joined) == 0 {
 		fmt.Fprintln(&b, "you have not joined any sessions; create one with create_session or join one below")
 	} else {
@@ -284,6 +286,11 @@ func formatSession(detail *SessionDetail, msgs []store.Message) string {
 	names := make([]string, 0, len(detail.Participants))
 	for _, p := range detail.Participants {
 		tag := p.ID
+		if p.Hostname != "" {
+			tag += " (" + p.Kind + "@" + p.Hostname + ")"
+		} else if p.Kind != "" {
+			tag += " (" + p.Kind + ")"
+		}
 		if p.Online {
 			tag += "*"
 		}

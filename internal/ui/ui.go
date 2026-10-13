@@ -33,9 +33,9 @@ const (
 )
 
 type Panel struct {
-	Store     *store.Store
-	Hub       *hub.Hub
-	Log       *slog.Logger
+	Store      *store.Store
+	Hub        *hub.Hub
+	Log        *slog.Logger
 	AdminToken string
 
 	sessions  *sessionStore
@@ -85,6 +85,13 @@ func New(st *store.Store, h *hub.Hub, adminToken string, log *slog.Logger) (*Pan
 			r := []rune(s)
 			if len(r) > 80 {
 				return string(r[:80]) + "…"
+			}
+			return s
+		},
+		"path": func(s string) string {
+			r := []rune(s)
+			if len(r) > 56 {
+				return string(r[:56]) + "…"
 			}
 			return s
 		},
@@ -192,10 +199,12 @@ type dashData struct {
 }
 
 type agentRow struct {
-	ID      string
-	Kind    string
-	Online  bool
-	LastTxt string
+	ID       string
+	Kind     string
+	Hostname string
+	Workdir  string
+	Online   bool
+	LastTxt  string
 }
 
 func (p *Panel) dashboard(w http.ResponseWriter, r *http.Request) {
@@ -228,7 +237,7 @@ func (p *Panel) dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	agentRows := make([]agentRow, 0, len(agents))
 	for _, a := range agents {
-		row := agentRow{ID: a.ID, Kind: a.Kind, Online: online(a.LastSeenAt), LastTxt: "never"}
+		row := agentRow{ID: a.ID, Kind: a.Kind, Hostname: a.Hostname, Workdir: a.Workdir, Online: online(a.LastSeenAt), LastTxt: "never"}
 		if a.LastSeenAt != nil {
 			row.LastTxt = time.Unix(*a.LastSeenAt, 0).UTC().Format("15:04:05")
 		}
@@ -469,7 +478,7 @@ func (p *Panel) fanout(ctx context.Context, sid string) {
 func (p *Panel) youAgent(ctx context.Context) (*store.Agent, error) {
 	a, err := p.Store.GetAgent(ctx, youAgentID)
 	if errors.Is(err, store.ErrNotFound) {
-		return p.Store.CreateAgent(ctx, youAgentID, "You", "human", auth.Hash(auth.NewToken()))
+		return p.Store.CreateAgent(ctx, youAgentID, "You", "human", "", "")
 	}
 	return a, err
 }

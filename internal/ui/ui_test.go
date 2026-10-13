@@ -103,7 +103,7 @@ func TestLoginFlow(t *testing.T) {
 func TestSessionViewAndPost(t *testing.T) {
 	srv, st, h, adminTok := newPanel(t)
 	ctx := context.Background()
-	if _, err := st.CreateAgent(ctx, "alpha", "alpha", "codex", "hash-alpha"); err != nil {
+	if _, err := st.CreateAgent(ctx, "alpha", "alpha", "codex", "alpha-host", "/tmp/proj"); err != nil {
 		t.Fatalf("create agent: %v", err)
 	}
 	if _, err := st.CreateSession(ctx, "s1", "panel test", "alpha", nil); err != nil {
@@ -125,7 +125,7 @@ func TestSessionViewAndPost(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("session view: %d", resp.StatusCode)
 	}
-	for _, want := range []string{"panel test", "existing message", `data-stream="/panel/sessions/s1/stream?after=`, "alpha"} {
+	for _, want := range []string{"panel test", "existing message", `data-stream="/panel/sessions/s1/stream?after=`, "alpha", "alpha-host", "/tmp/proj"} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("session view missing %q in:\n%s", want, string(body))
 		}
@@ -181,6 +181,30 @@ func TestSessionViewAndPost(t *testing.T) {
 	_ = h
 }
 
+func TestDashboardShowsRegistrationInfo(t *testing.T) {
+	srv, st, _, adminTok := newPanel(t)
+	ctx := context.Background()
+	if _, err := st.CreateAgent(ctx, "codex-laptop", "codex-laptop", "codex", "laptop.local", "/Users/andrew/proj"); err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+	client := newBrowser(t)
+	login(t, client, srv.URL, adminTok)
+	resp, err := client.Get(srv.URL + "/panel/")
+	if err != nil {
+		t.Fatalf("dashboard: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("dashboard: %d", resp.StatusCode)
+	}
+	for _, want := range []string{"codex-laptop", "laptop.local", "/Users/andrew/proj", "Working directory"} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("dashboard missing %q in:\n%s", want, string(body))
+		}
+	}
+}
+
 func TestOriginCheck(t *testing.T) {
 	srv, _, _, adminTok := newPanel(t)
 	client := newBrowser(t)
@@ -205,7 +229,7 @@ func TestOriginCheck(t *testing.T) {
 func TestSSEStream(t *testing.T) {
 	srv, st, h, adminTok := newPanel(t)
 	ctx := context.Background()
-	if _, err := st.CreateAgent(ctx, "alpha", "alpha", "codex", "hash-alpha"); err != nil {
+	if _, err := st.CreateAgent(ctx, "alpha", "alpha", "codex", "alpha-host", "/tmp/proj"); err != nil {
 		t.Fatalf("create agent: %v", err)
 	}
 	if _, err := st.CreateSession(ctx, "s1", "sse test", "alpha", nil); err != nil {
@@ -316,7 +340,7 @@ func readSSE(t *testing.T, r io.Reader, timeout time.Duration) []sseEvent {
 func TestArchivedSessionRejectsPosts(t *testing.T) {
 	srv, st, _, adminTok := newPanel(t)
 	ctx := context.Background()
-	if _, err := st.CreateAgent(ctx, "alpha", "alpha", "codex", "hash-alpha"); err != nil {
+	if _, err := st.CreateAgent(ctx, "alpha", "alpha", "codex", "alpha-host", "/tmp/proj"); err != nil {
 		t.Fatalf("create agent: %v", err)
 	}
 	if _, err := st.CreateSession(ctx, "s1", "archived test", "alpha", nil); err != nil {

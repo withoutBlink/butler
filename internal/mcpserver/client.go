@@ -116,7 +116,39 @@ type AgentInfo struct {
 	ID          string `json:"id"`
 	DisplayName string `json:"display_name"`
 	Kind        string `json:"kind"`
+	Hostname    string `json:"hostname"`
+	Workdir     string `json:"workdir"`
 	Online      bool   `json:"online"`
+}
+
+type RegisterResult struct {
+	Name     string `json:"name"`
+	Token    string `json:"token"`
+	Kind     string `json:"kind"`
+	Hostname string `json:"hostname"`
+	Workdir  string `json:"workdir"`
+	Replaced bool   `json:"replaced"`
+}
+
+// Register exchanges a kind token plus hostname and working directory for a
+// stable agent name and a fresh instance token. When the identity already
+// existed, the server replaces the previous instance (its token is revoked)
+// and Replaced is true. The caller must SetToken with the returned token
+// before issuing other requests.
+func (c *Client) Register(ctx context.Context, hostname, workdir string) (*RegisterResult, error) {
+	body := map[string]string{"hostname": hostname, "workdir": workdir}
+	var res RegisterResult
+	if err := c.do(ctx, "POST", "/api/v1/register", body, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// SetToken swaps the credential used on every request: the kind token during
+// registration, the instance token afterwards. Call it before serving tools
+// (do() reads the token on every request).
+func (c *Client) SetToken(token string) {
+	c.token = token
 }
 
 func (c *Client) SessionDetail(ctx context.Context, sid string) (*SessionDetail, error) {

@@ -57,6 +57,8 @@ td a { color: var(--accent); text-decoration: none; font-weight: 600; }
 .p-online::before { content: ""; position: absolute; left: 2px; top: 7px; width: 8px; height: 8px; border-radius: 50%; background: #2da44e; }
 .p-offline { list-style: none; position: relative; padding-left: 16px; }
 .p-offline::before { content: ""; position: absolute; left: 2px; top: 7px; width: 8px; height: 8px; border-radius: 50%; background: var(--border); }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--border); }
+.dot.on { background: #2da44e; }
 #participants ul { margin: 0; padding: 0; }
 #participants li { padding: 3px 0; }
 #participants small { color: var(--muted); }

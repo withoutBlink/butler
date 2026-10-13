@@ -22,7 +22,7 @@ func newTestStore(t *testing.T) *Store {
 
 func mustAgent(t *testing.T, s *Store, id string) {
 	t.Helper()
-	if _, err := s.CreateAgent(context.Background(), id, id, "test", "hash-"+id); err != nil {
+	if _, err := s.CreateAgent(context.Background(), id, id, "test", "", ""); err != nil {
 		t.Fatalf("create agent %s: %v", id, err)
 	}
 }
@@ -41,40 +41,104 @@ func TestOpenIdempotent(t *testing.T) {
 	s2.Close()
 }
 
-func TestAgentCRUD(t *testing.T) {
+func TestKindCRUD(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
 
-	a, err := s.CreateAgent(ctx, "a", "Alpha", "codex", "hash-a")
+	k, err := s.CreateKind(ctx, "codex", "Codex", "hash-codex")
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if a.ID != "a" || a.DisplayName != "Alpha" || a.Kind != "codex" {
-		t.Fatalf("bad agent: %+v", a)
+	if k.ID != "codex" || k.DisplayName != "Codex" {
+		t.Fatalf("bad kind: %+v", k)
 	}
-	if _, err := s.CreateAgent(ctx, "a", "Again", "codex", "hash-b"); !errors.Is(err, ErrConflict) {
+	if _, err := s.CreateKind(ctx, "codex", "Again", "hash-c2"); !errors.Is(err, ErrConflict) {
 		t.Fatalf("expected conflict, got %v", err)
 	}
-	if _, err := s.GetAgentByTokenHash(ctx, "hash-a"); err != nil {
+	got, err := s.GetKind(ctx, "codex")
+	if err != nil || got.ID != "codex" {
+		t.Fatalf("get: %v %+v", err, got)
+	}
+	if _, err := s.GetKind(ctx, "nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected not found, got %v", err)
+	}
+	if _, err := s.GetKindByTokenHash(ctx, "hash-codex"); err != nil {
 		t.Fatalf("lookup by hash: %v", err)
+	}
+	if _, err := s.GetKindByTokenHash(ctx, "hash-missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected not found, got %v", err)
+	}
+	if err := s.RotateKindToken(ctx, "codex", "hash-new"); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	if _, err := s.GetKindByTokenHash(ctx, "hash-new"); err != nil {
+		t.Fatalf("lookup new hash: %v", err)
+	}
+	if _, err := s.GetKindByTokenHash(ctx, "hash-codex"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("old hash should be gone, got %v", err)
+	}
+	if err := s.RotateKindToken(ctx, "ghost", "hash-x"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected not found, got %v", err)
+	}
+	list, err := s.ListKinds(ctx)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list: %v %d", err, len(list))
+	}
+}
+
+func TestAgentInstanceTokens(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	a, err := s.CreateAgent(ctx, "codex-laptop", "codex-laptop", "codex", "laptop.local", "/home/x/proj")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if a.Hostname != "laptop.local" || a.Workdir != "/home/x/proj" {
+		t.Fatalf("bad agent: %+v", a)
+	}
+	if _, err := s.CreateAgent(ctx, "codex-laptop", "again", "codex", "laptop.local", "/home/x/proj"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("expected conflict, got %v", err)
+	}
+	// One live instance token per identity: replacing revokes the previous.
+	if err := s.ReplaceAgentToken(ctx, "codex-laptop", "hash-1"); err != nil {
+		t.Fatalf("replace token: %v", err)
+	}
+	if got, err := s.GetAgentByTokenHash(ctx, "hash-1"); err != nil || got.ID != "codex-laptop" {
+		t.Fatalf("lookup by hash-1: %v %+v", err, got)
+	}
+	if err := s.ReplaceAgentToken(ctx, "codex-laptop", "hash-2"); err != nil {
+		t.Fatalf("replace token 2: %v", err)
+	}
+	if _, err := s.GetAgentByTokenHash(ctx, "hash-1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("replaced token should be revoked, got %v", err)
+	}
+	if got, err := s.GetAgentByTokenHash(ctx, "hash-2"); err != nil || got.ID != "codex-laptop" {
+		t.Fatalf("lookup by hash-2: %v %+v", err, got)
 	}
 	if _, err := s.GetAgentByTokenHash(ctx, "hash-missing"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected not found, got %v", err)
 	}
-	if err := s.RotateAgentToken(ctx, "a", "hash-new"); err != nil {
-		t.Fatalf("rotate: %v", err)
+	if err := s.ReplaceAgentToken(ctx, "ghost", "hash-x"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("token for unknown agent should be not found, got %v", err)
 	}
-	if _, err := s.GetAgentByTokenHash(ctx, "hash-new"); err != nil {
-		t.Fatalf("lookup new hash: %v", err)
+	// FindInstance matches on the registration triple.
+	inst, err := s.FindInstance(ctx, "codex", "laptop.local", "/home/x/proj")
+	if err != nil || inst.ID != "codex-laptop" {
+		t.Fatalf("find instance: %v %+v", err, inst)
 	}
-	if _, err := s.GetAgentByTokenHash(ctx, "hash-a"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("old hash should be gone, got %v", err)
-	}
-	if err := s.RotateAgentToken(ctx, "ghost", "hash-x"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.FindInstance(ctx, "codex", "laptop.local", "/elsewhere"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected not found, got %v", err)
 	}
-	s.TouchAgent(ctx, "a")
-	got, err := s.GetAgent(ctx, "a")
+	// Revoking kills the remaining token.
+	if err := s.RevokeAgentTokens(ctx, "codex-laptop"); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if _, err := s.GetAgentByTokenHash(ctx, "hash-2"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("token hash-2 should be revoked, got %v", err)
+	}
+	s.TouchAgent(ctx, "codex-laptop")
+	got, err := s.GetAgent(ctx, "codex-laptop")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -84,6 +148,61 @@ func TestAgentCRUD(t *testing.T) {
 	list, err := s.ListAgents(ctx)
 	if err != nil || len(list) != 1 {
 		t.Fatalf("list: %v %d", err, len(list))
+	}
+}
+
+func TestSessionsForAgent(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	mustAgent(t, s, "a")
+	mustAgent(t, s, "b")
+	if _, err := s.CreateSession(ctx, "s1", "one", "a", []string{"b"}); err != nil {
+		t.Fatalf("create s1: %v", err)
+	}
+	if _, err := s.CreateSession(ctx, "s2", "two", "a", nil); err != nil {
+		t.Fatalf("create s2: %v", err)
+	}
+	sids, err := s.SessionsForAgent(ctx, "b")
+	if err != nil || len(sids) != 1 || sids[0] != "s1" {
+		t.Fatalf("sessions for b: %v %v", err, sids)
+	}
+	sids, err = s.SessionsForAgent(ctx, "a")
+	if err != nil || len(sids) != 2 || sids[0] != "s1" || sids[1] != "s2" {
+		t.Fatalf("sessions for a: %v %v", err, sids)
+	}
+	sids, err = s.SessionsForAgent(ctx, "ghost")
+	if err != nil || len(sids) != 0 {
+		t.Fatalf("sessions for ghost: %v %v", err, sids)
+	}
+}
+
+func TestUniqueAgentName(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	// kind + hostname + basename of the workdir; long host parts truncate.
+	if got := s.UniqueAgentName(ctx, "codex", "Andrews-MacBook-Pro.local", "/Users/andrew/work/butler"); got != "codex-andrews-macbook-pro-butler" {
+		t.Fatalf("got %q", got)
+	}
+	first := s.UniqueAgentName(ctx, "codex", "host", "/tmp/proj")
+	if _, err := s.CreateAgent(ctx, first, first, "codex", "host", "/tmp/proj"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// Different directory, same basename: distinct identity, suffixed name.
+	if got := s.UniqueAgentName(ctx, "codex", "host", "/other/proj"); got != "codex-host-proj-2" {
+		t.Fatalf("expected suffix, got %q", got)
+	}
+	// Different directories on one host get distinct names, no suffix needed.
+	if got := s.UniqueAgentName(ctx, "codex", "host", "/tmp/other"); got != "codex-host-other" {
+		t.Fatalf("got %q", got)
+	}
+	// Long parts are truncated to a total cap.
+	long := s.UniqueAgentName(ctx, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "/tmp/cccccccccccccccccccccccccccccccccccc")
+	if len(long) > 48 {
+		t.Fatalf("expected truncation, got %q", long)
+	}
+	if got := s.UniqueAgentName(ctx, "!!!", "???", "/???"); got != "agent" {
+		t.Fatalf("expected fallback, got %q", got)
 	}
 }
 

@@ -1,10 +1,24 @@
+CREATE TABLE kinds (
+    id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL
+);
+
 CREATE TABLE agents (
     id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
     kind TEXT NOT NULL,
-    token_hash TEXT NOT NULL UNIQUE,
+    hostname TEXT NOT NULL DEFAULT '',
+    workdir TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL,
     last_seen_at INTEGER
+);
+
+CREATE TABLE agent_tokens (
+    token_hash TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL REFERENCES agents (id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL
 );
 
 CREATE TABLE sessions (

@@ -1,6 +1,6 @@
-butler
-butler-server
-butler-mcp
+/butler
+/butler-server
+/butler-mcp
 *.db
 *.db-shm
 *.db-wal

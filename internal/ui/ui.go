@@ -2,15 +2,19 @@ package ui
 
 import (
 	"context"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"html/template"
 	"io"
 	"io/fs"
 	"log/slog"
+	"mime"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,9 +42,11 @@ type Panel struct {
 	Log        *slog.Logger
 	AdminToken string
 
-	sessions  *sessionStore
-	templates *template.Template
-	Heartbeat time.Duration
+	sessions     *sessionStore
+	templates    *template.Template
+	Heartbeat    time.Duration
+	assets       map[string][]byte
+	assetVersion string
 }
 
 type sessionStore struct {
@@ -79,6 +85,10 @@ func (s *sessionStore) revoke(id string) {
 }
 
 func New(st *store.Store, h *hub.Hub, adminToken string, log *slog.Logger) (*Panel, error) {
+	assets, assetVersion, err := loadAssets()
+	if err != nil {
+		return nil, fmt.Errorf("load static assets: %w", err)
+	}
 	funcs := template.FuncMap{
 		"ts": func(ms int64) string { return time.UnixMilli(ms).UTC().Format("15:04:05") },
 		"short": func(s string) string {
@@ -95,20 +105,56 @@ func New(st *store.Store, h *hub.Hub, adminToken string, log *slog.Logger) (*Pan
 			}
 			return s
 		},
+		// asset returns a cache-busting URL: the version is a hash of the
+		// embedded files, so every new binary serves fresh assets.
+		"asset": func(name string) string {
+			return "/panel/static/" + name + "?v=" + assetVersion
+		},
 	}
 	tmpl, err := template.New("").Funcs(funcs).ParseFS(files, "templates/*.tmpl")
 	if err != nil {
 		return nil, fmt.Errorf("parse templates: %w", err)
 	}
 	return &Panel{
-		Store:      st,
-		Hub:        h,
-		Log:        log,
-		AdminToken: adminToken,
-		sessions:   newSessionStore(),
-		templates:  tmpl,
-		Heartbeat:  15 * time.Second,
+		Store:        st,
+		Hub:          h,
+		Log:          log,
+		AdminToken:   adminToken,
+		sessions:     newSessionStore(),
+		templates:    tmpl,
+		Heartbeat:    15 * time.Second,
+		assets:       assets,
+		assetVersion: assetVersion,
 	}, nil
+}
+
+// loadAssets reads the embedded static files into memory and derives a
+// version hash from their contents. Embedded files carry no modtime, so
+// browsers cannot revalidate them; the hash gives every binary a distinct,
+// safely immutable asset URL.
+func loadAssets() (map[string][]byte, string, error) {
+	assets := map[string][]byte{}
+	h := sha256.New()
+	err := fs.WalkDir(files, "static", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		b, err := files.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		assets[strings.TrimPrefix(p, "static/")] = b
+		h.Write([]byte(p))
+		h.Write(b)
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return assets, hex.EncodeToString(h.Sum(nil))[:12], nil
 }
 
 func (p *Panel) RegisterRoutes(mux *http.ServeMux) {
@@ -136,12 +182,26 @@ func (p *Panel) requirePanel(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func (p *Panel) static(w http.ResponseWriter, r *http.Request) {
-	sub, err := fs.Sub(files, "static")
-	if err != nil {
+	name := strings.TrimPrefix(r.URL.Path, "/panel/static/")
+	content, ok := p.assets[name]
+	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	http.StripPrefix("/panel/static/", http.FileServer(http.FS(sub))).ServeHTTP(w, r)
+	ct := mime.TypeByExtension(filepath.Ext(name))
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", ct)
+	if r.URL.Query().Get("v") == p.assetVersion {
+		// The content is embedded in this binary and the version query
+		// matches its hash: the response is immutable, cache forever.
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	} else {
+		// Unversioned URL: never let browsers serve a stale copy.
+		w.Header().Set("Cache-Control", "no-cache")
+	}
+	w.Write(content)
 }
 
 func (p *Panel) loginForm(w http.ResponseWriter, r *http.Request) {

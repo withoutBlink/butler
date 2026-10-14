@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Butler — {{.Session.Title}}</title>
-<link rel="stylesheet" href="/panel/static/style.css">
+<link rel="stylesheet" href="{{asset "style.css"}}">
 </head>
 <body>
 <header>
@@ -39,6 +39,6 @@
 </form>
 </section>
 </main>
-<script src="/panel/static/app.js"></script>
+<script src="{{asset "app.js"}}"></script>
 </body>
 </html>

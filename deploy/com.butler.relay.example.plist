@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd agent for `butler-mcp relay` (push delivery of butler messages into
+  codex sessions). One instance per working directory. Adjust the paths, save
+  as ~/Library/LaunchAgents/com.butler.relay.<project>.plist, then:
+
+    launchctl load ~/Library/LaunchAgents/com.butler.relay.<project>.plist
+
+  Logs go to /tmp/butler-relay-<project>.log.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.butler.relay.example</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/you/src/butler/butler-mcp</string>
+        <string>relay</string>
+        <string>--workdir</string>
+        <string>/Users/you/src/project</string>
+        <!-- <string>--thread</string>  optional: pin an explicit codex thread id -->
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/butler-relay-example.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/butler-relay-example.log</string>
+</dict>
+</plist>

@@ -5,7 +5,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -41,10 +43,12 @@ func main() {
 		kindCmd(rest)
 	case "agent":
 		agentCmd(rest)
+	case "reset":
+		resetCmd(rest)
 	case "version":
-		fmt.Println("butler-server " + version)
+		fmt.Println("butler " + version)
 	default:
-		fmt.Fprintln(os.Stderr, "usage: butler-server [serve|kind|agent|version] [flags]")
+		fmt.Fprintln(os.Stderr, "usage: butler [serve|kind|agent|reset|version] [flags]")
 		os.Exit(2)
 	}
 }
@@ -164,6 +168,79 @@ func parseSubFlags(fs *flag.FlagSet, args []string) []string {
 
 func openStore(dataDir string) (*store.Store, error) {
 	return store.Open(filepath.Join(dataDir, "butler.db"))
+}
+
+// resetCmd wipes the database (sessions, messages, agents, kinds) by moving
+// the DB files aside and recreating an empty schema. The admin token lives in
+// its own file outside the database and is deliberately untouched. Kind
+// tokens are stored in the DB, so they must be re-issued afterwards.
+func resetCmd(args []string) {
+	fs := flag.NewFlagSet("reset", flag.ExitOnError)
+	dataDir := fs.String("data-dir", envOr("BUTLER_DATA_DIR", defaultDir(".local/share/butler")), "data directory")
+	listen := fs.String("listen", envOr("BUTLER_LISTEN", "127.0.0.1:8787"), "listen address, checked to refuse reset while the server runs")
+	yes := fs.Bool("yes", false, "skip the confirmation prompt")
+	fs.Parse(args)
+
+	dbPath := filepath.Join(*dataDir, "butler.db")
+
+	// Moving the DB out from under a running server corrupts its state.
+	if conn, err := net.DialTimeout("tcp", *listen, 500*time.Millisecond); err == nil {
+		conn.Close()
+		fmt.Fprintf(os.Stderr, "error: something is listening on %s — stop the butler server before resetting\n", *listen)
+		os.Exit(1)
+	}
+
+	if !*yes {
+		fmt.Printf("reset moves %s aside (sessions, messages, agents and kinds are wiped) and recreates an empty database.\nthe admin token is NOT affected. kind tokens stop working and must be re-issued.\ncontinue? [y/N] ", dbPath)
+		var answer string
+		fmt.Scanln(&answer)
+		if answer != "y" && !strings.EqualFold(answer, "yes") {
+			fmt.Println("aborted")
+			return
+		}
+	}
+
+	ts := time.Now().UTC().Format("20060102-150405")
+	var moved []string
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		src := dbPath + suffix
+		if _, err := os.Stat(src); err != nil {
+			continue
+		}
+		dst := src + ".old-" + ts
+		for n := 2; ; n++ {
+			if _, err := os.Stat(dst); os.IsNotExist(err) {
+				break
+			}
+			// Same-second reset: never clobber an earlier backup.
+			dst = fmt.Sprintf("%s.old-%s-%d", src, ts, n)
+		}
+		if err := os.Rename(src, dst); err != nil {
+			fmt.Fprintf(os.Stderr, "error: moving %s aside: %v\n", src, err)
+			os.Exit(1)
+		}
+		moved = append(moved, dst)
+	}
+	if len(moved) == 0 {
+		fmt.Printf("no database at %s — creating a fresh one\n", dbPath)
+	} else {
+		fmt.Printf("database moved aside: %s\n", strings.Join(moved, ", "))
+	}
+
+	st, err := store.Open(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: recreating database: %v\n", err)
+		os.Exit(1)
+	}
+	bootstrapAgent(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)), st, "you", "You", "human")
+	if err := st.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("empty database created (agent \"you\" bootstrapped)")
+	fmt.Println("admin token unchanged — it lives in its own file")
+	fmt.Println(`next: re-issue kind tokens ("butler kind add <id>"), update your agents' configs, then start the server`)
 }
 
 func kindCmd(args []string) {
@@ -294,17 +371,17 @@ func agentCmd(args []string) {
 
 func kindUsage() {
 	fmt.Fprint(os.Stderr, `usage (flags before or after the id):
-  butler-server kind add <id> [--name X]
-  butler-server kind rotate <id>
-  butler-server kind list
+  butler kind add <id> [--name X]
+  butler kind rotate <id>
+  butler kind list
 `)
 }
 
 func agentUsage() {
-	fmt.Fprint(os.Stderr, `agent instances register themselves with a kind token; manage kinds with "butler-server kind".
+	fmt.Fprint(os.Stderr, `agent instances register themselves with a kind token; manage kinds with "butler kind".
 usage (flags before or after the id):
-  butler-server agent list
-  butler-server agent revoke <name>
+  butler agent list
+  butler agent revoke <name>
 `)
 }
 

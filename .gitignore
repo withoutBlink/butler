@@ -1,9 +1,9 @@
 /butler
-/butler-server
 /butler-mcp
 *.db
 *.db-shm
 *.db-wal
+.butler/
 data/
 dist/
 opencode.json

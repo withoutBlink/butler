@@ -35,7 +35,7 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 
 	addTool(mcpServer, &mcp.Tool{
 		Name:        "list_sessions",
-		Description: "List Butler messaging sessions. Shows sessions you have joined (with unread hints) and other active sessions you can join. Use this first to discover where to send messages.",
+		Description: "List Butler messaging sessions. The \"global\" session has every connected agent as a member — use it to reach everyone. Also shows your other joined sessions (with unread hints) and active sessions you can join. Use this first to discover where to send messages.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct{}) (*mcp.CallToolResult, any, error) {
 		return s.listSessions(ctx)
 	})
@@ -101,12 +101,12 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		return textResult(formatSession(detail, msgs)), nil, nil
+		return textResult(s.formatSession(detail, msgs)), nil, nil
 	})
 
 	addTool(mcpServer, &mcp.Tool{
 		Name:        "send_message",
-		Description: "Send a chat message to a session. You must be a participant (join_session first). Address specific agents with @mentions (e.g. \"@codex can you take the failing test?\"). Returns the message sequence number.",
+		Description: "Send a chat message to a session. You must be a participant (join_session first). Address specific agents with @mentions: \"@<agent id>\" for one agent, \"@<kind>\" for every agent of that kind in the session, or \"@all\" for all participants. Mentioned agents are expected to reply; unmentioned participants only get the message as FYI. Returns the message sequence number.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
 		Session string `json:"session" jsonschema:"session id, required"`
 		Content string `json:"content" jsonschema:"message text (markdown), required"`
@@ -127,7 +127,7 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 
 	addTool(mcpServer, &mcp.Tool{
 		Name:        "wait_for_messages",
-		Description: "Wait for new messages in your joined sessions (long-poll, near real time). Blocks up to timeout_seconds (default 20, max 60), then reports no new messages. Call this repeatedly to listen for replies from other agents and humans — it returns immediately when a message arrives. Returns messages since the last wait/check/read call in this session. Note: it only sees messages newer than your cursor; use read_session for older history.",
+		Description: "Wait for new messages in your joined sessions (long-poll, near real time). Blocks up to timeout_seconds (default 20, max 60), then reports no new messages. Call this repeatedly to listen for replies from other agents and humans — it returns immediately when a message arrives. Messages are grouped per session; ones that @-mention you are marked \"(mentioned you)\" and expect a reply, the rest are FYI you may ignore if not relevant. Etiquette: when you decide to act on a message, ack briefly first (send_message), then do the work and report back — don't go silent until done. It only sees messages newer than your cursor; use read_session for older history.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
 		TimeoutSeconds int `json:"timeout_seconds,omitempty" jsonschema:"how long to block, default 20, max 60"`
 	}) (*mcp.CallToolResult, any, error) {
@@ -150,12 +150,12 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		if len(msgs) == 0 {
 			return textResult("no new messages"), nil, nil
 		}
-		return textResult(fmt.Sprintf("%d new message(s):\n%s", len(msgs), formatMessages(msgs))), nil, nil
+		return textResult(s.formatNotification(ctx, msgs)), nil, nil
 	})
 
 	addTool(mcpServer, &mcp.Tool{
 		Name:        "check_messages",
-		Description: "Fetch new messages in your joined sessions without blocking (unlike wait_for_messages). Useful when you want a quick non-blocking check between other work.",
+		Description: "Fetch new messages in your joined sessions without blocking (unlike wait_for_messages). Messages that @-mention you are marked and expect a reply; the rest are FYI. Useful when you want a quick non-blocking check between other work.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct{}) (*mcp.CallToolResult, any, error) {
 		after, err := s.cursor(ctx)
 		if err != nil {
@@ -169,7 +169,7 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		if len(msgs) == 0 {
 			return textResult("no new messages"), nil, nil
 		}
-		return textResult(fmt.Sprintf("%d new message(s):\n%s", len(msgs), formatMessages(msgs))), nil, nil
+		return textResult(s.formatNotification(ctx, msgs)), nil, nil
 	})
 
 	addTool(mcpServer, &mcp.Tool{
@@ -280,7 +280,7 @@ func (s *Server) advanceCursor(seq int64) {
 	}
 }
 
-func formatSession(detail *SessionDetail, msgs []store.Message) string {
+func (s *Server) formatSession(detail *SessionDetail, msgs []store.Message) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "session %q (%s) [%s]\ncreated by %s\n", detail.Session.Title, detail.Session.ID, detail.Session.Status, detail.Session.CreatedBy)
 	names := make([]string, 0, len(detail.Participants))
@@ -302,19 +302,80 @@ func formatSession(detail *SessionDetail, msgs []store.Message) string {
 		return b.String()
 	}
 	fmt.Fprintf(&b, "last %d message(s):\n", len(msgs))
-	b.WriteString(formatMessages(msgs))
+	b.WriteString(s.formatMessages(msgs))
 	return b.String()
 }
 
-func formatMessages(msgs []store.Message) string {
+func (s *Server) formatMessages(msgs []store.Message) string {
 	var b strings.Builder
 	for _, m := range msgs {
-		ts := time.UnixMilli(m.CreatedAt).UTC().Format("15:04:05")
-		sender := m.SenderID
-		if m.Kind != "chat" {
-			sender += " (" + m.Kind + ")"
+		fmt.Fprintf(&b, "%s\n", s.formatMessageLine(m))
+	}
+	return b.String()
+}
+
+// formatMessageLine renders one message as "[seq time] sender: content".
+// Messages that @-mention this agent carry a "(mentioned you)" marker: they
+// are addressed to it and expect a reply; unmarked messages are FYI.
+func (s *Server) formatMessageLine(m store.Message) string {
+	ts := time.UnixMilli(m.CreatedAt).UTC().Format("15:04:05")
+	sender := m.SenderID
+	if m.Kind != "chat" {
+		sender += " (" + m.Kind + ")"
+	}
+	if m.MentionsAgent(s.agentName) {
+		sender += " (mentioned you)"
+	}
+	return fmt.Sprintf("[%d %s] %s: %s", m.Seq, ts, sender, m.Content)
+}
+
+// formatNotification renders a wait/check batch: a summary line splitting
+// messages that mention this agent (reply expected) from FYI, then the
+// messages grouped per session — with titles when known — so the agent knows
+// where to reply.
+func (s *Server) formatNotification(ctx context.Context, msgs []store.Message) string {
+	titles := map[string]string{}
+	if sessions, err := s.client.Sessions(ctx, true); err == nil {
+		for _, sess := range sessions {
+			titles[sess.ID] = sess.Title
 		}
-		fmt.Fprintf(&b, "[%d %s] %s: %s\n", m.Seq, ts, sender, m.Content)
+	}
+	mentions := 0
+	for _, m := range msgs {
+		if m.MentionsAgent(s.agentName) {
+			mentions++
+		}
+	}
+	fyis := len(msgs) - mentions
+
+	var order []string
+	groups := map[string][]store.Message{}
+	for _, m := range msgs {
+		if _, ok := groups[m.SessionID]; !ok {
+			order = append(order, m.SessionID)
+		}
+		groups[m.SessionID] = append(groups[m.SessionID], m)
+	}
+
+	var b strings.Builder
+	switch {
+	case mentions > 0 && fyis > 0:
+		fmt.Fprintf(&b, "%d new message(s): %d @-mention you (reply expected), %d are FYI (no reply needed unless relevant)\n", len(msgs), mentions, fyis)
+	case mentions > 0:
+		fmt.Fprintf(&b, "%d new message(s): all @-mention you (reply expected)\n", len(msgs))
+	default:
+		fmt.Fprintf(&b, "%d new message(s): none @-mention you — FYI, no reply needed unless relevant\n", len(msgs))
+	}
+	fmt.Fprintf(&b, "If you decide to act on any of these, ack briefly right away (send_message, e.g. \"on it\"), then do the work and report back — don't stay silent until finished; people are watching for a response.\n")
+	for _, sid := range order {
+		if t := titles[sid]; t != "" {
+			fmt.Fprintf(&b, "\n— session %q (%s):\n", t, sid)
+		} else {
+			fmt.Fprintf(&b, "\n— session %s:\n", sid)
+		}
+		for _, m := range groups[sid] {
+			fmt.Fprintf(&b, "%s\n", s.formatMessageLine(m))
+		}
 	}
 	return b.String()
 }

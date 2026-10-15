@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"mime/multipart"
@@ -17,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"butler/internal/auth"
 	"butler/internal/hub"
 	"butler/internal/store"
 	"butler/internal/ui"
@@ -105,7 +107,7 @@ func TestLoginFlow(t *testing.T) {
 func TestSessionViewAndPost(t *testing.T) {
 	srv, st, h, adminTok := newPanel(t)
 	ctx := context.Background()
-	if _, err := st.CreateAgent(ctx, "alpha", "alpha", "codex", "alpha-host", "/tmp/proj"); err != nil {
+	if _, err := st.CreateAgent(ctx, "alpha", "alpha", "codex", "alpha-host", "/tmp/proj", ""); err != nil {
 		t.Fatalf("create agent: %v", err)
 	}
 	if _, err := st.CreateSession(ctx, "s1", "panel test", "alpha", nil); err != nil {
@@ -139,16 +141,16 @@ func TestSessionViewAndPost(t *testing.T) {
 	}
 	frag, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || !strings.Contains(string(frag), "hello from the panel") || !strings.Contains(string(frag), "you") {
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(frag), "hello from the panel") || !strings.Contains(string(frag), "admin") {
 		t.Fatalf("post fragment: %d %s", resp.StatusCode, string(frag))
 	}
 
-	if _, err := st.GetAgent(ctx, "you"); err != nil {
-		t.Fatalf("you agent should be auto-created: %v", err)
+	if _, err := st.GetAgent(ctx, "admin"); err != nil {
+		t.Fatalf("admin agent should be auto-created: %v", err)
 	}
-	ok, err := st.IsParticipant(ctx, "s1", "you")
+	ok, err := st.IsParticipant(ctx, "s1", "admin")
 	if err != nil || !ok {
-		t.Fatalf("you should be auto-joined: %v %v", ok, err)
+		t.Fatalf("admin should be auto-joined: %v %v", ok, err)
 	}
 	msgs, err := st.SessionLatestMessages(ctx, "s1", 10)
 	if err != nil {
@@ -156,10 +158,10 @@ func TestSessionViewAndPost(t *testing.T) {
 	}
 	var hasJoin, hasPost bool
 	for _, m := range msgs {
-		if m.Kind == "system" && strings.Contains(m.Content, "you joined") {
+		if m.Kind == "system" && strings.Contains(m.Content, "admin joined") {
 			hasJoin = true
 		}
-		if m.SenderID == "you" && m.Content == "hello from the panel" {
+		if m.SenderID == "admin" && m.Content == "hello from the panel" {
 			hasPost = true
 		}
 	}
@@ -176,7 +178,7 @@ func TestSessionViewAndPost(t *testing.T) {
 		t.Fatalf("put context: %d", resp.StatusCode)
 	}
 	item, err := st.GetContextItem(ctx, "s1", "deploy")
-	if err != nil || item.Value != "panel-ok" || item.AuthorID != "you" {
+	if err != nil || item.Value != "panel-ok" || item.AuthorID != "admin" {
 		t.Fatalf("context item: %v %+v", err, item)
 	}
 
@@ -186,8 +188,13 @@ func TestSessionViewAndPost(t *testing.T) {
 func TestDashboardShowsRegistrationInfo(t *testing.T) {
 	srv, st, _, adminTok := newPanel(t)
 	ctx := context.Background()
-	if _, err := st.CreateAgent(ctx, "codex-laptop", "codex-laptop", "codex", "laptop.local", "/Users/andrew/proj"); err != nil {
+	if _, err := st.CreateAgent(ctx, "codex-laptop", "codex-laptop", "codex", "laptop.local", "/Users/andrew/proj", ""); err != nil {
 		t.Fatalf("create agent: %v", err)
+	}
+	// A per-session agent: display title differs from the id, and the
+	// table splits them into Kind / Title columns (id shown as a sub-line).
+	if _, err := st.CreateAgent(ctx, "opencode:fix-read-marks", "Fix read marks", "opencode", "laptop.local", "/Users/andrew/proj", "ses_one"); err != nil {
+		t.Fatalf("create session agent: %v", err)
 	}
 	client := newBrowser(t)
 	login(t, client, srv.URL, adminTok)
@@ -200,10 +207,138 @@ func TestDashboardShowsRegistrationInfo(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("dashboard: %d", resp.StatusCode)
 	}
-	for _, want := range []string{"codex-laptop", "laptop.local", "/Users/andrew/proj", "Working directory"} {
+	for _, want := range []string{
+		"codex-laptop", "laptop.local", "/Users/andrew/proj", "Working directory",
+		"<th>Kind</th>", "<th>Title</th>", "Fix read marks", "opencode:fix-read-marks",
+	} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("dashboard missing %q in:\n%s", want, string(body))
 		}
+	}
+}
+
+// TestPanelKickAgent: the agents-table kick button EVICTS an agent — tokens
+// revoked, hidden from the dashboard and from session participants, with a
+// system notice in each session it was in. The row survives in the store
+// (history references it) and never applies to the admin.
+func TestPanelKickAgent(t *testing.T) {
+	srv, st, _, adminTok := newPanel(t)
+	ctx := context.Background()
+	if _, err := st.CreateAgent(ctx, "admin", "Admin", "human", "", "", ""); err != nil {
+		t.Fatalf("create admin: %v", err)
+	}
+	if _, err := st.CreateAgent(ctx, "opencode:fix-read-marks", "Fix read marks", "opencode", "h", "/w", "ses_one"); err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+	liveTok := auth.NewToken()
+	if err := st.ReplaceAgentToken(ctx, "opencode:fix-read-marks", auth.Hash(liveTok)); err != nil {
+		t.Fatalf("replace token: %v", err)
+	}
+	if _, err := st.CreateSession(ctx, "s1", "kick test", "admin", []string{"opencode:fix-read-marks"}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	client := newBrowser(t)
+	login(t, client, srv.URL, adminTok)
+
+	// The dashboard offers one kick button per agent row — except the admin's.
+	resp, err := client.Get(srv.URL + "/panel/")
+	if err != nil {
+		t.Fatalf("dashboard: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `action="/panel/agents/opencode:fix-read-marks/revoke"`) {
+		t.Fatalf("dashboard missing kick action:\n%s", string(body))
+	}
+	if strings.Count(string(body), "/revoke") != 1 {
+		t.Fatalf("admin row must not offer a kick:\n%s", string(body))
+	}
+
+	// The session page shows it as a participant before the kick.
+	resp, err = client.Get(srv.URL + "/panel/sessions/s1")
+	if err != nil {
+		t.Fatalf("session view: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), "Fix read marks") {
+		t.Fatalf("session view missing participant:\n%s", string(body))
+	}
+
+	// The live token resolves before the kick.
+	if _, err := st.GetAgentByTokenHash(ctx, auth.Hash(liveTok)); err != nil {
+		t.Fatalf("token should resolve pre-kick: %v", err)
+	}
+
+	resp, err = client.PostForm(srv.URL+"/panel/agents/opencode:fix-read-marks/revoke", nil)
+	if err != nil {
+		t.Fatalf("kick: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("kick: %d", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/panel/" {
+		t.Fatalf("kick redirect: %q", loc)
+	}
+
+	// Tokens are revoked; the agent is GONE from the dashboard (visible
+	// immediately, not after the 90s presence window) and hidden from the
+	// session's participants; a system notice explains the eviction.
+	if _, err := st.GetAgentByTokenHash(ctx, auth.Hash(liveTok)); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("kicked token should be revoked: %v", err)
+	}
+	resp, err = client.Get(srv.URL + "/panel/")
+	if err != nil {
+		t.Fatalf("dashboard: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	// The eviction notice in the sessions preview may name the agent; what
+	// must be gone is its agents-table row (kick form) and its pick.
+	if strings.Contains(string(body), `action="/panel/agents/opencode:fix-read-marks/revoke"`) {
+		t.Fatalf("evicted agent still has a kick form:\n%s", string(body))
+	}
+	if strings.Contains(string(body), `value="opencode:fix-read-marks"`) {
+		t.Fatalf("evicted agent still pickable:\n%s", string(body))
+	}
+	resp, err = client.Get(srv.URL + "/panel/sessions/s1")
+	if err != nil {
+		t.Fatalf("session view: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if strings.Contains(string(body), "Fix read marks") {
+		t.Fatalf("evicted agent should not be a participant:\n%s", string(body))
+	}
+	if !strings.Contains(string(body), "was kicked by admin") {
+		t.Fatalf("session view missing eviction notice:\n%s", string(body))
+	}
+	// The row survives in the store: history (messages, sessions) still
+	// references the id. Reviving happens on re-registration (api tests).
+	if a, err := st.GetAgent(ctx, "opencode:fix-read-marks"); err != nil || a.RemovedAt == nil {
+		t.Fatalf("evicted row should survive with removed_at set: %v %+v", err, a)
+	}
+
+	// Kicking the admin is a silent no-op redirect.
+	resp, err = client.PostForm(srv.URL+"/panel/agents/admin/revoke", nil)
+	if err != nil {
+		t.Fatalf("kick admin: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("kick admin: %d", resp.StatusCode)
+	}
+
+	// Kicking an unknown agent 404s.
+	resp, err = client.PostForm(srv.URL+"/panel/agents/ghost/revoke", nil)
+	if err != nil {
+		t.Fatalf("kick ghost: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("kick ghost: %d", resp.StatusCode)
 	}
 }
 
@@ -231,7 +366,7 @@ func TestOriginCheck(t *testing.T) {
 func TestSSEStream(t *testing.T) {
 	srv, st, h, adminTok := newPanel(t)
 	ctx := context.Background()
-	if _, err := st.CreateAgent(ctx, "alpha", "alpha", "codex", "alpha-host", "/tmp/proj"); err != nil {
+	if _, err := st.CreateAgent(ctx, "alpha", "alpha", "codex", "alpha-host", "/tmp/proj", ""); err != nil {
 		t.Fatalf("create agent: %v", err)
 	}
 	if _, err := st.CreateSession(ctx, "s1", "sse test", "alpha", nil); err != nil {
@@ -346,7 +481,7 @@ func readSSE(t *testing.T, r io.Reader, timeout time.Duration) []sseEvent {
 func TestPanelPostMessageMultipart(t *testing.T) {
 	srv, st, _, adminTok := newPanel(t)
 	ctx := context.Background()
-	if _, err := st.CreateAgent(ctx, "alpha", "alpha", "codex", "alpha-host", "/tmp/proj"); err != nil {
+	if _, err := st.CreateAgent(ctx, "alpha", "alpha", "codex", "alpha-host", "/tmp/proj", ""); err != nil {
 		t.Fatalf("create agent: %v", err)
 	}
 	if _, err := st.CreateSession(ctx, "s1", "multipart post", "alpha", nil); err != nil {
@@ -377,7 +512,7 @@ func TestPanelPostMessageMultipart(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("multipart post: %d %s", resp.StatusCode, string(body))
 	}
-	if !strings.Contains(string(body), "sent via multipart") || !strings.Contains(string(body), "you") {
+	if !strings.Contains(string(body), "sent via multipart") || !strings.Contains(string(body), "admin") {
 		t.Fatalf("fragment missing content: %s", string(body))
 	}
 	msgs, err := st.SessionLatestMessages(ctx, "s1", 10)
@@ -386,7 +521,7 @@ func TestPanelPostMessageMultipart(t *testing.T) {
 	}
 	var found bool
 	for _, m := range msgs {
-		if m.SenderID == "you" && m.Content == "sent via multipart" {
+		if m.SenderID == "admin" && m.Content == "sent via multipart" {
 			found = true
 		}
 	}
@@ -398,7 +533,7 @@ func TestPanelPostMessageMultipart(t *testing.T) {
 func TestArchivedSessionRejectsPosts(t *testing.T) {
 	srv, st, _, adminTok := newPanel(t)
 	ctx := context.Background()
-	if _, err := st.CreateAgent(ctx, "alpha", "alpha", "codex", "alpha-host", "/tmp/proj"); err != nil {
+	if _, err := st.CreateAgent(ctx, "alpha", "alpha", "codex", "alpha-host", "/tmp/proj", ""); err != nil {
 		t.Fatalf("create agent: %v", err)
 	}
 	if _, err := st.CreateSession(ctx, "s1", "archived test", "alpha", nil); err != nil {
@@ -417,5 +552,263 @@ func TestArchivedSessionRejectsPosts(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("expected conflict, got %d %s", resp.StatusCode, string(body))
+	}
+}
+
+func TestPanelCreateSession(t *testing.T) {
+	srv, st, _, adminTok := newPanel(t)
+	ctx := context.Background()
+	for _, a := range []string{"codex:alpha:proj", "opencode:beta:proj"} {
+		if _, err := st.CreateAgent(ctx, a, a, "kind", "h", "/w", ""); err != nil {
+			t.Fatalf("create agent: %v", err)
+		}
+	}
+
+	client := newBrowser(t)
+	login(t, client, srv.URL, adminTok)
+
+	// The dashboard form offers every registered agent as a pick.
+	resp, err := client.Get(srv.URL + "/panel/")
+	if err != nil {
+		t.Fatalf("dashboard: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	for _, want := range []string{"New session", `name="agents" value="codex:alpha:proj"`, `value="opencode:beta:proj"`, `action="/panel/sessions"`} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("dashboard missing %q", want)
+		}
+	}
+
+	// Create a session with both agents picked.
+	form := url.Values{"title": {"ship the release"}, "agents": {"codex:alpha:proj", "opencode:beta:proj"}}
+	resp, err = client.PostForm(srv.URL+"/panel/sessions", form)
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("create session: %d", resp.StatusCode)
+	}
+	loc := resp.Header.Get("Location")
+	if !strings.HasPrefix(loc, "/panel/sessions/") {
+		t.Fatalf("bad redirect: %q", loc)
+	}
+	sid := strings.TrimPrefix(loc, "/panel/sessions/")
+
+	sess, err := st.GetSession(ctx, sid)
+	if err != nil || sess.Title != "ship the release" || sess.CreatedBy != "admin" {
+		t.Fatalf("session: %v %+v", err, sess)
+	}
+	// you + both picked agents are participants — and the picked agents got
+	// join notices, so waiting agents learn they were added.
+	for _, a := range []string{"admin", "codex:alpha:proj", "opencode:beta:proj"} {
+		ok, err := st.IsParticipant(ctx, sid, a)
+		if err != nil || !ok {
+			t.Fatalf("participant %s: %v %v", a, ok, err)
+		}
+	}
+	msgs, err := st.SessionLatestMessages(ctx, sid, 10)
+	if err != nil {
+		t.Fatalf("latest: %v", err)
+	}
+	joins := 0
+	for _, m := range msgs {
+		if m.Kind == "system" && strings.Contains(m.Content, " joined the session") {
+			joins++
+		}
+	}
+	if joins != 2 {
+		t.Fatalf("expected 2 join notices, got %d: %+v", joins, msgs)
+	}
+
+	// One agent can be in many sessions at once (global + this one).
+	if _, err := st.EnsureGlobalSession(ctx, "admin"); err != nil {
+		t.Fatalf("ensure global: %v", err)
+	}
+	if _, err := st.JoinSession(ctx, store.GlobalSessionID, "codex:alpha:proj"); err != nil {
+		t.Fatalf("join global: %v", err)
+	}
+	sids, err := st.SessionsForAgent(ctx, "codex:alpha:proj")
+	if err != nil || len(sids) != 2 {
+		t.Fatalf("expected membership in 2 sessions, got %v: %v", sids, err)
+	}
+
+	// Validation: title required, unknown agent rejected.
+	resp, err = client.PostForm(srv.URL+"/panel/sessions", url.Values{"title": {""}})
+	if err != nil {
+		t.Fatalf("empty title post: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("empty title: %d", resp.StatusCode)
+	}
+	resp, err = client.PostForm(srv.URL+"/panel/sessions", url.Values{"title": {"x"}, "agents": {"ghost"}})
+	if err != nil {
+		t.Fatalf("ghost post: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unknown agent: %d", resp.StatusCode)
+	}
+}
+
+func TestSessionViewMentionables(t *testing.T) {
+	srv, st, _, adminTok := newPanel(t)
+	ctx := context.Background()
+	if _, err := st.CreateAgent(ctx, "admin", "Admin", "human", "", "", ""); err != nil {
+		t.Fatalf("create you: %v", err)
+	}
+	if _, err := st.CreateAgent(ctx, "codex:alpha:proj", "codex:alpha:proj", "codex", "h", "/w", ""); err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+	if _, err := st.CreateSession(ctx, "s1", "room", "admin", []string{"codex:alpha:proj"}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	client := newBrowser(t)
+	login(t, client, srv.URL, adminTok)
+	resp, err := client.Get(srv.URL + "/panel/sessions/s1")
+	if err != nil {
+		t.Fatalf("session view: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	// The composer carries the @autocomplete targets (other participants + all,
+	// "admin" itself excluded) as a JSON data attribute. html/template escapes
+	// quotes in attribute values as &#34;.
+	want := `data-mentionables="[&#34;all&#34;,&#34;codex:alpha:proj&#34;]"`
+	if !strings.Contains(string(body), want) {
+		t.Fatalf("session view missing mentionables %q in:\n%s", want, string(body))
+	}
+}
+
+func TestSessionViewReadMarks(t *testing.T) {
+	srv, st, _, adminTok := newPanel(t)
+	ctx := context.Background()
+	if _, err := st.CreateAgent(ctx, "admin", "Admin", "human", "", "", ""); err != nil {
+		t.Fatalf("create you: %v", err)
+	}
+	if _, err := st.CreateAgent(ctx, "codex:alpha:proj", "codex:alpha:proj", "codex", "h", "/w", ""); err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+	if _, err := st.CreateAgent(ctx, "opencode:beta:proj", "opencode:beta:proj", "opencode", "h", "/w", ""); err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+	if _, err := st.CreateSession(ctx, "s1", "room", "admin", []string{"codex:alpha:proj", "opencode:beta:proj"}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := st.InsertMessage(ctx, &store.Message{SessionID: "s1", SenderID: "admin", Kind: "chat", Content: "hello agents"}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	client := newBrowser(t)
+	login(t, client, srv.URL, adminTok)
+	resp, err := client.Get(srv.URL + "/panel/sessions/s1")
+	if err != nil {
+		t.Fatalf("session view: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	// Unread: both agent participants could read it, none has yet.
+	if !strings.Contains(string(body), `✓0/2`) {
+		t.Fatalf("session view missing unread mark 0/2 in:\n%s", string(body))
+	}
+	// The read state is embedded for app.js (agent ids + agent->seq map).
+	if !strings.Contains(string(body), `data-agents="[&#34;codex:alpha:proj&#34;,&#34;opencode:beta:proj&#34;]"`) {
+		t.Fatalf("session view missing data-agents in:\n%s", string(body))
+	}
+	if !strings.Contains(string(body), `data-reads="{}"`) {
+		t.Fatalf("session view missing empty data-reads in:\n%s", string(body))
+	}
+
+	// One agent waits (cursor lands on the message) → 1/2, not "all".
+	if err := st.MarkRead(ctx, "s1", "codex:alpha:proj", 1); err != nil {
+		t.Fatalf("mark read: %v", err)
+	}
+	resp, err = client.Get(srv.URL + "/panel/sessions/s1")
+	if err != nil {
+		t.Fatalf("session view: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `✓1/2`) || strings.Contains(string(body), "m-read all") {
+		t.Fatalf("session view missing 1/2 mark (not all) in:\n%s", string(body))
+	}
+
+	// Both read → 2/2 with the "all" class.
+	if err := st.MarkRead(ctx, "s1", "opencode:beta:proj", 1); err != nil {
+		t.Fatalf("mark read: %v", err)
+	}
+	resp, err = client.Get(srv.URL + "/panel/sessions/s1")
+	if err != nil {
+		t.Fatalf("session view: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `✓2/2`) || !strings.Contains(string(body), "m-read all") {
+		t.Fatalf("session view missing 2/2 all mark in:\n%s", string(body))
+	}
+}
+
+func TestSSEStreamReads(t *testing.T) {
+	srv, st, h, adminTok := newPanel(t)
+	ctx := context.Background()
+	if _, err := st.CreateAgent(ctx, "admin", "Admin", "human", "", "", ""); err != nil {
+		t.Fatalf("create you: %v", err)
+	}
+	if _, err := st.CreateAgent(ctx, "codex:alpha:proj", "codex:alpha:proj", "codex", "h", "/w", ""); err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+	if _, err := st.CreateSession(ctx, "s1", "sse reads", "admin", []string{"codex:alpha:proj"}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	msg, err := st.InsertMessage(ctx, &store.Message{SessionID: "s1", SenderID: "admin", Kind: "chat", Content: "did you get this"})
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	client := newBrowser(t)
+	login(t, client, srv.URL, adminTok)
+
+	streamCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(streamCtx, "GET", srv.URL+"/panel/sessions/s1/stream?after=0", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	defer resp.Body.Close()
+
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		// The agent's wait batch landing in the store: cursor advances and
+		// the session stream is woken (as api.markReads does).
+		if err := st.MarkRead(ctx, "s1", "codex:alpha:proj", msg.Seq); err != nil {
+			t.Errorf("mark read: %v", err)
+			return
+		}
+		h.NotifySession("s1")
+	}()
+
+	events := readSSE(t, resp.Body, 2*time.Second)
+	var gotMessage, gotReads bool
+	for _, ev := range events {
+		if ev.name == "message" && strings.Contains(ev.data, "did you get this") {
+			gotMessage = true
+		}
+		if ev.name == "reads" && strings.Contains(ev.data, "codex:alpha:proj") {
+			gotReads = true
+		}
+	}
+	if !gotMessage {
+		t.Fatalf("expected message event, got %v", events)
+	}
+	if !gotReads {
+		t.Fatalf("expected reads event for codex:alpha:proj, got %v", events)
 	}
 }

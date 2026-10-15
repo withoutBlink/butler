@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -32,16 +33,23 @@ type Store struct {
 }
 
 // Agent is a registered agent instance: a (kind, hostname, workdir) triple
-// identified by a server-generated name. Multiple instance tokens may be
-// active at once (one per registration).
+// identified by a server-generated name, plus an optional client_session
+// discriminator that splits one app instance into per-client-session
+// identities (e.g. one butler agent per OpenCode session). Multiple instance
+// tokens may be active at once (one per registration).
 type Agent struct {
-	ID          string `json:"id"`
-	DisplayName string `json:"display_name"`
-	Kind        string `json:"kind"`
-	Hostname    string `json:"hostname"`
-	Workdir     string `json:"workdir"`
-	CreatedAt   int64  `json:"created_at"`
-	LastSeenAt  *int64 `json:"last_seen_at,omitempty"`
+	ID            string `json:"id"`
+	DisplayName   string `json:"display_name"`
+	Kind          string `json:"kind"`
+	Hostname      string `json:"hostname"`
+	Workdir       string `json:"workdir"`
+	ClientSession string `json:"client_session,omitempty"`
+	CreatedAt     int64  `json:"created_at"`
+	LastSeenAt    *int64 `json:"last_seen_at,omitempty"`
+	// RemovedAt is set when the agent is kicked (evicted): it keeps its row
+	// — messages and sessions reference it — but listings, participants and
+	// mentions skip it until it re-registers, which clears the flag.
+	RemovedAt *int64 `json:"removed_at,omitempty"`
 }
 
 // Kind is an agent kind (codex, opencode, ...) with a single token shared by
@@ -61,13 +69,26 @@ type Session struct {
 }
 
 type Message struct {
-	Seq       int64  `json:"seq"`
-	ID        string `json:"id"`
-	SessionID string `json:"session_id"`
-	SenderID  string `json:"sender_id"`
-	Kind      string `json:"kind"`
-	Content   string `json:"content"`
-	CreatedAt int64  `json:"created_at"`
+	Seq       int64    `json:"seq"`
+	ID        string   `json:"id"`
+	SessionID string   `json:"session_id"`
+	SenderID  string   `json:"sender_id"`
+	Kind      string   `json:"kind"`
+	Content   string   `json:"content"`
+	Mentions  []string `json:"mentions,omitempty"`
+	CreatedAt int64    `json:"created_at"`
+}
+
+// MentionsAgent reports whether the message @-mentions the given agent.
+// Mentions are resolved to agent ids at insert time (exact id, kind, or
+// @all), so a plain id comparison suffices.
+func (m Message) MentionsAgent(agentID string) bool {
+	for _, id := range m.Mentions {
+		if id == agentID {
+			return true
+		}
+	}
+	return false
 }
 
 type ContextItem struct {
@@ -257,34 +278,37 @@ func (s *Store) RotateKindToken(ctx context.Context, id, tokenHash string) error
 
 // ---- agent instances ----
 
-func (s *Store) CreateAgent(ctx context.Context, name, displayName, kind, hostname, workdir string) (*Agent, error) {
+func (s *Store) CreateAgent(ctx context.Context, name, displayName, kind, hostname, workdir, clientSession string) (*Agent, error) {
 	now := time.Now().Unix()
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO agents (id, display_name, kind, hostname, workdir, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		name, displayName, kind, hostname, workdir, now); err != nil {
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO agents (id, display_name, kind, hostname, workdir, client_session, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		name, displayName, kind, hostname, workdir, clientSession, now); err != nil {
 		if isUniqueErr(err) {
 			return nil, fmt.Errorf("%w: agent %q", ErrConflict, name)
 		}
 		return nil, err
 	}
-	return &Agent{ID: name, DisplayName: displayName, Kind: kind, Hostname: hostname, Workdir: workdir, CreatedAt: now}, nil
+	return &Agent{ID: name, DisplayName: displayName, Kind: kind, Hostname: hostname, Workdir: workdir, ClientSession: clientSession, CreatedAt: now}, nil
 }
 
-const agentCols = `id, display_name, kind, hostname, workdir, created_at, last_seen_at`
+const agentCols = `id, display_name, kind, hostname, workdir, client_session, created_at, last_seen_at, removed_at`
 
 func (s *Store) GetAgent(ctx context.Context, name string) (*Agent, error) {
 	return scanAgent(s.db.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id = ?`, name))
 }
 
-// GetAgentByTokenHash resolves an instance token to its agent.
+// GetAgentByTokenHash resolves an instance token to its agent. Removed
+// (kicked) agents have no tokens, so they never resolve here.
 func (s *Store) GetAgentByTokenHash(ctx context.Context, tokenHash string) (*Agent, error) {
-	return scanAgent(s.db.QueryRowContext(ctx, `SELECT a.id, a.display_name, a.kind, a.hostname, a.workdir, a.created_at, a.last_seen_at
+	return scanAgent(s.db.QueryRowContext(ctx, `SELECT a.id, a.display_name, a.kind, a.hostname, a.workdir, a.client_session, a.created_at, a.last_seen_at, a.removed_at
 		FROM agents a JOIN agent_tokens t ON t.agent_id = a.id WHERE t.token_hash = ?`, tokenHash))
 }
 
-// FindInstance returns the agent registered for (kind, hostname, workdir), if any.
-func (s *Store) FindInstance(ctx context.Context, kind, hostname, workdir string) (*Agent, error) {
-	return scanAgent(s.db.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE kind = ? AND hostname = ? AND workdir = ?`,
-		kind, hostname, workdir))
+// FindInstance returns the agent registered for (kind, hostname, workdir,
+// clientSession). clientSession "" is the app-level identity; a non-empty
+// discriminator selects the per-client-session sibling of that identity.
+func (s *Store) FindInstance(ctx context.Context, kind, hostname, workdir, clientSession string) (*Agent, error) {
+	return scanAgent(s.db.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE kind = ? AND hostname = ? AND workdir = ? AND client_session = ?`,
+		kind, hostname, workdir, clientSession))
 }
 
 // ReplaceAgentToken revokes every instance token of an agent and issues a
@@ -311,9 +335,47 @@ func (s *Store) ReplaceAgentToken(ctx context.Context, agentID, tokenHash string
 	return tx.Commit()
 }
 
+// UpdateAgentDisplayName refreshes an agent's display name (e.g. a changed
+// client-session title re-registered by its owner). The id never changes.
+func (s *Store) UpdateAgentDisplayName(ctx context.Context, agentID, displayName string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE agents SET display_name = ? WHERE id = ?`, displayName, agentID)
+	return err
+}
+
 // RevokeAgentTokens invalidates all instance tokens of an agent.
 func (s *Store) RevokeAgentTokens(ctx context.Context, agentID string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM agent_tokens WHERE agent_id = ?`, agentID)
+	return err
+}
+
+// RemoveAgent evicts an agent: its tokens are revoked and it is marked
+// removed — hidden from listings, session participants and mention
+// resolution. The row itself survives (messages and sessions reference it);
+// re-registering the identity revives it (ClearAgentRemoved). Participants
+// and read marks are left in place so a revive restores them untouched.
+func (s *Store) RemoveAgent(ctx context.Context, agentID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE agents SET removed_at = ? WHERE id = ? AND removed_at IS NULL`, time.Now().Unix(), agentID)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return ErrNotFound
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM agent_tokens WHERE agent_id = ?`, agentID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ClearAgentRemoved revives an evicted agent (called when the identity
+// re-registers — a live process coming back).
+func (s *Store) ClearAgentRemoved(ctx context.Context, agentID string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE agents SET removed_at = NULL WHERE id = ?`, agentID)
 	return err
 }
 
@@ -353,7 +415,28 @@ func (s *Store) UniqueAgentName(ctx context.Context, kind, hostname, workdir str
 			kept = append(kept, p)
 		}
 	}
-	base := strings.Join(kept, ":")
+	return s.uniqueName(ctx, strings.Join(kept, ":"))
+}
+
+// UniqueSessionAgentName mints the name of a per-client-session agent from
+// the kind and a slug of its display name — normally the client session's
+// title, e.g. "Fix read marks" → "opencode:fix-read-marks" — so a human can
+// tell the agents of two same-workdir client sessions apart in transcripts
+// and @mentions. Falls back to the workdir basename when the display name
+// has no usable characters. Names are minted once; a later title change does
+// not remint (existing identities keep their names).
+func (s *Store) UniqueSessionAgentName(ctx context.Context, kind, displayName, workdir string) string {
+	slug := sanitizeName(displayName)
+	if slug == "" {
+		slug = sanitizeName(path.Base(workdir))
+	}
+	base := truncateSlug(sanitizeName(kind), 16) + ":" + truncateSlug(slug, 36)
+	return s.uniqueName(ctx, strings.Trim(base, "-:"))
+}
+
+// uniqueName trims a candidate to ≤48 chars and appends -2, -3, … until it
+// collides with no existing agent.
+func (s *Store) uniqueName(ctx context.Context, base string) string {
 	if base == "" {
 		base = "agent"
 	}
@@ -401,8 +484,8 @@ func sanitizeName(s string) string {
 
 func scanAgent(row *sql.Row) (*Agent, error) {
 	var a Agent
-	var lastSeen sql.NullInt64
-	if err := row.Scan(&a.ID, &a.DisplayName, &a.Kind, &a.Hostname, &a.Workdir, &a.CreatedAt, &lastSeen); err != nil {
+	var lastSeen, removed sql.NullInt64
+	if err := row.Scan(&a.ID, &a.DisplayName, &a.Kind, &a.Hostname, &a.Workdir, &a.ClientSession, &a.CreatedAt, &lastSeen, &removed); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -411,6 +494,10 @@ func scanAgent(row *sql.Row) (*Agent, error) {
 	if lastSeen.Valid {
 		v := lastSeen.Int64
 		a.LastSeenAt = &v
+	}
+	if removed.Valid {
+		v := removed.Int64
+		a.RemovedAt = &v
 	}
 	return &a, nil
 }
@@ -424,25 +511,80 @@ func (s *Store) queryAgents(ctx context.Context, q string, args ...any) ([]Agent
 	agents := []Agent{}
 	for rows.Next() {
 		var a Agent
-		var lastSeen sql.NullInt64
-		if err := rows.Scan(&a.ID, &a.DisplayName, &a.Kind, &a.Hostname, &a.Workdir, &a.CreatedAt, &lastSeen); err != nil {
+		var lastSeen, removed sql.NullInt64
+		if err := rows.Scan(&a.ID, &a.DisplayName, &a.Kind, &a.Hostname, &a.Workdir, &a.ClientSession, &a.CreatedAt, &lastSeen, &removed); err != nil {
 			return nil, err
 		}
 		if lastSeen.Valid {
 			v := lastSeen.Int64
 			a.LastSeenAt = &v
 		}
+		if removed.Valid {
+			v := removed.Int64
+			a.RemovedAt = &v
+		}
 		agents = append(agents, a)
 	}
 	return agents, rows.Err()
 }
 
+// ListAgents returns the active (non-removed) agents. Kicked agents stay
+// hidden until they re-register.
 func (s *Store) ListAgents(ctx context.Context) ([]Agent, error) {
-	return s.queryAgents(ctx, `SELECT `+agentCols+` FROM agents ORDER BY id`)
+	return s.queryAgents(ctx, `SELECT `+agentCols+` FROM agents WHERE removed_at IS NULL ORDER BY id`)
 }
 
 func (s *Store) TouchAgent(ctx context.Context, id string) {
 	_, _ = s.db.ExecContext(ctx, `UPDATE agents SET last_seen_at = ? WHERE id = ?`, time.Now().Unix(), id)
+}
+
+// GlobalSessionID is the fixed id of the default session every agent joins
+// automatically: created at server bootstrap, joined on registration.
+const GlobalSessionID = "global"
+
+// GlobalSessionTitle is the display title of the global session.
+const GlobalSessionTitle = "Global"
+
+// EnsureGlobalSession creates the global session (the default room shared by
+// every agent) if it does not exist yet and adds creatorID — normally the
+// panel's "admin" agent — as its first participant. Idempotent: safe to call at
+// every server start. Returns whether the session was newly created.
+func (s *Store) EnsureGlobalSession(ctx context.Context, creatorID string) (bool, error) {
+	now := time.Now().Unix()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	created := false
+	res, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO sessions (id, title, status, created_by, created_at) VALUES (?, ?, 'active', ?, ?)`,
+		GlobalSessionID, GlobalSessionTitle, creatorID, now)
+	if err != nil {
+		if isFKErr(err) {
+			return false, fmt.Errorf("%w: creator %q", ErrNotFound, creatorID)
+		}
+		return false, err
+	}
+	if n, err := res.RowsAffected(); err == nil && n > 0 {
+		created = true
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO participants (session_id, agent_id, joined_at) VALUES (?, ?, ?)`,
+		GlobalSessionID, creatorID, now); err != nil {
+		if isFKErr(err) {
+			return false, fmt.Errorf("%w: creator %q", ErrNotFound, creatorID)
+		}
+		return false, err
+	}
+	if created {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO messages (id, session_id, sender_id, kind, content, created_at) VALUES (?, ?, ?, 'system', ?, ?)`,
+			ids.New(), GlobalSessionID, creatorID, creatorID+" created the global session — every agent joins it automatically", now); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return created, nil
 }
 
 func (s *Store) CreateSession(ctx context.Context, id, title, creatorID string, participants []string) (*Session, error) {
@@ -568,9 +710,15 @@ func (s *Store) IsParticipant(ctx context.Context, sessionID, agentID string) (b
 func (s *Store) Participants(ctx context.Context, sessionID string) ([]Agent, error) {
 	return s.queryAgents(ctx, `SELECT `+agentCols+`
 		FROM agents a JOIN participants p ON p.agent_id = a.id
-		WHERE p.session_id = ? ORDER BY a.id`, sessionID)
+		WHERE p.session_id = ? AND a.removed_at IS NULL ORDER BY a.id`, sessionID)
 }
 
+// InsertMessage stores a chat message. @mentions in the content are resolved
+// against the session's participants (exact agent id, agent kind, or
+// @all/@everyone) and stored with the message, so consumers can tell "this
+// message addresses me" (reply expected) from FYI. Message ids are
+// client-supplied and idempotent: re-inserting the same id is a no-op that
+// returns the stored message.
 func (s *Store) InsertMessage(ctx context.Context, m *Message) (*Message, error) {
 	if m.ID == "" {
 		m.ID = ids.New()
@@ -578,8 +726,19 @@ func (s *Store) InsertMessage(ctx context.Context, m *Message) (*Message, error)
 	if m.CreatedAt == 0 {
 		m.CreatedAt = time.Now().UnixMilli()
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO messages (id, session_id, sender_id, kind, content, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING`,
-		m.ID, m.SessionID, m.SenderID, m.Kind, m.Content, m.CreatedAt)
+	if m.Mentions == nil {
+		m.Mentions = s.resolveMentions(ctx, m.SessionID, m.Content)
+	}
+	mentionsJSON := "[]"
+	if len(m.Mentions) > 0 {
+		b, err := json.Marshal(m.Mentions)
+		if err != nil {
+			return nil, err
+		}
+		mentionsJSON = string(b)
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO messages (id, session_id, sender_id, kind, content, mentions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING`,
+		m.ID, m.SessionID, m.SenderID, m.Kind, m.Content, mentionsJSON, m.CreatedAt)
 	if err != nil {
 		if isFKErr(err) {
 			return nil, fmt.Errorf("%w: session or agent referenced by message", ErrNotFound)
@@ -589,21 +748,108 @@ func (s *Store) InsertMessage(ctx context.Context, m *Message) (*Message, error)
 	return s.GetMessage(ctx, m.ID)
 }
 
+// resolveMentions maps the @tokens in content to the participant agents they
+// address: "@<agent id>" (exact), "@<kind>" (every participant of that kind)
+// and "@all"/"@everyone"/"@here" (all participants). Tokens that match no
+// participant resolve to nothing — mentioning only reaches agents already in
+// the session.
+func (s *Store) resolveMentions(ctx context.Context, sessionID, content string) []string {
+	tokens := mentionTokens(content)
+	if len(tokens) == 0 {
+		return nil
+	}
+	participants, err := s.Participants(ctx, sessionID)
+	if err != nil {
+		// Fail open: store the message without mentions rather than
+		// dropping it.
+		return nil
+	}
+	var mentions []string
+	seen := map[string]bool{}
+	add := func(id string) {
+		if id != "" && !seen[id] {
+			seen[id] = true
+			mentions = append(mentions, id)
+		}
+	}
+	for _, tok := range tokens {
+		switch tok {
+		case "all", "everyone", "here":
+			for _, p := range participants {
+				add(p.ID)
+			}
+		default:
+			for _, p := range participants {
+				if p.ID == tok || p.Kind == tok {
+					add(p.ID)
+				}
+			}
+		}
+	}
+	return mentions
+}
+
+// mentionTokens extracts the distinct @tokens in content: an "@" followed by
+// agent-id characters (letters, digits, ":", "_", "-"). Emails and other @
+// uses only match when they happen to equal a participant id or kind.
+func mentionTokens(content string) []string {
+	var tokens []string
+	seen := map[string]bool{}
+	for i := 0; i < len(content); i++ {
+		if content[i] != '@' {
+			continue
+		}
+		j := i + 1
+		for j < len(content) && isMentionChar(content[j]) {
+			j++
+		}
+		if j > i+1 {
+			tok := content[i+1 : j]
+			if !seen[tok] {
+				seen[tok] = true
+				tokens = append(tokens, tok)
+			}
+			i = j - 1
+		}
+	}
+	return tokens
+}
+
+func isMentionChar(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
+		c == '_' || c == ':' || c == '-'
+}
+
+// scanMentions decodes the mentions column; undecodable values (never
+// produced by this code) read as no mentions.
+func scanMentions(raw string) []string {
+	if raw == "" || raw == "[]" {
+		return nil
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
 func (s *Store) GetMessage(ctx context.Context, id string) (*Message, error) {
 	var m Message
-	err := s.db.QueryRowContext(ctx, `SELECT global_seq, id, session_id, sender_id, kind, content, created_at FROM messages WHERE id = ?`, id).
-		Scan(&m.Seq, &m.ID, &m.SessionID, &m.SenderID, &m.Kind, &m.Content, &m.CreatedAt)
+	var mentionsJSON string
+	err := s.db.QueryRowContext(ctx, `SELECT global_seq, id, session_id, sender_id, kind, content, mentions, created_at FROM messages WHERE id = ?`, id).
+		Scan(&m.Seq, &m.ID, &m.SessionID, &m.SenderID, &m.Kind, &m.Content, &mentionsJSON, &m.CreatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
+	m.Mentions = scanMentions(mentionsJSON)
 	return &m, nil
 }
 
 func (s *Store) MessagesSince(ctx context.Context, agentID, sessionID string, after int64, limit int) ([]Message, error) {
-	q := `SELECT global_seq, id, session_id, sender_id, kind, content, created_at FROM messages`
+	q := `SELECT global_seq, id, session_id, sender_id, kind, content, mentions, created_at FROM messages`
 	var args []any
 	if sessionID != "" {
 		q += ` WHERE session_id = ? AND global_seq > ?`
@@ -622,9 +868,11 @@ func (s *Store) MessagesSince(ctx context.Context, agentID, sessionID string, af
 	msgs := []Message{}
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.Seq, &m.ID, &m.SessionID, &m.SenderID, &m.Kind, &m.Content, &m.CreatedAt); err != nil {
+		var mentionsJSON string
+		if err := rows.Scan(&m.Seq, &m.ID, &m.SessionID, &m.SenderID, &m.Kind, &m.Content, &mentionsJSON, &m.CreatedAt); err != nil {
 			return nil, err
 		}
+		m.Mentions = scanMentions(mentionsJSON)
 		msgs = append(msgs, m)
 	}
 	return msgs, rows.Err()
@@ -636,8 +884,44 @@ func (s *Store) LatestSeq(ctx context.Context) (int64, error) {
 	return n, err
 }
 
+// MarkRead advances the per-session read cursor for an agent: the message
+// seq up to which the agent has received the session's messages (a wait
+// long-poll batch, a message fetch, or the agent's own post). Cursors are
+// monotonic — a lower seq never moves one back. The panel renders "already
+// read" marks from these cursors.
+func (s *Store) MarkRead(ctx context.Context, sessionID, agentID string, seq int64) error {
+	if seq <= 0 {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO read_marks (session_id, agent_id, last_seq) VALUES (?, ?, ?)
+		ON CONFLICT (session_id, agent_id) DO UPDATE SET last_seq = MAX(last_seq, excluded.last_seq)`,
+		sessionID, agentID, seq)
+	return err
+}
+
+// ReadMarks returns the per-agent read cursors for a session: a map of agent
+// id to the highest seq that agent has received. Agents absent from the map
+// have read nothing in the session.
+func (s *Store) ReadMarks(ctx context.Context, sessionID string) (map[string]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT agent_id, last_seq FROM read_marks WHERE session_id = ?`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	marks := map[string]int64{}
+	for rows.Next() {
+		var id string
+		var seq int64
+		if err := rows.Scan(&id, &seq); err != nil {
+			return nil, err
+		}
+		marks[id] = seq
+	}
+	return marks, rows.Err()
+}
+
 func (s *Store) SessionLatestMessages(ctx context.Context, sessionID string, n int) ([]Message, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT global_seq, id, session_id, sender_id, kind, content, created_at
+	rows, err := s.db.QueryContext(ctx, `SELECT global_seq, id, session_id, sender_id, kind, content, mentions, created_at
 		FROM messages WHERE session_id = ? ORDER BY global_seq DESC LIMIT ?`, sessionID, n)
 	if err != nil {
 		return nil, err
@@ -646,9 +930,11 @@ func (s *Store) SessionLatestMessages(ctx context.Context, sessionID string, n i
 	msgs := []Message{}
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.Seq, &m.ID, &m.SessionID, &m.SenderID, &m.Kind, &m.Content, &m.CreatedAt); err != nil {
+		var mentionsJSON string
+		if err := rows.Scan(&m.Seq, &m.ID, &m.SessionID, &m.SenderID, &m.Kind, &m.Content, &mentionsJSON, &m.CreatedAt); err != nil {
 			return nil, err
 		}
+		m.Mentions = scanMentions(mentionsJSON)
 		msgs = append(msgs, m)
 	}
 	if err := rows.Err(); err != nil {

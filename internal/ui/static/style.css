@@ -1,12 +1,18 @@
 :root {
-  --bg: #f6f7f9;
-  --fg: #1f2328;
-  --muted: #6a737d;
-  --border: #d8dee4;
-  --accent: #0969da;
-  --card: #ffffff;
-  --system: #8250df;
-  --context: #9a6700;
+  /* Dark scheme (GitHub-dark inspired). color-scheme makes form controls,
+     scrollbars and selection render dark natively. */
+  color-scheme: dark;
+  --bg: #0d1117;
+  --fg: #e6edf3;
+  --muted: #8b949e;
+  --border: #30363d;
+  --accent: #4493f8;
+  --card: #161b22;
+  --system: #ab7df8;
+  --context: #d29922;
+  --ok: #3fb950;
+  --row: #21262d;
+  --err: #f85149;
 }
 * { box-sizing: border-box; }
 body {
@@ -36,28 +42,44 @@ h2, h3 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.05em; col
 .login-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 32px; width: 340px; text-align: center; }
 .login-card h1 { margin: 0 0 8px; }
 .login-card p { color: var(--muted); margin: 0 0 16px; }
-.login-card input { width: 100%; padding: 8px; margin-bottom: 12px; border: 1px solid var(--border); border-radius: 6px; }
+.login-card input { width: 100%; padding: 8px; margin-bottom: 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--fg); }
 .login-card button { width: 100%; padding: 8px; background: var(--accent); color: #fff; border: none; border-radius: 6px; cursor: pointer; }
-.error { color: #cf222e; }
+.error { color: var(--err); }
 
 .dashboard { display: grid; gap: 20px; }
-.agents, .sessions { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+.agents, .sessions, .new-session { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+.new-session-form { display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }
+.new-session-form input[type=text] { padding: 8px; border: 1px solid var(--border); border-radius: 6px; font: inherit; background: var(--bg); color: var(--fg); }
+.new-session-form button { align-self: flex-start; padding: 8px 16px; background: var(--accent); color: #fff; border: none; border-radius: 6px; cursor: pointer; }
+.picks { display: flex; flex-wrap: wrap; gap: 8px; }
+.pick { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 14px; cursor: pointer; }
+.pick input { margin: 0; }
+.hint { color: var(--muted); font-size: 13px; }
 .preview { color: var(--muted); font-size: 12px; }
 table { border-collapse: collapse; width: 100%; table-layout: auto; }
 td, th { text-align: left; padding: 8px 10px; border-top: 1px solid var(--border); vertical-align: top; }
 th { border-top: none; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
 td a { color: var(--accent); text-decoration: none; font-weight: 600; }
 .id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; overflow-wrap: anywhere; }
+.sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.kick { padding: 2px 10px; background: transparent; color: var(--muted); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; font: inherit; font-size: 12px; }
+.kick:hover { color: var(--err); border-color: var(--err); }
 
 .session-layout { display: grid; grid-template-columns: 280px 1fr; gap: 20px; }
-.sidebar, .chat { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+/* Narrow windows / phones: single column, chat first. */
+@media (max-width: 760px) {
+  .session-layout { grid-template-columns: 1fr; }
+  .session-layout .chat-pane { order: -1; }
+  #messages { max-height: 55vh; }
+}
+.sidebar, .chat-pane { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
 .sidebar { display: flex; flex-direction: column; gap: 20px; }
 .p-online { list-style: none; position: relative; padding-left: 16px; }
-.p-online::before { content: ""; position: absolute; left: 2px; top: 7px; width: 8px; height: 8px; border-radius: 50%; background: #2da44e; }
+.p-online::before { content: ""; position: absolute; left: 2px; top: 7px; width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
 .p-offline { list-style: none; position: relative; padding-left: 16px; }
 .p-offline::before { content: ""; position: absolute; left: 2px; top: 7px; width: 8px; height: 8px; border-radius: 50%; background: var(--border); }
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--border); }
-.dot.on { background: #2da44e; }
+.dot.on { background: var(--ok); }
 #participants ul { margin: 0; padding: 0; }
 #participants li { padding: 4px 0 4px 16px; }
 #participants .id { font-size: 12px; }
@@ -66,19 +88,33 @@ td a { color: var(--accent); text-decoration: none; font-weight: 600; }
 .context dt { font-weight: 600; margin-top: 8px; }
 .context dd { margin: 2px 0 0 0; white-space: pre-wrap; word-break: break-word; }
 .context-form { display: flex; flex-direction: column; gap: 6px; margin-top: 16px; }
-.context-form input, .context-form textarea { padding: 6px; border: 1px solid var(--border); border-radius: 6px; font: inherit; }
+.context-form input, .context-form textarea { padding: 6px; border: 1px solid var(--border); border-radius: 6px; font: inherit; background: var(--bg); color: var(--fg); }
 .context-form textarea { min-height: 48px; resize: vertical; }
 .context-form button { padding: 6px; background: var(--accent); color: #fff; border: none; border-radius: 6px; cursor: pointer; }
 
-.chat { display: flex; flex-direction: column; min-height: 70vh; }
+/* NOTE: layout styles target .chat-pane, NOT .chat — every chat message
+   carries class "msg chat" (kind), and a bare .chat selector would hit
+   those too (that bug made each message min-height: 70vh). */
+.chat-pane { display: flex; flex-direction: column; min-height: 70vh; }
 #messages { flex: 1; overflow-y: auto; max-height: 70vh; padding-right: 8px; }
-.msg { padding: 4px 0; border-bottom: 1px solid #eef1f4; }
-.m-meta { color: var(--muted); font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+.msg { padding: 3px 0; border-bottom: 1px solid var(--row); line-height: 1.4; }
+.m-meta { color: var(--muted); font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .m-meta b { color: var(--fg); }
-.m-content { white-space: pre-wrap; word-break: break-word; margin-top: 0; }
+/* Read mark: "✓k/N" agent participants (≠ sender) have received the message;
+   turns green when everyone has. See app.js updateReadMarks. */
+.m-read { color: var(--muted); font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin-left: 6px; white-space: nowrap; }
+.m-read.all { color: var(--ok); }
+/* Meta and content share one line; long messages clamp to a few lines and
+   expand on click (see app.js markClamp). */
+.m-content { white-space: pre-wrap; word-break: break-word; margin-top: 0; max-height: 7em; overflow: hidden; }
+.m-content.clamped { cursor: pointer; }
+.m-content.expanded { max-height: none; }
 .msg.system .m-content, .msg.context .m-content { color: var(--muted); font-style: italic; }
 .msg.system .kind { color: var(--system); }
 .msg.context .kind { color: var(--context); }
-#compose { display: flex; gap: 8px; margin-top: 12px; }
-#compose textarea { flex: 1; padding: 8px; border: 1px solid var(--border); border-radius: 6px; font: inherit; min-height: 44px; resize: vertical; }
+#compose { display: flex; gap: 8px; margin-top: 12px; position: relative; }
+#compose textarea { flex: 1; padding: 8px; border: 1px solid var(--border); border-radius: 6px; font: inherit; min-height: 44px; resize: vertical; background: var(--bg); color: var(--fg); }
 #compose button { padding: 8px 16px; background: var(--accent); color: #fff; border: none; border-radius: 6px; cursor: pointer; }
+.mention-menu { position: absolute; bottom: 100%; left: 0; margin-bottom: 4px; min-width: 260px; max-width: 420px; max-height: 220px; overflow-y: auto; background: var(--card); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 4px 16px rgba(0,0,0,0.5); z-index: 10; }
+.mention-item { padding: 6px 10px; cursor: pointer; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; overflow-wrap: anywhere; }
+.mention-item.active { background: rgba(68, 147, 248, 0.2); }

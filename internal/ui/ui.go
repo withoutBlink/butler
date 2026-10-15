@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -32,9 +33,14 @@ var files embed.FS
 const (
 	cookieName   = "butler_panel"
 	sessionTTL   = 30 * 24 * time.Hour
-	youAgentID   = "you"
 	maxPostBytes = 64 << 10
 )
+
+// AdminAgentID is the fixed identity of the human on the panel (kind
+// "human"). It never authenticates via the agent API — the panel acts as it
+// through its login sessions — so it is treated as always online: anyone
+// seeing presence is, by definition, looking at the panel.
+const AdminAgentID = "admin"
 
 type Panel struct {
 	Store      *store.Store
@@ -110,6 +116,10 @@ func New(st *store.Store, h *hub.Hub, adminToken string, log *slog.Logger) (*Pan
 		"asset": func(name string) string {
 			return "/panel/static/" + name + "?v=" + assetVersion
 		},
+		// agentOnline drives the participants sidebar dot: present within
+		// the presence window, or the admin (always online — see
+		// AdminAgentID).
+		"agentOnline": func(a store.Agent) bool { return agentOnline(&a) },
 	}
 	tmpl, err := template.New("").Funcs(funcs).ParseFS(files, "templates/*.tmpl")
 	if err != nil {
@@ -166,10 +176,12 @@ func (p *Panel) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /panel/login", p.loginSubmit)
 	mux.HandleFunc("POST /panel/logout", p.logout)
 	mux.HandleFunc("GET /panel/", p.dashboard)
+	mux.HandleFunc("POST /panel/sessions", p.createSession)
 	mux.HandleFunc("GET /panel/sessions/{id}", p.sessionView)
 	mux.HandleFunc("POST /panel/sessions/{id}/messages", p.postMessage)
 	mux.HandleFunc("POST /panel/sessions/{id}/context", p.putContext)
 	mux.HandleFunc("GET /panel/sessions/{id}/stream", p.stream)
+	mux.HandleFunc("POST /panel/agents/{id}/revoke", p.revokeAgent)
 }
 
 func (p *Panel) requirePanel(w http.ResponseWriter, r *http.Request) bool {
@@ -256,11 +268,19 @@ type dashSessionRow struct {
 type dashData struct {
 	Sessions []dashSessionRow
 	Agents   []agentRow
+	// Pickable reports whether any agent other than "admin" exists (i.e.
+	// the new-session form has someone to pick).
+	Pickable bool
 }
 
 type agentRow struct {
 	ID       string
 	Kind     string
+	// Title is the display title (the OpenCode/codex session title for
+	// per-session agents, the minted id otherwise). Sub shows the id when
+	// it differs — it is what @mentions resolve against.
+	Title    string
+	Sub      string
 	Hostname string
 	Workdir  string
 	Online   bool
@@ -296,22 +316,219 @@ func (p *Panel) dashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	agentRows := make([]agentRow, 0, len(agents))
+	pickable := false
 	for _, a := range agents {
-		row := agentRow{ID: a.ID, Kind: a.Kind, Hostname: a.Hostname, Workdir: a.Workdir, Online: online(a.LastSeenAt), LastTxt: "never"}
+		row := agentRow{ID: a.ID, Kind: a.Kind, Title: a.DisplayName, Hostname: a.Hostname, Workdir: a.Workdir, Online: agentOnline(&a), LastTxt: "never"}
+		if a.DisplayName != a.ID {
+			row.Sub = a.ID
+		}
 		if a.LastSeenAt != nil {
 			row.LastTxt = time.Unix(*a.LastSeenAt, 0).UTC().Format("15:04:05")
 		}
+		if a.ID != AdminAgentID {
+			pickable = true
+		}
 		agentRows = append(agentRows, row)
 	}
-	p.render(w, http.StatusOK, "dashboard.tmpl", dashData{Sessions: rows, Agents: agentRows})
+	p.render(w, http.StatusOK, "dashboard.tmpl", dashData{Sessions: rows, Agents: agentRows, Pickable: pickable})
+}
+
+// createSession handles the dashboard "New session" form: a title plus a
+// picked set of agents. The session is created by "admin" (joined
+// automatically), every picked agent is added with a join notice so waiting
+// agents learn they were added, and the browser lands on the session page.
+// An agent can be in any number of sessions at once.
+func (p *Panel) createSession(w http.ResponseWriter, r *http.Request) {
+	if !p.requirePanel(w, r) {
+		return
+	}
+	if !sameOrigin(r) {
+		http.Error(w, "cross-origin rejected", http.StatusForbidden)
+		return
+	}
+	ctx := r.Context()
+	r.Body = http.MaxBytesReader(w, r.Body, maxPostBytes+4096)
+	if err := parsePanelForm(r); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	title := strings.TrimSpace(r.PostFormValue("title"))
+	if title == "" {
+		http.Error(w, "title is required", http.StatusBadRequest)
+		return
+	}
+	if len(title) > 200 {
+		http.Error(w, "title exceeds 200 characters", http.StatusBadRequest)
+		return
+	}
+	admin, err := p.adminAgent(ctx)
+	if err != nil {
+		p.httpError(w, "store error", 500)
+		return
+	}
+	seen := map[string]bool{}
+	picked := []string{}
+	for _, a := range r.PostForm["agents"] {
+		a = strings.TrimSpace(a)
+		if a == "" || a == AdminAgentID || seen[a] {
+			continue
+		}
+		if _, err := p.Store.GetAgent(ctx, a); err != nil {
+			http.Error(w, "unknown agent "+a, http.StatusBadRequest)
+			return
+		}
+		seen[a] = true
+		picked = append(picked, a)
+	}
+	sid := ids.New()
+	if _, err := p.Store.CreateSession(ctx, sid, title, admin.ID, nil); err != nil {
+		p.httpError(w, "store error", 500)
+		return
+	}
+	for _, a := range picked {
+		if _, err := p.Store.JoinSession(ctx, sid, a); err != nil {
+			p.httpError(w, "store error", 500)
+			return
+		}
+	}
+	p.fanout(ctx, sid)
+	http.Redirect(w, r, "/panel/sessions/"+sid, http.StatusSeeOther)
+}
+
+// revokeAgent is the dashboard agents-table "kick" button. It evicts the
+// agent: tokens revoked AND the identity hidden from the panel and session
+// participants (with a system notice per session) — a kick is visible
+// immediately, not just after the 90s presence window. The row itself
+// survives (history references it); a live process re-registering the
+// identity revives it, so kicking a stale agent is permanent cleanup while
+// kicking a live one only disconnects it until its next registration.
+func (p *Panel) revokeAgent(w http.ResponseWriter, r *http.Request) {
+	if !p.requirePanel(w, r) {
+		return
+	}
+	if !sameOrigin(r) {
+		http.Error(w, "cross-origin rejected", http.StatusForbidden)
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" || id == AdminAgentID {
+		http.Redirect(w, r, "/panel/", http.StatusSeeOther)
+		return
+	}
+	agent, err := p.Store.GetAgent(r.Context(), id)
+	if err != nil {
+		p.httpError(w, "store error", 404)
+		return
+	}
+	if err := p.Store.RemoveAgent(r.Context(), id); err != nil {
+		p.httpError(w, "store error", 500)
+		return
+	}
+	p.Log.Info("panel evicted agent", "id", id)
+	p.announceEviction(r.Context(), agent)
+	http.Redirect(w, r, "/panel/", http.StatusSeeOther)
+}
+
+// announceEviction posts a system message in every session the evicted agent
+// participated in and wakes both subscriber kinds, so open panels and
+// waiting agents see immediately why it vanished.
+func (p *Panel) announceEviction(ctx context.Context, agent *store.Agent) {
+	sids, err := p.Store.SessionsForAgent(ctx, agent.ID)
+	if err != nil {
+		p.Log.Error("list sessions for agent", "err", err, "agent", agent.ID)
+		return
+	}
+	content := agent.ID + " was kicked by admin (tokens revoked; hidden until it re-registers)"
+	for _, sid := range sids {
+		if _, err := p.Store.InsertMessage(ctx, &store.Message{
+			ID: ids.New(), SessionID: sid, SenderID: agent.ID, Kind: "system", Content: content,
+		}); err != nil {
+			p.Log.Error("announce eviction", "err", err, "session", sid)
+			continue
+		}
+		p.fanout(ctx, sid)
+	}
 }
 
 type sessionViewData struct {
 	Session      store.Session
 	Participants []store.Agent
-	Messages     []store.Message
+	Messages     []uiMsg
 	ContextItems []store.ContextItem
 	LatestSeq    int64
+	// Mentionables is a JSON array of @autocomplete targets for the
+	// composer: every other participant plus "all".
+	Mentionables string
+	// Agents is a JSON array of the session's agent participant ids and
+	// Reads a JSON object of agent id -> highest read seq. app.js uses
+	// these (plus SSE "reads" events) to keep the per-message read marks
+	// current without a page reload.
+	Agents string
+	Reads  string
+}
+
+// uiMsg is a message plus the panel's read state for it.
+type uiMsg struct {
+	store.Message
+	ReadCount int    // agent participants (≠ sender) whose read cursor covers the message
+	ReadTotal int    // agent participants (≠ sender) who could read it
+	Readers   string // comma-joined ids of the readers, for the mark's tooltip
+}
+
+// readState is a session's read-cursor snapshot: the agent participants and
+// their highest read seq. "admin" has no cursor — the human reads in the panel.
+type readState struct {
+	agents []string
+	marks  map[string]int64
+}
+
+func (p *Panel) loadReadState(ctx context.Context, sid string) readState {
+	rs := readState{agents: []string{}, marks: map[string]int64{}}
+	parts, err := p.Store.Participants(ctx, sid)
+	if err != nil {
+		p.Log.Error("participants", "err", err, "session", sid)
+		return rs
+	}
+	for _, a := range parts {
+		if a.ID != AdminAgentID {
+			rs.agents = append(rs.agents, a.ID)
+		}
+	}
+	marks, err := p.Store.ReadMarks(ctx, sid)
+	if err != nil {
+		p.Log.Error("read marks", "err", err, "session", sid)
+		return rs
+	}
+	rs.marks = marks
+	return rs
+}
+
+// attachReadState computes per-message read marks for rendering: a chat
+// message counts as read for each agent participant other than the sender
+// whose cursor has reached its seq. Non-chat kinds never show marks.
+func attachReadState(rs readState, msgs []store.Message) []uiMsg {
+	out := make([]uiMsg, len(msgs))
+	for i, m := range msgs {
+		vm := uiMsg{Message: m}
+		if m.Kind != "chat" {
+			out[i] = vm
+			continue
+		}
+		var readers []string
+		for _, a := range rs.agents {
+			if a == m.SenderID {
+				continue
+			}
+			vm.ReadTotal++
+			if rs.marks[a] >= m.Seq {
+				readers = append(readers, a)
+			}
+		}
+		vm.ReadCount = len(readers)
+		vm.Readers = strings.Join(readers, ", ")
+		out[i] = vm
+	}
+	return out
 }
 
 func (p *Panel) sessionView(w http.ResponseWriter, r *http.Request) {
@@ -344,8 +561,33 @@ func (p *Panel) sessionView(w http.ResponseWriter, r *http.Request) {
 	if len(msgs) > 0 {
 		latest = msgs[len(msgs)-1].Seq
 	}
+	targets := make([]string, 0, len(parts)+1)
+	targets = append(targets, "all")
+	for _, pa := range parts {
+		if pa.ID == AdminAgentID {
+			continue
+		}
+		targets = append(targets, pa.ID)
+	}
+	mentionables, err := json.Marshal(targets)
+	if err != nil {
+		p.httpError(w, "store error", 500)
+		return
+	}
+	rs := p.loadReadState(ctx, sid)
+	readsJSON, err := json.Marshal(rs.marks)
+	if err != nil {
+		p.httpError(w, "store error", 500)
+		return
+	}
+	agentsJSON, err := json.Marshal(rs.agents)
+	if err != nil {
+		p.httpError(w, "store error", 500)
+		return
+	}
 	p.render(w, http.StatusOK, "session.tmpl", sessionViewData{
-		Session: *sess, Participants: parts, Messages: msgs, ContextItems: items, LatestSeq: latest,
+		Session: *sess, Participants: parts, Messages: attachReadState(rs, msgs), ContextItems: items, LatestSeq: latest,
+		Mentionables: string(mentionables), Agents: string(agentsJSON), Reads: string(readsJSON),
 	})
 }
 
@@ -382,27 +624,27 @@ func (p *Panel) postMessage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "session is "+sess.Status, http.StatusConflict)
 		return
 	}
-	you, err := p.youAgent(ctx)
+	admin, err := p.adminAgent(ctx)
 	if err != nil {
 		p.httpError(w, "store error", 500)
 		return
 	}
-	if ok, err := p.Store.IsParticipant(ctx, sid, you.ID); err == nil && !ok {
-		if _, err := p.Store.JoinSession(ctx, sid, you.ID); err != nil {
+	if ok, err := p.Store.IsParticipant(ctx, sid, admin.ID); err == nil && !ok {
+		if _, err := p.Store.JoinSession(ctx, sid, admin.ID); err != nil {
 			p.httpError(w, "store error", 500)
 			return
 		}
 		p.fanout(ctx, sid)
 	}
 	msg, err := p.Store.InsertMessage(ctx, &store.Message{
-		ID: ids.New(), SessionID: sid, SenderID: you.ID, Kind: "chat", Content: content,
+		ID: ids.New(), SessionID: sid, SenderID: admin.ID, Kind: "chat", Content: content,
 	})
 	if err != nil {
 		p.httpError(w, "store error", 500)
 		return
 	}
 	p.fanout(ctx, sid)
-	p.renderFragment(w, "message", msg)
+	p.renderFragment(w, "message", attachReadState(p.loadReadState(ctx, sid), []store.Message{*msg})[0])
 }
 
 func (p *Panel) putContext(w http.ResponseWriter, r *http.Request) {
@@ -439,12 +681,12 @@ func (p *Panel) putContext(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "session is "+sess.Status, http.StatusConflict)
 		return
 	}
-	you, err := p.youAgent(ctx)
+	admin, err := p.adminAgent(ctx)
 	if err != nil {
 		p.httpError(w, "store error", 500)
 		return
 	}
-	if _, _, err := p.Store.UpsertContext(ctx, sid, key, value, you.ID); err != nil {
+	if _, _, err := p.Store.UpsertContext(ctx, sid, key, value, admin.ID); err != nil {
 		p.httpError(w, "store error", 500)
 		return
 	}
@@ -482,31 +724,57 @@ func (p *Panel) stream(w http.ResponseWriter, r *http.Request) {
 	cursor := after
 	ticker := time.NewTicker(p.Heartbeat)
 	defer ticker.Stop()
+	// The page embeds the read marks it was rendered with; remember them so
+	// only advances get emitted as "reads" events.
+	lastMarks := map[string]int64{}
+	if marks, err := p.Store.ReadMarks(ctx, sid); err == nil {
+		lastMarks = marks
+	}
+	emitReads := func() {
+		marks, err := p.Store.ReadMarks(ctx, sid)
+		if err != nil {
+			return
+		}
+		for a, seq := range marks {
+			if seq <= lastMarks[a] {
+				continue
+			}
+			lastMarks[a] = seq
+			if data, err := json.Marshal(map[string]any{"agent": a, "seq": seq}); err == nil {
+				writeSSE(w, flusher, "reads", string(data))
+			}
+		}
+	}
+	sendMessages := func(msgs []store.Message) {
+		if len(msgs) == 0 {
+			return
+		}
+		vms := attachReadState(p.loadReadState(ctx, sid), msgs)
+		for _, vm := range vms {
+			writeSSE(w, flusher, "message", p.fragment("message", vm))
+			cursor = vm.Seq
+		}
+	}
 	for {
 		msgs, err := p.Store.MessagesSince(ctx, "", sid, cursor, 500)
 		if err != nil {
 			return
 		}
-		for _, m := range msgs {
-			writeSSE(w, flusher, "message", p.fragment("message", m))
-			cursor = m.Seq
-		}
+		sendMessages(msgs)
 		ch, cancel := p.Hub.SubscribeSession(sid)
 		msgs, err = p.Store.MessagesSince(ctx, "", sid, cursor, 500)
 		if err != nil {
 			cancel()
 			return
 		}
-		for _, m := range msgs {
-			writeSSE(w, flusher, "message", p.fragment("message", m))
-			cursor = m.Seq
-		}
+		sendMessages(msgs)
 		select {
 		case <-ch:
 			cancel()
 			if p.Hub.Closed() {
 				return
 			}
+			emitReads()
 		case <-ticker.C:
 			cancel()
 			if parts, err := p.Store.Participants(ctx, sid); err == nil {
@@ -514,6 +782,7 @@ func (p *Panel) stream(w http.ResponseWriter, r *http.Request) {
 			} else {
 				writeSSEPing(w, flusher)
 			}
+			emitReads()
 		case <-ctx.Done():
 			cancel()
 			return
@@ -535,10 +804,10 @@ func (p *Panel) fanout(ctx context.Context, sid string) {
 	p.Hub.Notify(agentIDs)
 }
 
-func (p *Panel) youAgent(ctx context.Context) (*store.Agent, error) {
-	a, err := p.Store.GetAgent(ctx, youAgentID)
+func (p *Panel) adminAgent(ctx context.Context) (*store.Agent, error) {
+	a, err := p.Store.GetAgent(ctx, AdminAgentID)
 	if errors.Is(err, store.ErrNotFound) {
-		return p.Store.CreateAgent(ctx, youAgentID, "You", "human", "", "")
+		return p.Store.CreateAgent(ctx, AdminAgentID, "Admin", "human", "", "", "")
 	}
 	return a, err
 }
@@ -586,6 +855,14 @@ func writeSSEPing(w io.Writer, flusher http.Flusher) {
 
 func online(lastSeen *int64) bool {
 	return lastSeen != nil && time.Since(time.Unix(*lastSeen, 0)) < 90*time.Second
+}
+
+// agentOnline reports panel presence: seen within the presence window, or
+// the admin — it never calls the agent API (the panel acts as it directly),
+// yet whoever reads presence is by definition at the panel, so it counts as
+// online.
+func agentOnline(a *store.Agent) bool {
+	return a.ID == AdminAgentID || online(a.LastSeenAt)
 }
 
 func sameOrigin(r *http.Request) bool {

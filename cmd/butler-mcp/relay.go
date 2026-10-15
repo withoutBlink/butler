@@ -164,7 +164,7 @@ func deliver(ctx context.Context, msgs []store.Message, cfg deliveryConfig) erro
 			return err
 		}
 	}
-	text := formatRelay(ctx, cfg.client, msgs)
+	text := formatRelay(ctx, cfg.client, msgs, cfg.self)
 	qctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(qctx, cfg.codexBin, "queue", "--thread", threadID, "--message", text).CombinedOutput()
@@ -176,8 +176,10 @@ func deliver(ctx context.Context, msgs []store.Message, cfg deliveryConfig) erro
 }
 
 // formatRelay renders a batch of butler messages as one prompt for the codex
-// agent, grouped per butler session.
-func formatRelay(ctx context.Context, client *mcpserver.Client, msgs []store.Message) string {
+// agent, grouped per butler session. Messages that @-mention the agent are
+// flagged as requiring a reply; the rest are framed as FYI so the agent can
+// ignore them when they are not relevant.
+func formatRelay(ctx context.Context, client *mcpserver.Client, msgs []store.Message, self string) string {
 	titles := map[string]string{}
 	if sessions, err := client.Sessions(ctx, true); err == nil {
 		for _, s := range sessions {
@@ -192,6 +194,12 @@ func formatRelay(ctx context.Context, client *mcpserver.Client, msgs []store.Mes
 		}
 		groups[m.SessionID] = append(groups[m.SessionID], m)
 	}
+	mentioned := 0
+	for _, m := range msgs {
+		if m.MentionsAgent(self) {
+			mentioned++
+		}
+	}
 
 	var b strings.Builder
 	if len(order) == 1 {
@@ -204,10 +212,18 @@ func formatRelay(ctx context.Context, client *mcpserver.Client, msgs []store.Mes
 			fmt.Fprintf(&b, "\n— session %q:\n", sessionLabel(titles, sid))
 		}
 		for _, m := range groups[sid] {
-			fmt.Fprintf(&b, "%s: %s\n", m.SenderID, clip(m.Content, 2000))
+			flag := "FYI:"
+			if m.MentionsAgent(self) {
+				flag = "ADDRESSED TO YOU (reply expected):"
+			}
+			fmt.Fprintf(&b, "%s %s: %s\n", flag, m.SenderID, clip(m.Content, 2000))
 		}
 	}
-	b.WriteString("\nReply through the butler MCP tools (send_message / check_messages).")
+	if mentioned > 0 {
+		fmt.Fprintf(&b, "\n%d of these message(s) @-mention you — respond to those through the butler MCP tools (send_message / check_messages). The rest are FYI; ignore them unless relevant. If you decide to act on any of them, ack briefly first (send_message \"on it\"), then do the work and report back — don't stay silent until finished.\n", mentioned)
+	} else {
+		b.WriteString("\nNone of these messages @-mention you — they are FYI; reply through the butler MCP tools (send_message / check_messages) only if relevant.\n")
+	}
 	return b.String()
 }
 

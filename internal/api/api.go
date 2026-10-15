@@ -85,6 +85,7 @@ func (a *API) Routes() http.Handler {
 	route("POST /api/v1/kinds/{id}/rotate", a.rotateKind)
 	route("GET /api/v1/agents", a.listAgents)
 	route("POST /api/v1/agents/{id}/revoke", a.revokeAgentTokens)
+	route("POST /api/v1/agents/rename", a.renameAgent)
 	route("GET /api/v1/sessions", a.listSessions)
 	route("POST /api/v1/sessions", a.createSession)
 	route("GET /api/v1/sessions/{id}", a.getSession)
@@ -257,6 +258,30 @@ func (a *API) notifySession(ctx context.Context, sid string) {
 	a.Hub.Notify(ids)
 }
 
+// markReads records that the agent has now received these messages — per
+// session, up to the highest seq in the batch — and wakes the session's
+// panel streams so the "already read" marks update live. Only session
+// subscribers are notified: read advances must not churn the long-poll
+// waiters (they re-check and re-sleep on every wake).
+func (a *API) markReads(ctx context.Context, agent *store.Agent, msgs []store.Message) {
+	if agent == nil || len(msgs) == 0 {
+		return
+	}
+	last := map[string]int64{}
+	for _, m := range msgs {
+		if m.SessionID != "" && m.Seq > last[m.SessionID] {
+			last[m.SessionID] = m.Seq
+		}
+	}
+	for sid, seq := range last {
+		if err := a.Store.MarkRead(ctx, sid, agent.ID, seq); err != nil {
+			a.Log.Error("mark read", "err", err, "session", sid, "agent", agent.ID)
+			continue
+		}
+		a.Hub.NotifySession(sid)
+	}
+}
+
 func (a *API) writeMessages(w http.ResponseWriter, msgs []store.Message) {
 	if msgs == nil {
 		msgs = []store.Message{}
@@ -272,7 +297,11 @@ func (a *API) writeMessages(w http.ResponseWriter, msgs []store.Message) {
 }
 
 func toAgentJSON(a *store.Agent) agentJSON {
-	online := a.LastSeenAt != nil && time.Since(time.Unix(*a.LastSeenAt, 0)) < presenceWindow
+	// The admin never authenticates via the agent API (the panel acts as it
+	// directly) — yet whoever reads presence is at the panel, so the admin
+	// counts as always online.
+	online := a.ID == ui.AdminAgentID ||
+		(a.LastSeenAt != nil && time.Since(time.Unix(*a.LastSeenAt, 0)) < presenceWindow)
 	return agentJSON{Agent: *a, Online: online}
 }
 
@@ -294,67 +323,139 @@ func (a *API) listAgents(w http.ResponseWriter, r *http.Request) {
 
 // registerAgent exchanges a kind token plus hostname/workdir for a stable
 // agent identity (name) and a fresh instance token. The same registration key
-// (kind, hostname, workdir) always maps to the same name; registering again
-// REPLACES the previous instance: its token is revoked (its process gets 401
-// on its next call) and the sessions it joined get a system message.
+// (kind, hostname, workdir, client_session) always maps to the same name;
+// registering again REPLACES the previous instance: its token is revoked (its
+// process gets 401 on its next call) and the sessions it joined get a system
+// message.
+//
+// Two auth paths:
+//   - kind token: registers the app-level identity (client_session ""). This
+//     is what butler-mcp does at startup.
+//   - instance token: registers a per-client-session SIBLING of the caller —
+//     same kind/hostname/workdir, keyed by the body's client_session and
+//     named from its display_name. The relay plugin uses this to give every
+//     OpenCode session its own butler identity without ever seeing the kind
+//     token; an instance token can only mint siblings of its own identity.
 func (a *API) registerAgent(w http.ResponseWriter, r *http.Request) {
 	ident, ok := identity(r)
 	if !ok {
 		writeErr(w, http.StatusUnauthorized, "missing or invalid token")
 		return
 	}
-	if ident.Kind == nil {
-		writeErr(w, http.StatusForbidden, "kind token required: register with a kind token to obtain an instance identity")
-		return
-	}
 	var req struct {
-		Hostname string `json:"hostname"`
-		Workdir  string `json:"workdir"`
+		Hostname      string `json:"hostname"`
+		Workdir       string `json:"workdir"`
+		ClientSession string `json:"client_session"`
+		DisplayName   string `json:"display_name"`
 	}
 	if !decodeJSON(w, r, &req, 8<<10) {
 		return
 	}
-	hostname := strings.TrimSpace(req.Hostname)
-	workdir := strings.TrimSpace(req.Workdir)
-	if err := validateRegistration(hostname, workdir); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+	clientSession := strings.TrimSpace(req.ClientSession)
+	displayName := strings.TrimSpace(req.DisplayName)
+	var kindID, hostname, workdir string
+	if ident.Kind != nil {
+		kindID = ident.Kind.ID
+		hostname = strings.TrimSpace(req.Hostname)
+		workdir = strings.TrimSpace(req.Workdir)
+		if err := validateRegistration(hostname, workdir); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	} else if ident.Agent != nil {
+		kindID, hostname, workdir = ident.Agent.Kind, ident.Agent.Hostname, ident.Agent.Workdir
+		if clientSession == "" {
+			writeErr(w, http.StatusBadRequest, "client_session is required when registering with an instance token")
+			return
+		}
+	} else {
+		writeErr(w, http.StatusForbidden, "kind token or instance token required")
+		return
+	}
+	if len(clientSession) > 128 {
+		writeErr(w, http.StatusBadRequest, "client_session too long (max 128)")
+		return
+	}
+	if len(displayName) > 200 {
+		writeErr(w, http.StatusBadRequest, "display_name too long (max 200)")
 		return
 	}
 	ctx := r.Context()
-	agent, err := a.Store.FindInstance(ctx, ident.Kind.ID, hostname, workdir)
+	agent, err := a.Store.FindInstance(ctx, kindID, hostname, workdir, clientSession)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		writeErr(w, http.StatusInternalServerError, "store error")
 		return
 	}
 	replaced := agent != nil
+	if agent != nil && agent.RemovedAt != nil {
+		// A live process re-registering an evicted identity revives it.
+		if err := a.Store.ClearAgentRemoved(ctx, agent.ID); err != nil {
+			a.writeStoreErr(w, err)
+			return
+		}
+		agent.RemovedAt = nil
+		a.Log.Info("revived agent", "id", agent.ID)
+	}
 	if agent == nil {
-		name := a.Store.UniqueAgentName(ctx, ident.Kind.ID, hostname, workdir)
-		agent, err = a.Store.CreateAgent(ctx, name, name, ident.Kind.ID, hostname, workdir)
+		var name string
+		if clientSession != "" {
+			name = a.Store.UniqueSessionAgentName(ctx, kindID, displayName, workdir)
+			if displayName == "" {
+				displayName = name
+			}
+		} else {
+			name = a.Store.UniqueAgentName(ctx, kindID, hostname, workdir)
+			displayName = name
+		}
+		agent, err = a.Store.CreateAgent(ctx, name, displayName, kindID, hostname, workdir, clientSession)
 		if err != nil {
 			a.writeStoreErr(w, err)
 			return
 		}
+	} else if displayName != "" && agent.DisplayName != displayName {
+		// Re-registration with a different display name (a renamed client
+		// session): refresh it so the panel stays readable. The id never
+		// changes.
+		if err := a.Store.UpdateAgentDisplayName(ctx, agent.ID, displayName); err != nil {
+			a.writeStoreErr(w, err)
+			return
+		}
+		agent.DisplayName = displayName
 	}
 	tok := auth.NewToken()
 	if err := a.Store.ReplaceAgentToken(ctx, agent.ID, auth.Hash(tok)); err != nil {
 		a.writeStoreErr(w, err)
 		return
 	}
-	if replaced {
+	// App-level reconnects announce the replacement (the panel and waiting
+	// agents should see the old process was kicked). Per-client-session
+	// siblings are re-registered by their own plugin on every app restart —
+	// announcing each would spam every session they joined.
+	if replaced && clientSession == "" {
 		a.announceReplacement(ctx, agent.ID)
-		a.Log.Info("replaced agent instance", "kind", ident.Kind.ID, "name", agent.ID, "hostname", hostname, "workdir", workdir)
-	} else {
-		a.Log.Info("registered agent", "kind", ident.Kind.ID, "name", agent.ID, "hostname", hostname, "workdir", workdir)
+	}
+	a.Log.Info("registered agent", "kind", kindID, "name", agent.ID, "hostname", hostname, "workdir", workdir, "client_session", clientSession, "replaced", replaced)
+	// Every agent joins the global session — the default room shared by all
+	// connected agents. Idempotent: re-registering an existing identity
+	// changes nothing (its participant row already exists).
+	if _, err := a.Store.GetSession(ctx, store.GlobalSessionID); err == nil {
+		joined, jerr := a.Store.JoinSession(ctx, store.GlobalSessionID, agent.ID)
+		if jerr != nil {
+			a.Log.Error("auto-join global session", "err", jerr, "agent", agent.ID)
+		} else if joined {
+			a.notifySession(ctx, store.GlobalSessionID)
+		}
 	}
 	a.Store.TouchAgent(ctx, agent.ID)
 	writeJSON(w, http.StatusCreated, struct {
-		Name     string `json:"name"`
-		Token    string `json:"token"`
-		Kind     string `json:"kind"`
-		Hostname string `json:"hostname"`
-		Workdir  string `json:"workdir"`
-		Replaced bool   `json:"replaced"`
-	}{Name: agent.ID, Token: tok, Kind: ident.Kind.ID, Hostname: agent.Hostname, Workdir: agent.Workdir, Replaced: replaced})
+		Name          string `json:"name"`
+		Token         string `json:"token"`
+		Kind          string `json:"kind"`
+		Hostname      string `json:"hostname"`
+		Workdir       string `json:"workdir"`
+		ClientSession string `json:"client_session,omitempty"`
+		Replaced      bool   `json:"replaced"`
+	}{Name: agent.ID, Token: tok, Kind: kindID, Hostname: agent.Hostname, Workdir: agent.Workdir, ClientSession: agent.ClientSession, Replaced: replaced})
 }
 
 // announceReplacement posts a system message in every session the identity
@@ -460,22 +561,128 @@ func (a *API) rotateKind(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"id": id, "token": tok})
 }
 
-// revokeAgentTokens invalidates every instance token of an agent, kicking all
-// of its live processes; they stay out until each re-registers.
+// revokeAgentTokens evicts an agent (the panel kick / CLI `agent revoke`):
+// every instance token is invalidated AND the identity is marked removed —
+// hidden from listings, participants and mentions — so a kick is visible
+// immediately. The row survives (history references it); a live process
+// brings the identity back by re-registering, which revives it.
 func (a *API) revokeAgentTokens(w http.ResponseWriter, r *http.Request) {
 	if !a.requireAdmin(w, r) {
 		return
 	}
 	id := r.PathValue("id")
-	if _, err := a.Store.GetAgent(r.Context(), id); err != nil {
+	agent, err := a.Store.GetAgent(r.Context(), id)
+	if err != nil {
 		a.writeStoreErr(w, err)
 		return
 	}
-	if err := a.Store.RevokeAgentTokens(r.Context(), id); err != nil {
-		writeErr(w, http.StatusInternalServerError, "store error")
+	if agent.ID == ui.AdminAgentID {
+		writeErr(w, http.StatusBadRequest, "the admin agent cannot be revoked")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"id": id, "revoked": true})
+	if err := a.Store.RemoveAgent(r.Context(), id); err != nil {
+		a.writeStoreErr(w, err)
+		return
+	}
+	a.announceEviction(r.Context(), agent)
+	writeJSON(w, http.StatusOK, map[string]any{"id": id, "revoked": true, "removed": true})
+}
+
+// announceEviction posts a system message in every session the evicted agent
+// participated in, so panels and waiting agents see why it vanished.
+func (a *API) announceEviction(ctx context.Context, agent *store.Agent) {
+	sids, err := a.Store.SessionsForAgent(ctx, agent.ID)
+	if err != nil {
+		a.Log.Error("list sessions for agent", "err", err, "agent", agent.ID)
+		return
+	}
+	content := agent.ID + " was kicked by admin (tokens revoked; hidden until it re-registers)"
+	for _, sid := range sids {
+		if _, err := a.Store.InsertMessage(ctx, &store.Message{
+			ID: ids.New(), SessionID: sid, SenderID: agent.ID, Kind: "system", Content: content,
+		}); err != nil {
+			a.Log.Error("announce eviction", "err", err, "session", sid)
+			continue
+		}
+		a.notifySession(ctx, sid)
+	}
+}
+
+// renameAgent renames an agent's display title — the id never changes.
+// Two auth paths, mirroring sibling registration:
+//   - instance token + {client_session, display_name}: renames a
+//     per-client-session sibling of the caller's own identity. The OpenCode
+//     relay plugin uses this to follow session-title changes (renamed
+//     sessions) so butler's panel and participant lists stay readable; the
+//     same call works for any client keyed by session uuid (codex relays).
+//   - admin token + {agent, display_name}: renames any agent by id.
+func (a *API) renameAgent(w http.ResponseWriter, r *http.Request) {
+	ident, ok := a.requireAuth(w, r) // also rejects kind tokens (403)
+	if !ok {
+		return
+	}
+	var req struct {
+		Agent         string `json:"agent"`
+		ClientSession string `json:"client_session"`
+		DisplayName   string `json:"display_name"`
+	}
+	if !decodeJSON(w, r, &req, 8<<10) {
+		return
+	}
+	displayName := strings.TrimSpace(req.DisplayName)
+	if displayName == "" {
+		writeErr(w, http.StatusBadRequest, "display_name is required")
+		return
+	}
+	if len(displayName) > 200 {
+		writeErr(w, http.StatusBadRequest, "display_name too long (max 200)")
+		return
+	}
+	ctx := r.Context()
+	var agent *store.Agent
+	switch {
+	case ident.Agent != nil:
+		clientSession := strings.TrimSpace(req.ClientSession)
+		if clientSession == "" {
+			writeErr(w, http.StatusBadRequest, "client_session is required when renaming with an instance token")
+			return
+		}
+		if len(clientSession) > 128 {
+			writeErr(w, http.StatusBadRequest, "client_session too long (max 128)")
+			return
+		}
+		// An instance token may only rename its own identity's siblings —
+		// the same trust boundary as sibling registration.
+		var err error
+		agent, err = a.Store.FindInstance(ctx, ident.Agent.Kind, ident.Agent.Hostname, ident.Agent.Workdir, clientSession)
+		if err != nil {
+			a.writeStoreErr(w, err)
+			return
+		}
+	case ident.Admin:
+		id := strings.TrimSpace(req.Agent)
+		if id == "" {
+			writeErr(w, http.StatusBadRequest, "agent is required when renaming with the admin token")
+			return
+		}
+		var err error
+		agent, err = a.Store.GetAgent(ctx, id)
+		if err != nil {
+			a.writeStoreErr(w, err)
+			return
+		}
+	default:
+		writeErr(w, http.StatusForbidden, "instance token or admin token required")
+		return
+	}
+	if agent.DisplayName != displayName {
+		if err := a.Store.UpdateAgentDisplayName(ctx, agent.ID, displayName); err != nil {
+			a.writeStoreErr(w, err)
+			return
+		}
+		a.Log.Info("renamed agent", "id", agent.ID, "display_name", displayName)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": agent.ID, "display_name": displayName})
 }
 
 func (a *API) listSessions(w http.ResponseWriter, r *http.Request) {
@@ -637,7 +844,8 @@ func (a *API) joinSession(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) sessionMessages(w http.ResponseWriter, r *http.Request) {
 	sid := r.PathValue("id")
-	if _, ok := a.requireAuth(w, r); !ok {
+	ident, ok := a.requireAuth(w, r)
+	if !ok {
 		return
 	}
 	if _, err := a.Store.GetSession(r.Context(), sid); err != nil {
@@ -668,6 +876,10 @@ func (a *API) sessionMessages(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "store error")
 		return
 	}
+	// Fetching a session's messages means the agent received them; record
+	// the read so the panel can show it (admins reading via the API don't
+	// get a cursor — they are not a chat participant).
+	a.markReads(r.Context(), ident.Agent, msgs)
 	a.writeMessages(w, msgs)
 }
 
@@ -726,6 +938,10 @@ func (a *API) postMessage(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		a.writeStoreErr(w, err)
 		return
+	}
+	// The sender has obviously received their own message.
+	if err := a.Store.MarkRead(r.Context(), sid, agent.ID, msg.Seq); err != nil {
+		a.Log.Error("mark read", "err", err, "session", sid, "agent", agent.ID)
 	}
 	a.notifySession(r.Context(), sid)
 	a.Metrics.MessagesPosted.Add(1)
@@ -895,6 +1111,9 @@ func (a *API) waitMessages(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(msgs) > 0 {
+			// Delivered to the agent's context (MCP wait, relay, ...): mark
+			// the batch read so the panel can show read receipts.
+			a.markReads(ctx, agent, msgs)
 			a.writeMessages(w, msgs)
 			return
 		}
@@ -907,6 +1126,7 @@ func (a *API) waitMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(msgs) > 0 {
 			cancel()
+			a.markReads(ctx, agent, msgs)
 			a.writeMessages(w, msgs)
 			return
 		}

@@ -20,6 +20,7 @@ import (
 	"butler/internal/api"
 	"butler/internal/auth"
 	"butler/internal/hub"
+	"butler/internal/ids"
 	"butler/internal/metrics"
 	"butler/internal/store"
 	"butler/internal/ui"
@@ -81,7 +82,8 @@ func serve(log *slog.Logger, args []string) {
 	if err != nil {
 		fatal(log, err)
 	}
-	bootstrapAgent(context.Background(), log, st, "you", "You", "human")
+	bootstrapAgent(context.Background(), log, st, "admin", "Admin", "human")
+	bootstrapGlobalSession(context.Background(), log, st)
 
 	h := hub.New()
 	m := &metrics.Metrics{}
@@ -141,10 +143,41 @@ func bootstrapAgent(ctx context.Context, log *slog.Logger, st *store.Store, id, 
 	} else if !errors.Is(err, store.ErrNotFound) {
 		fatal(log, err)
 	}
-	if _, err := st.CreateAgent(ctx, id, name, kind, "", ""); err != nil {
+	if _, err := st.CreateAgent(ctx, id, name, kind, "", "", ""); err != nil {
 		fatal(log, err)
 	}
 	log.Info("bootstrap agent created", "id", id, "kind", kind)
+}
+
+// bootstrapGlobalSession ensures the default global session exists (created
+// by "admin") and that every registered agent is a member. Join notices are
+// posted only for agents that are not members yet — typically the first start
+// after upgrading a database that predates the global session.
+func bootstrapGlobalSession(ctx context.Context, log *slog.Logger, st *store.Store) {
+	created, err := st.EnsureGlobalSession(ctx, "admin")
+	if err != nil {
+		fatal(log, err)
+	}
+	if created {
+		log.Info("global session created", "id", store.GlobalSessionID)
+	}
+	agents, err := st.ListAgents(ctx)
+	if err != nil {
+		fatal(log, err)
+	}
+	for _, ag := range agents {
+		if ag.ID == "admin" {
+			continue // added by EnsureGlobalSession
+		}
+		joined, err := st.JoinSession(ctx, store.GlobalSessionID, ag.ID)
+		if err != nil {
+			log.Error("join global session", "err", err, "agent", ag.ID)
+			continue
+		}
+		if joined {
+			log.Info("agent joined global session", "agent", ag.ID)
+		}
+	}
 }
 
 // parseSubFlags parses fs over args, rotating a leading positional argument
@@ -232,13 +265,17 @@ func resetCmd(args []string) {
 		fmt.Fprintf(os.Stderr, "error: recreating database: %v\n", err)
 		os.Exit(1)
 	}
-	bootstrapAgent(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)), st, "you", "You", "human")
+	bootstrapAgent(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)), st, "admin", "Admin", "human")
+	if _, err := st.EnsureGlobalSession(context.Background(), "admin"); err != nil {
+		fmt.Fprintf(os.Stderr, "error: creating global session: %v\n", err)
+		os.Exit(1)
+	}
 	if err := st.Close(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Println("empty database created (agent \"you\" bootstrapped)")
+	fmt.Println("empty database created (agent \"you\" bootstrapped, global session created)")
 	fmt.Println("admin token unchanged — it lives in its own file")
 	fmt.Println(`next: re-issue kind tokens ("butler kind add <id>"), update your agents' configs, then start the server`)
 }
@@ -339,13 +376,13 @@ func agentCmd(args []string) {
 			os.Exit(1)
 		}
 		w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "NAME\tKIND\tHOST\tWORKDIR\tLAST_SEEN")
+		fmt.Fprintln(w, "NAME\tTITLE\tKIND\tHOST\tWORKDIR\tLAST_SEEN")
 		for _, a := range agents {
 			last := "never"
 			if a.LastSeenAt != nil {
 				last = time.Unix(*a.LastSeenAt, 0).UTC().Format(time.RFC3339)
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", a.ID, a.Kind, a.Hostname, a.Workdir, last)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", a.ID, a.DisplayName, a.Kind, a.Hostname, a.Workdir, last)
 		}
 		w.Flush()
 	case "revoke":
@@ -354,15 +391,34 @@ func agentCmd(args []string) {
 			os.Exit(2)
 		}
 		id := positional[0]
-		if _, err := st.GetAgent(ctx, id); err != nil {
+		agent, err := st.GetAgent(ctx, id)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
-		if err := st.RevokeAgentTokens(ctx, id); err != nil {
+		if agent.ID == "admin" {
+			fmt.Fprintln(os.Stderr, "error: the admin agent cannot be revoked")
+			os.Exit(1)
+		}
+		if err := st.RemoveAgent(ctx, id); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("all instance tokens for %s revoked; its live processes must re-register\n", id)
+		// Post the eviction notice directly (the CLI has no hub access; the
+		// server's waiters see it on their next poll, up to ~25s later).
+		sids, err := st.SessionsForAgent(ctx, id)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not list sessions: %v\n", err)
+		}
+		for _, sid := range sids {
+			if _, err := st.InsertMessage(ctx, &store.Message{
+				ID: ids.New(), SessionID: sid, SenderID: id, Kind: "system",
+				Content: id + " was kicked by admin (tokens revoked; hidden until it re-registers)",
+			}); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: eviction notice for %s: %v\n", sid, err)
+			}
+		}
+		fmt.Printf("evicted %s: tokens revoked, hidden from the panel and sessions until it re-registers\n", id)
 	default:
 		agentUsage()
 		os.Exit(2)
@@ -381,7 +437,7 @@ func agentUsage() {
 	fmt.Fprint(os.Stderr, `agent instances register themselves with a kind token; manage kinds with "butler kind".
 usage (flags before or after the id):
   butler agent list
-  butler agent revoke <name>
+  butler agent revoke <name>   # evict: revoke tokens + hide until it re-registers
 `)
 }
 

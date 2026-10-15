@@ -29,12 +29,12 @@
 </form>
 </section>
 </aside>
-<section class="chat">
-<div id="messages" data-stream="/panel/sessions/{{.Session.ID}}/stream?after={{.LatestSeq}}">
+<section class="chat-pane">
+<div id="messages" data-stream="/panel/sessions/{{.Session.ID}}/stream?after={{.LatestSeq}}" data-agents="{{.Agents}}" data-reads="{{.Reads}}">
 {{range .Messages}}{{template "message" .}}{{end}}
 </div>
 <form id="compose" method="post" action="/panel/sessions/{{.Session.ID}}/messages">
-<textarea name="content" placeholder="Send a message as you…" required></textarea>
+<textarea name="content" placeholder="Send a message as admin… (type @ to mention agents)" required data-mentionables="{{.Mentionables}}"></textarea>
 <button type="submit">Send</button>
 </form>
 </section>

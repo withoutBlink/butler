@@ -244,10 +244,11 @@ func TestRegistration(t *testing.T) {
 		t.Fatalf("kind token on wait: %d %v", resp.StatusCode, body)
 	}
 
-	// Register requires a kind token.
-	resp, body = req(t, "POST", base+"/api/v1/register", tokens["test:beta:beta"], map[string]any{"hostname": "x", "workdir": "/x"})
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("register with instance token: %d %v", resp.StatusCode, body)
+	// An instance token without a client_session is a bad sibling
+	// registration (400); the admin token cannot register at all.
+	resp, body = req(t, "POST", base+"/api/v1/register", tokens["test:beta:beta"], map[string]any{})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("sibling register without client_session: %d %v", resp.StatusCode, body)
 	}
 	resp, body = req(t, "POST", base+"/api/v1/register", adminTok, map[string]any{"hostname": "x", "workdir": "/x"})
 	if resp.StatusCode != http.StatusForbidden {
@@ -287,14 +288,48 @@ func TestRegistration(t *testing.T) {
 		t.Fatalf("test-alpha missing from list: %v", body)
 	}
 
-	// Revoking kills the agent's live instance token.
+	// Revoking evicts the agent: token dead, hidden from listings, and a
+	// live process can revive it by re-registering.
 	resp, body = req(t, "POST", base+"/api/v1/agents/test:alpha:alpha/revoke", adminTok, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("revoke: %d %v", resp.StatusCode, body)
 	}
+	if body["removed"] != true {
+		t.Fatalf("revoke should evict: %v", body)
+	}
 	resp, _ = req(t, "GET", base+"/api/v1/sessions", tok2, nil)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("revoked token should fail: %d", resp.StatusCode)
+	}
+	// The evicted agent is hidden from the agents list.
+	resp, body = req(t, "GET", base+"/api/v1/agents", adminTok, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list agents: %d %v", resp.StatusCode, body)
+	}
+	for _, a := range body["agents"].([]any) {
+		if m := a.(map[string]any); m["id"] == "test:alpha:alpha" {
+			t.Fatalf("evicted agent should be hidden: %v", m)
+		}
+	}
+	// Re-registering the identity revives it with a fresh token.
+	resp, body = req(t, "POST", base+"/api/v1/register", kindTok, map[string]any{"hostname": "alpha", "workdir": "/tmp/alpha"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("revive register: %d %v", resp.StatusCode, body)
+	}
+	revivedTok, _ := body["token"].(string)
+	resp, body = req(t, "GET", base+"/api/v1/agents", adminTok, nil)
+	found = false
+	for _, a := range body["agents"].([]any) {
+		if m := a.(map[string]any); m["id"] == "test:alpha:alpha" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("revived agent should be listed: %v", body)
+	}
+	resp, _ = req(t, "GET", base+"/api/v1/sessions", revivedTok, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("revived token should work: %d", resp.StatusCode)
 	}
 	resp, body = req(t, "POST", base+"/api/v1/agents/ghost/revoke", adminTok, nil)
 	if resp.StatusCode != http.StatusNotFound {
@@ -503,5 +538,531 @@ func TestArchiveBlocksPosting(t *testing.T) {
 	resp, body = req(t, "PATCH", base+"/api/v1/sessions/"+sid, tokens["test:beta:beta"], map[string]any{"status": "active"})
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("non-creator patch: %d %v", resp.StatusCode, body)
+	}
+}
+
+// newTestAPIGlobal boots the API the way `butler serve` does: a "admin" agent
+// and the global session every agent joins at registration.
+func newTestAPIGlobal(t *testing.T) (*httptest.Server, string, string, map[string]string) {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "butler.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		close(done)
+		st.Close()
+	})
+	a := &api.API{
+		Store:      st,
+		Hub:        hub.New(),
+		AdminToken: adminTok,
+		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:    &metrics.Metrics{},
+		Done:       done,
+	}
+	ctx := context.Background()
+	if _, err := st.CreateAgent(ctx, "admin", "Admin", "human", "", "", ""); err != nil {
+		t.Fatalf("create you: %v", err)
+	}
+	if _, err := st.EnsureGlobalSession(ctx, "admin"); err != nil {
+		t.Fatalf("ensure global: %v", err)
+	}
+	kindTok := auth.NewToken()
+	if _, err := st.CreateKind(ctx, "test", "Test", auth.Hash(kindTok)); err != nil {
+		t.Fatalf("create kind: %v", err)
+	}
+	srv := httptest.NewServer(a.Routes())
+	t.Cleanup(srv.Close)
+	tokens := map[string]string{}
+	for _, h := range []string{"alpha", "beta"} {
+		name, tok := registerAgent(t, srv, kindTok, h, "/tmp/"+h)
+		tokens[name] = tok
+	}
+	return srv, adminTok, kindTok, tokens
+}
+
+func TestRegisterAutoJoinsGlobal(t *testing.T) {
+	srv, _, _, tokens := newTestAPIGlobal(t)
+	base := srv.URL
+
+	// Both registered agents (and "admin") are participants of the global session.
+	resp, body := req(t, "GET", base+"/api/v1/sessions/"+store.GlobalSessionID, tokens["test:alpha:alpha"], nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get global: %d %v", resp.StatusCode, body)
+	}
+	parts := body["participants"].([]any)
+	if len(parts) != 3 {
+		t.Fatalf("expected 3 participants (you, alpha, beta), got %v", body)
+	}
+
+	// beta sees the global join notices and can post there.
+	resp, body = req(t, "GET", base+"/api/v1/messages?after=0", tokens["test:beta:beta"], nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("catchup: %d %v", resp.StatusCode, body)
+	}
+	msgs := body["messages"].([]any)
+	if len(msgs) < 2 {
+		t.Fatalf("expected join notices, got %v", msgs)
+	}
+	last := msgs[len(msgs)-1].(map[string]any)
+	if last["kind"] != "system" || last["session_id"] != store.GlobalSessionID {
+		t.Fatalf("expected a global join notice last, got %v", last)
+	}
+
+	resp, body = req(t, "POST", base+"/api/v1/sessions/"+store.GlobalSessionID+"/messages", tokens["test:beta:beta"], map[string]any{"content": "hello everyone"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("post to global: %d %v", resp.StatusCode, body)
+	}
+
+	// alpha's wait (across all joined sessions) picks the global message.
+	latest := int64(body["seq"].(float64))
+	resp, body = req(t, "GET", base+"/api/v1/wait?after="+strconv.FormatInt(latest-1, 10)+"&timeout=2", tokens["test:alpha:alpha"], nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("wait: %d %v", resp.StatusCode, body)
+	}
+	msgs = body["messages"].([]any)
+	if len(msgs) != 1 || msgs[0].(map[string]any)["content"] != "hello everyone" {
+		t.Fatalf("alpha should see the global message: %v", msgs)
+	}
+}
+
+func TestMentionFlow(t *testing.T) {
+	srv, _, _, tokens := newTestAPIGlobal(t)
+	base := srv.URL
+
+	// An exact-id mention in the global session resolves to the mentioned agent.
+	resp, body := req(t, "POST", base+"/api/v1/sessions/"+store.GlobalSessionID+"/messages", tokens["test:alpha:alpha"], map[string]any{
+		"content": "@test:beta:beta please take the failing test",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("post mention: %d %v", resp.StatusCode, body)
+	}
+	mentions, ok := body["mentions"].([]any)
+	if !ok || len(mentions) != 1 || mentions[0] != "test:beta:beta" {
+		t.Fatalf("expected mentions [test:beta:beta], got %v", body)
+	}
+	seq := int64(body["seq"].(float64))
+
+	// The mentioned agent sees the mentions list on wait.
+	resp, body = req(t, "GET", base+"/api/v1/wait?after="+strconv.FormatInt(seq-1, 10)+"&timeout=2", tokens["test:beta:beta"], nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("wait: %d %v", resp.StatusCode, body)
+	}
+	msgs := body["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message, got %v", msgs)
+	}
+	m := msgs[0].(map[string]any)
+	if m["content"] != "@test:beta:beta please take the failing test" {
+		t.Fatalf("bad message: %v", m)
+	}
+	if mentions, ok := m["mentions"].([]any); !ok || len(mentions) != 1 || mentions[0] != "test:beta:beta" {
+		t.Fatalf("wait response should carry mentions, got %v", m)
+	}
+
+	// Unmentioned messages (and @unknown tokens) resolve to no mentions.
+	resp, body = req(t, "POST", base+"/api/v1/sessions/"+store.GlobalSessionID+"/messages", tokens["test:alpha:alpha"], map[string]any{"content": "fyi only, no mention"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("post fyi: %d %v", resp.StatusCode, body)
+	}
+	if _, ok := body["mentions"]; ok {
+		t.Fatalf("unmentioned message should omit mentions, got %v", body)
+	}
+}
+
+// newReadTestAPI boots a minimal API whose store is returned to the test so
+// read cursors can be inspected directly.
+func newReadTestAPI(t *testing.T) (*httptest.Server, *store.Store, string) {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "butler.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	h := hub.New()
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		close(done)
+		h.Close()
+		st.Close()
+	})
+	a := &api.API{
+		Store:      st,
+		Hub:        h,
+		AdminToken: adminTok,
+		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:    &metrics.Metrics{},
+		Done:       done,
+	}
+	kindTok := auth.NewToken()
+	if _, err := st.CreateKind(context.Background(), "test", "Test", auth.Hash(kindTok)); err != nil {
+		t.Fatalf("create kind: %v", err)
+	}
+	srv := httptest.NewServer(a.Routes())
+	t.Cleanup(srv.Close)
+	return srv, st, kindTok
+}
+
+// TestReadMarksRecorded covers the three delivery paths that advance an
+// agent's read cursor: a wait long-poll batch, a session message fetch, and
+// the agent's own post.
+func TestReadMarksRecorded(t *testing.T) {
+	srv, st, kindTok := newReadTestAPI(t)
+	ctx := context.Background()
+	readerName, readerTok := registerAgent(t, srv, kindTok, "reader", "/tmp/reader")
+	fetcherName, fetcherTok := registerAgent(t, srv, kindTok, "fetcher", "/tmp/fetcher")
+	posterName, posterTok := registerAgent(t, srv, kindTok, "poster", "/tmp/poster")
+
+	// A message from a fourth party (the human "admin").
+	if _, err := st.CreateAgent(ctx, "admin", "Admin", "human", "", "", ""); err != nil {
+		t.Fatalf("create you: %v", err)
+	}
+	if _, err := st.CreateSession(ctx, "s1", "read marks", "admin", nil); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	for _, aid := range []string{readerName, fetcherName, posterName} {
+		if _, err := st.JoinSession(ctx, "s1", aid); err != nil {
+			t.Fatalf("join: %v", err)
+		}
+	}
+	if _, err := st.JoinSession(ctx, "s1", "admin"); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	msg1, err := st.InsertMessage(ctx, &store.Message{SessionID: "s1", SenderID: "admin", Kind: "chat", Content: "hello agents"})
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	// Wait delivers the message: the reader's cursor must cover it.
+	waitReq, err := http.NewRequest("GET", srv.URL+"/api/v1/wait?timeout=2", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	waitReq.Header.Set("Authorization", "Bearer "+readerTok)
+	resp, err := http.DefaultClient.Do(waitReq)
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte("hello agents")) {
+		t.Fatalf("wait: status=%d body=%s", resp.StatusCode, body)
+	}
+	marks, err := st.ReadMarks(ctx, "s1")
+	if err != nil {
+		t.Fatalf("read marks: %v", err)
+	}
+	if marks[readerName] < msg1.Seq {
+		t.Fatalf("wait should mark read up to seq %d, got %v", msg1.Seq, marks)
+	}
+
+	// A direct session message fetch also marks the fetcher's read.
+	fetchReq, err := http.NewRequest("GET", srv.URL+"/api/v1/sessions/s1/messages?after=0", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	fetchReq.Header.Set("Authorization", "Bearer "+fetcherTok)
+	resp, err = http.DefaultClient.Do(fetchReq)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte("hello agents")) {
+		t.Fatalf("fetch: status=%d body=%s", resp.StatusCode, body)
+	}
+	marks, err = st.ReadMarks(ctx, "s1")
+	if err != nil {
+		t.Fatalf("read marks: %v", err)
+	}
+	if marks[fetcherName] < msg1.Seq {
+		t.Fatalf("fetch should mark read up to seq %d, got %v", msg1.Seq, marks)
+	}
+
+	// The poster's own post advances their cursor to it.
+	postBody, _ := json.Marshal(map[string]string{"content": "poster speaking"})
+	postReq, err := http.NewRequest("POST", srv.URL+"/api/v1/sessions/s1/messages", bytes.NewReader(postBody))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	postReq.Header.Set("Authorization", "Bearer "+posterTok)
+	postReq.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(postReq)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("post: status=%d body=%s", resp.StatusCode, body)
+	}
+	var posted store.Message
+	if err := json.Unmarshal(body, &posted); err != nil {
+		t.Fatalf("decode post: %v", err)
+	}
+	marks, err = st.ReadMarks(ctx, "s1")
+	if err != nil {
+		t.Fatalf("read marks: %v", err)
+	}
+	if marks[posterName] < posted.Seq {
+		t.Fatalf("own post should mark read up to seq %d, got %v", posted.Seq, marks)
+	}
+
+	// Admin reads do not create cursors.
+	adminReq, err := http.NewRequest("GET", srv.URL+"/api/v1/sessions/s1/messages?after=0", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	adminReq.Header.Set("Authorization", "Bearer "+adminTok)
+	resp, err = http.DefaultClient.Do(adminReq)
+	if err != nil {
+		t.Fatalf("admin fetch: %v", err)
+	}
+	resp.Body.Close()
+	if _, ok := marks["admin"]; ok {
+		t.Fatalf("no cursor expected for humans/admins, got %v", marks)
+	}
+}
+
+// registerSibling posts a sibling registration (instance token +
+// client_session + display name) and returns the response body.
+func registerSibling(t *testing.T, srv *httptest.Server, tok, clientSession, displayName string) map[string]any {
+	t.Helper()
+	resp, body := req(t, "POST", srv.URL+"/api/v1/register", tok, map[string]any{
+		"client_session": clientSession,
+		"display_name":   displayName,
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("sibling register %s: %d %v", clientSession, resp.StatusCode, body)
+	}
+	return body
+}
+
+// TestSiblingRegistration: an instance token mints per-client-session agents
+// of its own identity — named from the display name (the client session's
+// title) so a human can tell them apart, joined to the global session, and
+// re-registering one replaces its token without the app-level announcement.
+func TestSiblingRegistration(t *testing.T) {
+	srv, adminTok, kindTok, tokens := newTestAPIGlobal(t)
+	base := srv.URL
+
+	appTok := tokens["test:alpha:alpha"] // the app-level instance token
+
+	// Sibling "sessions" of the alpha identity, named by title.
+	b1 := registerSibling(t, srv, appTok, "ses_one", "Fix read marks")
+	if b1["name"] != "test:fix-read-marks" {
+		t.Fatalf("expected title-derived name, got %q", b1["name"])
+	}
+	if b1["client_session"] != "ses_one" {
+		t.Fatalf("client_session echo: %v", b1)
+	}
+	b2 := registerSibling(t, srv, appTok, "ses_two", "Dark theme polish")
+	if b2["name"] != "test:dark-theme-polish" {
+		t.Fatalf("expected test:dark-theme-polish, got %q", b2["name"])
+	}
+	// Same title again: minted name collides, counter suffix disambiguates.
+	b3 := registerSibling(t, srv, appTok, "ses_three", "Fix read marks")
+	if b3["name"] != "test:fix-read-marks-2" {
+		t.Fatalf("expected suffixed name, got %q", b3["name"])
+	}
+	// A sibling with no usable title falls back to the workdir basename.
+	b4 := registerSibling(t, srv, appTok, "ses_four", "")
+	if name, _ := b4["name"].(string); name != "test:alpha" {
+		t.Fatalf("expected workdir fallback name, got %q", b4["name"])
+	}
+
+	tok1, _ := b1["token"].(string)
+	// The sibling token authenticates as its own agent.
+	resp, body := req(t, "GET", base+"/api/v1/sessions?joined=1", tok1, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sibling token should work: %d %v", resp.StatusCode, body)
+	}
+	found := false
+	for _, s := range body["sessions"].([]any) {
+		if m := s.(map[string]any); m["id"] == "global" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("sibling should auto-join the global session: %v", body)
+	}
+
+	// Re-registering the same client_session replaces the token, keeps the
+	// name, refreshes the display name, and does NOT post the app-level
+	// reconnect announcement (replaced siblings are routine: their plugin
+	// re-registers them on every app restart).
+	before := latestSeq(t, base, appTok)
+	b1b := registerSibling(t, srv, appTok, "ses_one", "Fix read marks (renamed)")
+	if b1b["name"] != "test:fix-read-marks" {
+		t.Fatalf("stable sibling name: %q", b1b["name"])
+	}
+	if b1b["replaced"] != true {
+		t.Fatalf("expected replaced=true: %v", b1b)
+	}
+	resp, _ = req(t, "GET", base+"/api/v1/sessions?joined=1", tok1, nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("replaced sibling token should 401: %d", resp.StatusCode)
+	}
+	if latestSeq(t, base, appTok) != before {
+		t.Fatalf("sibling replacement should be silent, messages appeared (seq %d -> %d)", before, latestSeq(t, base, appTok))
+	}
+	// The display name follows the rename; the id does not.
+	resp, body = req(t, "GET", base+"/api/v1/agents", adminTok, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list agents: %d", resp.StatusCode)
+	}
+	for _, a := range body["agents"].([]any) {
+		if m := a.(map[string]any); m["id"] == "test:fix-read-marks" {
+			if m["display_name"] != "Fix read marks (renamed)" {
+				t.Fatalf("display name should follow the rename: %v", m)
+			}
+		}
+	}
+
+	// An instance token cannot register an APP-LEVEL identity (no
+	// client_session → 400, covered in TestRegistration) and a sibling cannot
+	// escape its own identity: kind/hostname/workdir are inherited, not taken
+	// from the body.
+	resp, body = req(t, "POST", base+"/api/v1/register", kindTok, map[string]any{
+		"hostname": "alpha", "workdir": "/tmp/alpha",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("kind token still registers app-level: %d %v", resp.StatusCode, body)
+	}
+	kindName, _ := body["name"].(string)
+	if kindName != "test:alpha:alpha" {
+		t.Fatalf("app-level name unchanged: %q", kindName)
+	}
+}
+
+func latestSeq(t *testing.T, base, tok string) int64 {
+	t.Helper()
+	resp, body := req(t, "GET", base+"/api/v1/seq", tok, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("seq: %d %v", resp.StatusCode, body)
+	}
+	n, _ := body["latest_seq"].(float64)
+	return int64(n)
+}
+
+// TestRenameAgent: display titles follow client-session renames through the
+// dedicated rename endpoint — an instance token renames siblings of its own
+// identity keyed by client session (the plugin path: OpenCode/codex session
+// title changes), the admin renames any agent by id. The agent id never
+// changes; kind tokens are rejected; cross-identity renames 404; the admin
+// always shows online.
+func TestRenameAgent(t *testing.T) {
+	srv, adminTok, kindTok, tokens := newTestAPIGlobal(t)
+	base := srv.URL
+
+	appTok := tokens["test:alpha:alpha"]
+	betaTok := tokens["test:beta:beta"]
+
+	b1 := registerSibling(t, srv, appTok, "ses_one", "Fix read marks")
+	if b1["name"] != "test:fix-read-marks" {
+		t.Fatalf("expected title-derived name, got %q", b1["name"])
+	}
+	sibTok, _ := b1["token"].(string)
+
+	// The sibling renames itself by its session uuid.
+	resp, body := req(t, "POST", base+"/api/v1/agents/rename", sibTok, map[string]any{
+		"client_session": "ses_one", "display_name": "Fix read marks v2",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("self rename: %d %v", resp.StatusCode, body)
+	}
+	if body["id"] != "test:fix-read-marks" || body["display_name"] != "Fix read marks v2" {
+		t.Fatalf("rename echo: %v", body)
+	}
+
+	// The app-level instance token renames its sibling as well (the plugin
+	// holds both tokens).
+	resp, body = req(t, "POST", base+"/api/v1/agents/rename", appTok, map[string]any{
+		"client_session": "ses_one", "display_name": "Fix read marks v3",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sibling rename via app token: %d %v", resp.StatusCode, body)
+	}
+
+	// An instance token cannot rename another identity's session.
+	resp, _ = req(t, "POST", base+"/api/v1/agents/rename", betaTok, map[string]any{
+		"client_session": "ses_one", "display_name": "hijack",
+	})
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("cross-identity rename should 404: %d", resp.StatusCode)
+	}
+
+	// Kind tokens only authorize registration.
+	resp, _ = req(t, "POST", base+"/api/v1/agents/rename", kindTok, map[string]any{
+		"client_session": "ses_one", "display_name": "nope",
+	})
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("kind token rename should 403: %d", resp.StatusCode)
+	}
+
+	// The admin renames any agent by id.
+	resp, body = req(t, "POST", base+"/api/v1/agents/rename", adminTok, map[string]any{
+		"agent": "test:fix-read-marks", "display_name": "Fix read marks v4",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("admin rename: %d %v", resp.StatusCode, body)
+	}
+	if body["id"] != "test:fix-read-marks" || body["display_name"] != "Fix read marks v4" {
+		t.Fatalf("admin rename echo: %v", body)
+	}
+
+	// Validation: blank title, missing client_session (instance), missing
+	// agent (admin), unknown agent.
+	resp, _ = req(t, "POST", base+"/api/v1/agents/rename", appTok, map[string]any{
+		"client_session": "ses_one", "display_name": "   ",
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("blank display_name should 400: %d", resp.StatusCode)
+	}
+	resp, _ = req(t, "POST", base+"/api/v1/agents/rename", appTok, map[string]any{
+		"display_name": "x",
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("missing client_session should 400: %d", resp.StatusCode)
+	}
+	resp, _ = req(t, "POST", base+"/api/v1/agents/rename", adminTok, map[string]any{
+		"display_name": "x",
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("admin without agent should 400: %d", resp.StatusCode)
+	}
+	resp, _ = req(t, "POST", base+"/api/v1/agents/rename", adminTok, map[string]any{
+		"agent": "ghost", "display_name": "x",
+	})
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown agent should 404: %d", resp.StatusCode)
+	}
+
+	// Persisted in the agents list; the admin is always online.
+	resp, body = req(t, "GET", base+"/api/v1/agents", adminTok, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list agents: %d %v", resp.StatusCode, body)
+	}
+	seenRenamed, seenAdmin := false, false
+	for _, a := range body["agents"].([]any) {
+		m := a.(map[string]any)
+		switch m["id"] {
+		case "test:fix-read-marks":
+			seenRenamed = true
+			if m["display_name"] != "Fix read marks v4" {
+				t.Fatalf("rename persisted: %v", m)
+			}
+		case "admin":
+			seenAdmin = true
+			if m["online"] != true {
+				t.Fatalf("admin should always be online: %v", m)
+			}
+		}
+	}
+	if !seenRenamed || !seenAdmin {
+		t.Fatalf("agents list incomplete: %v", body)
 	}
 }

@@ -337,3 +337,107 @@ func TestClientErrorShape(t *testing.T) {
 		t.Fatalf("expected 401 Error, got %v", err)
 	}
 }
+
+// newButlerBackendStore is newButlerBackend but also returns the store, for
+// tests that bootstrap state the way `butler serve` does.
+func newButlerBackendStore(t *testing.T) (*httptest.Server, *store.Store, string, map[string]string) {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "butler.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		close(done)
+		st.Close()
+	})
+	a := &api.API{
+		Store:      st,
+		Hub:        hub.New(),
+		AdminToken: "test-admin-token",
+		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:    &metrics.Metrics{},
+		Done:       done,
+	}
+	kinds := map[string]string{}
+	for _, id := range []string{"codex", "opencode"} {
+		tok := auth.NewToken()
+		if _, err := st.CreateKind(context.Background(), id, id, auth.Hash(tok)); err != nil {
+			t.Fatalf("create kind %s: %v", id, err)
+		}
+		kinds[id] = tok
+	}
+	srv := httptest.NewServer(a.Routes())
+	t.Cleanup(srv.Close)
+	return srv, st, "test-admin-token", kinds
+}
+
+func TestWaitMentionFormatting(t *testing.T) {
+	backend, st, _, kinds := newButlerBackendStore(t)
+	ctx := context.Background()
+
+	// Bootstrap "admin" + the global session the way `butler serve` does:
+	// every agent that registers joins it automatically.
+	if _, err := st.CreateAgent(ctx, "admin", "Admin", "human", "", "", ""); err != nil {
+		t.Fatalf("create you: %v", err)
+	}
+	if _, err := st.EnsureGlobalSession(ctx, "admin"); err != nil {
+		t.Fatalf("ensure global: %v", err)
+	}
+
+	alpha, _ := connectMCPClient(t, backend.URL, kinds["codex"], "alpha", "/tmp/proj")
+	beta, _ := connectMCPClient(t, backend.URL, kinds["opencode"], "beta", "/tmp/proj")
+
+	// Registration auto-joined both agents: the global session shows up.
+	out, isErr := callTool(t, alpha, "list_sessions", nil)
+	if isErr || !strings.Contains(out, "global") {
+		t.Fatalf("list_sessions should include the global session: %q", out)
+	}
+
+	// Initialize alpha's cursor before beta posts.
+	out, isErr = callTool(t, alpha, "wait_for_messages", map[string]any{"timeout_seconds": 1})
+	if isErr || !strings.Contains(out, "no new messages") {
+		t.Fatalf("wait before activity: %q isErr=%v", out, isErr)
+	}
+
+	// beta posts a mention and an FYI message in the global session.
+	out, isErr = callTool(t, beta, "send_message", map[string]any{"session": store.GlobalSessionID, "content": "@codex:alpha:proj please review the diff"})
+	if isErr {
+		t.Fatalf("beta send mention: %s", out)
+	}
+	out, isErr = callTool(t, beta, "send_message", map[string]any{"session": store.GlobalSessionID, "content": "heads up: build is green"})
+	if isErr {
+		t.Fatalf("beta send fyi: %s", out)
+	}
+
+	out, isErr = callTool(t, alpha, "wait_for_messages", map[string]any{"timeout_seconds": 3})
+	if isErr {
+		t.Fatalf("wait: %s", out)
+	}
+	for _, want := range []string{
+		"2 new message(s)",
+		"1 @-mention you (reply expected)",
+		"1 are FYI",
+		"(mentioned you): @codex:alpha:proj please review the diff",
+		"heads up: build is green",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("wait output missing %q in:\n%s", want, out)
+		}
+	}
+	// The FYI line must NOT carry the marker.
+	if strings.Contains(out, "(mentioned you): heads up") {
+		t.Fatalf("FYI message should not be marked as a mention:\n%s", out)
+	}
+	// Session grouping shows the title so the agent knows where to reply.
+	if !strings.Contains(out, "— session \"Global\" (global):") {
+		t.Fatalf("wait output should group by session with title:\n%s", out)
+	}
+
+	// read_session history also marks messages that mention the reader.
+	out, isErr = callTool(t, alpha, "read_session", map[string]any{"session": store.GlobalSessionID})
+	if isErr || !strings.Contains(out, "(mentioned you)") {
+		t.Fatalf("read_session should mark the mention: %q isErr=%v", out, isErr)
+	}
+}

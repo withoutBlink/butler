@@ -938,6 +938,123 @@ func TestSiblingRegistration(t *testing.T) {
 	}
 }
 
+// TestAgentRoles: an instance token lists its own agent client's roles
+// (removed flagged) — the eager-activation feed the OpenCode relay plugin
+// consumes at startup. Kind and admin tokens are rejected. While the client
+// has a live role it is hidden from the agents list; evicting every role
+// makes it the visible fallback again.
+func TestAgentRoles(t *testing.T) {
+	srv, adminTok, kindTok, tokens := newTestAPIGlobal(t)
+	base := srv.URL
+	appTok := tokens["test:alpha:alpha"]
+
+	// Auth surface: instance tokens only.
+	resp, _ := req(t, "GET", base+"/api/v1/agents/roles", "", nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no token: %d", resp.StatusCode)
+	}
+	resp, _ = req(t, "GET", base+"/api/v1/agents/roles", kindTok, nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("kind token: %d", resp.StatusCode)
+	}
+	resp, _ = req(t, "GET", base+"/api/v1/agents/roles", adminTok, nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("admin token: %d", resp.StatusCode)
+	}
+
+	// No roles yet: empty list, client still visible.
+	resp, body := req(t, "GET", base+"/api/v1/agents/roles", appTok, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("roles: %d %v", resp.StatusCode, body)
+	}
+	if body["identity"] != "test:alpha:alpha" {
+		t.Fatalf("identity: %v", body)
+	}
+	if roles, ok := body["roles"].([]any); !ok || len(roles) != 0 {
+		t.Fatalf("expected empty roles: %v", body)
+	}
+	agentListed := func(tok, id string) bool {
+		resp, body := req(t, "GET", base+"/api/v1/agents", tok, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("list agents: %d %v", resp.StatusCode, body)
+		}
+		for _, a := range body["agents"].([]any) {
+			if m := a.(map[string]any); m["id"] == id {
+				return true
+			}
+		}
+		return false
+	}
+	if !agentListed(adminTok, "test:alpha:alpha") {
+		t.Fatal("client without roles should be listed")
+	}
+
+	// Two roles on the alpha identity.
+	b1 := registerSibling(t, srv, appTok, "ses_one", "Fix read marks")
+	b2 := registerSibling(t, srv, appTok, "ses_two", "Dark theme polish")
+	role1, _ := b1["name"].(string)
+	role2, _ := b2["name"].(string)
+	sibTok, _ := b2["token"].(string)
+
+	// Both the client's token and a role's token see the same roles.
+	for _, tok := range []string{appTok, sibTok} {
+		resp, body = req(t, "GET", base+"/api/v1/agents/roles", tok, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("roles via %q: %d %v", tok, resp.StatusCode, body)
+		}
+		roles, _ := body["roles"].([]any)
+		if len(roles) != 2 {
+			t.Fatalf("expected 2 roles: %v", body)
+		}
+		for _, r := range roles {
+			m := r.(map[string]any)
+			if m["removed"] != false {
+				t.Fatalf("role should not be removed: %v", m)
+			}
+			if m["client_session"] != "ses_one" && m["client_session"] != "ses_two" {
+				t.Fatalf("unexpected role: %v", m)
+			}
+		}
+	}
+
+	// A live role hides the client; the roles themselves are listed.
+	if agentListed(adminTok, "test:alpha:alpha") {
+		t.Fatal("client with a live role should be hidden")
+	}
+	if !agentListed(adminTok, role1) || !agentListed(adminTok, role2) {
+		t.Fatal("roles should be listed")
+	}
+
+	// Evict one role: it is flagged removed, the client stays hidden.
+	resp, _ = req(t, "POST", base+"/api/v1/agents/"+role1+"/revoke", adminTok, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("revoke role1: %d", resp.StatusCode)
+	}
+	resp, body = req(t, "GET", base+"/api/v1/agents/roles", appTok, nil)
+	removedCount := 0
+	for _, r := range body["roles"].([]any) {
+		m := r.(map[string]any)
+		if m["agent"] == role1 && m["removed"] == true {
+			removedCount++
+		}
+	}
+	if removedCount != 1 {
+		t.Fatalf("evicted role should be flagged: %v", body["roles"])
+	}
+	if agentListed(adminTok, "test:alpha:alpha") {
+		t.Fatal("client should stay hidden while role2 is live")
+	}
+
+	// Evicting the last role makes the client the visible fallback again.
+	resp, _ = req(t, "POST", base+"/api/v1/agents/"+role2+"/revoke", adminTok, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("revoke role2: %d", resp.StatusCode)
+	}
+	if !agentListed(adminTok, "test:alpha:alpha") {
+		t.Fatal("client should be visible once every role is evicted")
+	}
+}
+
 func latestSeq(t *testing.T, base, tok string) int64 {
 	t.Helper()
 	resp, body := req(t, "GET", base+"/api/v1/seq", tok, nil)

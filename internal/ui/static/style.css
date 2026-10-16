@@ -89,6 +89,7 @@ td a { color: var(--accent); text-decoration: none; font-weight: 600; }
 .context dd { margin: 2px 0 0 0; white-space: pre-wrap; word-break: break-word; }
 .context-form { display: flex; flex-direction: column; gap: 6px; margin-top: 16px; }
 .context-form input, .context-form textarea { padding: 6px; border: 1px solid var(--border); border-radius: 6px; font: inherit; background: var(--bg); color: var(--fg); }
+.context-form select { padding: 6px; border: 1px solid var(--border); border-radius: 6px; font: inherit; background: var(--bg); color: var(--fg); }
 .context-form textarea { min-height: 48px; resize: vertical; }
 .context-form button { padding: 6px; background: var(--accent); color: #fff; border: none; border-radius: 6px; cursor: pointer; }
 

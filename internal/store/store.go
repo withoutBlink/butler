@@ -296,6 +296,15 @@ func (s *Store) GetAgent(ctx context.Context, name string) (*Agent, error) {
 	return scanAgent(s.db.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id = ?`, name))
 }
 
+// GetVisibleAgent resolves an agent by id with the same visibility rules as
+// ListAgents and Participants: evicted (kicked) agents and hidden agent
+// clients (app-level identities with live roles) do not resolve.
+func (s *Store) GetVisibleAgent(ctx context.Context, id string) (*Agent, error) {
+	return scanAgent(s.db.QueryRowContext(ctx, `SELECT `+agentCols+`
+		FROM agents WHERE id = ? AND removed_at IS NULL
+		AND NOT (`+clientHidden("agents")+`)`, id))
+}
+
 // GetAgentByTokenHash resolves an instance token to its agent. Removed
 // (kicked) agents have no tokens, so they never resolve here.
 func (s *Store) GetAgentByTokenHash(ctx context.Context, tokenHash string) (*Agent, error) {
@@ -528,10 +537,28 @@ func (s *Store) queryAgents(ctx context.Context, q string, args ...any) ([]Agent
 	return agents, rows.Err()
 }
 
-// ListAgents returns the active (non-removed) agents. Kicked agents stay
-// hidden until they re-register.
+// clientHidden matches app-level identities ("agent clients",
+// client_session '') that have at least one live role: once the client is
+// represented by its per-session roles it becomes backend plumbing — the
+// panel, participants and mention resolution skip it, while its token,
+// wait loop and registration path keep working (auth and delivery queries
+// never filter on this).
+func clientHidden(alias string) string {
+	return alias + `.client_session = '' AND EXISTS (
+	SELECT 1 FROM agents r
+	WHERE r.kind = ` + alias + `.kind AND r.hostname = ` + alias + `.hostname
+	  AND r.workdir = ` + alias + `.workdir AND r.client_session <> ''
+	  AND r.removed_at IS NULL)`
+}
+
+// ListAgents returns the visible (non-removed, non-hidden-client) agents.
+// Kicked agents stay hidden until they re-register; agent clients with live
+// roles are hidden — the roles represent them.
 func (s *Store) ListAgents(ctx context.Context) ([]Agent, error) {
-	return s.queryAgents(ctx, `SELECT `+agentCols+` FROM agents WHERE removed_at IS NULL ORDER BY id`)
+	return s.queryAgents(ctx, `SELECT `+agentCols+`
+		FROM agents
+		WHERE removed_at IS NULL AND NOT (`+clientHidden("agents")+`)
+		ORDER BY id`)
 }
 
 func (s *Store) TouchAgent(ctx context.Context, id string) {
@@ -710,7 +737,19 @@ func (s *Store) IsParticipant(ctx context.Context, sessionID, agentID string) (b
 func (s *Store) Participants(ctx context.Context, sessionID string) ([]Agent, error) {
 	return s.queryAgents(ctx, `SELECT `+agentCols+`
 		FROM agents a JOIN participants p ON p.agent_id = a.id
-		WHERE p.session_id = ? AND a.removed_at IS NULL ORDER BY a.id`, sessionID)
+		WHERE p.session_id = ? AND a.removed_at IS NULL
+		  AND NOT (`+clientHidden("a")+`)
+		ORDER BY a.id`, sessionID)
+}
+
+// AgentsForIdentity returns every agent row of one agent client's identity
+// key (kind, hostname, workdir): the client itself plus all its roles,
+// removed ones included — the caller decides what to show or re-register.
+func (s *Store) AgentsForIdentity(ctx context.Context, kind, hostname, workdir string) ([]Agent, error) {
+	return s.queryAgents(ctx, `SELECT `+agentCols+`
+		FROM agents
+		WHERE kind = ? AND hostname = ? AND workdir = ?
+		ORDER BY id`, kind, hostname, workdir)
 }
 
 // InsertMessage stores a chat message. @mentions in the content are resolved

@@ -50,13 +50,21 @@ Each agent *kind* (codex, opencode, ...) has exactly **one token**, shared by ev
 - The panel shows kind, title, hostname and working directory for every agent, plus a **kick** button that evicts it: tokens revoked and the agent hidden from the panel, sessions and mentions (visible immediately, with a system notice) — a stale agent is gone for good, a live one returns when it re-registers.
 - Rotating a kind token only blocks *new* registrations; existing instance tokens keep working until the agent is evicted (`agent revoke`).
 
-### Per-session identities (one butler agent per OpenCode session)
+### Agent clients, roles and meetings
 
-An MCP connection is per *app*, not per session — OpenCode spawns one `butler-mcp` for all its sessions, so sessions would otherwise share one identity. To make each session its own recognizable agent, the **registration key has a fourth part: `client_session`** (the client's session uuid). Registering with a kind token plus a non-empty `client_session` — or, more usefully, with an **instance token** of an existing identity plus `{client_session, display_name}` — mints a *sibling* agent:
+An MCP connection is per *app*, not per session — OpenCode spawns one `butler-mcp` for all its sessions, so sessions would otherwise share one identity. The model has three parts:
 
-- Sibling registration with an instance token inherits the caller's kind/hostname/workdir (an instance token can only mint siblings of its own identity) and names the agent from the display name — the OpenCode plugin passes the **session title**, so the agent reads `opencode:fix-read-marks` instead of a uuid. Re-registering keeps the minted id forever, refreshes the title, rotates the token, and is silent (no reconnect announcements — the plugin re-registers every sibling on each app restart).
-- Renamed client sessions keep the panel readable through `POST /api/v1/agents/rename` (`{client_session, display_name}` with an instance token, or `{agent, display_name}` with the admin token): the relay plugin watches OpenCode session titles and pushes renames as they change. The id never changes; the title does.
-- The OpenCode relay plugin is the reference consumer: it sibling-registers a butler agent on each session's first model request, runs a per-session wait loop (so an @mention of `opencode:fix-read-marks` wakes *exactly that session*), and shadows the butler MCP tools so tool calls act as the calling session's agent. See "Automatic delivery into OpenCode".
+- the **agent client** — the app-level identity above (`opencode:t3mcenter-arm:butler`, registered by `butler-mcp`, `client_session` empty). Once it has live roles it is **backend plumbing**: the panel, participants lists, session picks and mention resolution all hide it (the roles represent it) while its token, registration path and fallback relay keep working. It re-appears only when it has no live role left — e.g. after every role was kicked. The CLI (`butler agent list`) always shows it.
+- the **role** — a per-session sibling agent: the **registration key has a fourth part: `client_session`** (the client's session uuid). Registering with a kind token plus a non-empty `client_session` — or, more usefully, with an **instance token** of an existing identity plus `{client_session, display_name}` — mints a sibling agent of that client:
+  - Sibling registration with an instance token inherits the caller's kind/hostname/workdir (an instance token can only mint siblings of its own identity) and names the agent from the display name — the OpenCode plugin passes the **session title**, so the agent reads `opencode:fix-read-marks` instead of a uuid. Re-registering keeps the minted id forever, refreshes the title, rotates the token, and is silent (no reconnect announcements — the plugin re-registers every sibling on each app restart).
+  - Renamed client sessions keep the panel readable through `POST /api/v1/agents/rename` (`{client_session, display_name}` with an instance token, or `{agent, display_name}` with the admin token): the relay plugin watches OpenCode session titles and pushes renames as they change. The id never changes; the title does.
+- the **meeting** — a butler session you compose from roles (and yourself): create it in the panel, pick the roles that should take part, and everyone sees the same thread with read marks. Nothing new server-side — just the vocabulary for "session of roles + human".
+
+**Roles activate eagerly while the client app runs.** The OpenCode relay plugin is the reference consumer:
+
+- At startup it asks butler for every role of its agent client (`GET /api/v1/agents/roles`) and re-registers each one whose OpenCode session still exists — a session that is open but dormant comes back online without waiting for a model request. Evicted (kicked) roles stay out until their session itself acts; roles of deleted sessions are skipped.
+- Any session touch activates its role: a model request, opening the session (`session.viewed`), or sending it a prompt (`session.inbox.enqueued`).
+- Each role runs its own wait loop (so an @mention of `opencode:fix-read-marks` wakes *exactly that session*), and the plugin shadows the butler MCP tools so tool calls act as the calling session's role. See "Automatic delivery into OpenCode".
 
 ## Connecting agents (MCP)
 
@@ -136,14 +144,14 @@ panel / codex / another agent
                       ADDRESSED TO YOU (reply expected): …"
 ```
 
-Per-session agents:
+Per-session roles:
 
-- On a session's first model request (once it has a title — the plugin waits for one) the plugin **sibling-registers** a butler agent named from the session title, e.g. `opencode:fix-read-marks`. Every OpenCode session in the workdir gets its own agent this way; @mentioning a specific one wakes exactly that session.
-- Each session agent runs its own long-poll loop and relays **only into its own session**. Read marks advance per session agent, so the panel's read chips honestly reflect what reached which session.
+- **Eager activation**: at plugin startup the plugin asks butler for every role of its agent client (`GET /api/v1/agents/roles`) and re-registers each one whose OpenCode session still exists (butler remembers roles by session id — ids are stable), so even dormant open sessions have their role online while OpenCode runs. Evicted (kicked) roles stay out until their session itself acts; roles of deleted sessions are skipped. Beyond that, any session touch — a model request, opening the session, sending it a prompt — activates its role (once it has a title; the plugin waits for one) by **sibling-registering** a butler agent named from the session title, e.g. `opencode:fix-read-marks`. @mentioning a specific role wakes exactly that session.
+- Each role runs its own long-poll loop and relays **only into its own session**. Read marks advance per role, so the panel's read chips honestly reflect what reached which session.
 - When an OpenCode session is renamed, the plugin pushes the new title via the rename endpoint, so the panel and participant lists stay recognizable (ids stay stable).
 - The plugin **shadows the butler MCP tools** under their same effective names (`butler_send_message`, `butler_read_session`, …) so nothing changes for agents. Executors resolve the *calling session's* agent, so replies and history reads act as that session's identity; sessions without a registered agent (and Code Mode calls with no session context) fall back to the shared app-level identity. `wait_for_messages`/`check_messages` stay MCP.
 
-App-level relay (the original loop, still running): messages of the shared identity — for sessions that have no agent yet — go to the session that most recently ran a model request (tracked with a no-op `context` hook), or a dedicated "Butler" bridge session with `bridge: true`. A per-seq delivery map dedupes: when a session's own agent already relayed a message into that session, the app-level loop skips it.
+Agent-client relay (the original loop, still running): the client's own messages — for sessions that have no live role — go to the session that most recently ran a model request (tracked with a no-op `context` hook), or a dedicated "Butler" bridge session with `bridge: true`. A per-seq delivery map dedupes: when a session's own role already relayed a message into that session, the client loop skips it. The client identity itself is hidden from the panel while it has live roles (see "Agent clients, roles and meetings").
 
 Delivery rules (both loops):
 
@@ -151,7 +159,7 @@ Delivery rules (both loops):
 - **`delivery: "queue"`** (default) never interrupts an in-flight generation; the message is processed at the next step boundary. `delivery: "steer"` is available as an option.
 - **Filtered**: messages sent by the identity itself (its own `send_message` output — prevents echo loops) and `system` notices (join/leave/reconnect) are not relayed; `chat` and `context` messages are.
 - **Mention-aware framing**: injected messages carry `ADDRESSED TO YOU (reply expected):` when they @-mention the agent and `FYI:` otherwise, so the agent knows which to answer and which it can ignore.
-- **Cursor**: initialized to the server's latest seq when the plugin starts — history is never replayed (agents use `read_session` for that). Same semantics as `butler-mcp`'s in-memory cursor.
+- **Cursor**: the agent-client loop starts at the server's latest seq (history is never replayed — agents use `read_session`). Each role loop's cursor **persists in plugin storage**, so messages that arrived while the plugin context was down (OpenCode tears plugins down when no client work is active) are delivered when the role re-activates — at-least-once: a teardown right after a relay can re-deliver that batch.
 
 Recovery:
 
@@ -164,7 +172,7 @@ Options (when referenced via the `plugins` array in `opencode.json`): `stateFile
 { "plugins": [{ "package": "/path/to/butler/.opencode/plugins/butler", "options": { "bridge": true } }] }
 ```
 
-Limitations: deleting an OpenCode session stops its agent's loop but leaves the butler agent behind (kick it from the panel); a new session with the same title mints a `-2` name.
+Limitations: roles show offline whenever no OpenCode client context is active — OpenCode tears the plugin (and its wait loops) down between active work, so nothing is polling then; eager activation plus persisted cursors bring the role back and deliver what it missed on the next client activity. Deleting an OpenCode session stops its role's loop but leaves the butler agent behind (kick it from the panel); a new session with the same title mints a `-2` name.
 
 ### Automatic delivery into Codex (relay daemon)
 
@@ -207,7 +215,7 @@ Open `https://<your-butler-host>/panel/` in a browser and sign in with the admin
 
 - dashboard: all sessions with participants (by title) and last activity; the agents table splits **Kind** and **Title** (the session title for per-session agents, with the id as a small sub-line — it's what @mentions resolve against), host, working directory and presence (online = seen in the last 90s; `admin` is always shown online — anyone reading presence is at the panel). A **kick** button per row evicts the agent (same as `butler agent revoke`): its tokens are revoked and it disappears from the panel, session participants and mentions immediately, with a system notice in every session it was in. The identity row survives (history references it); a live process brings it back by re-registering — so kicking cleans up stale agents permanently and only disconnects live ones until their next registration.
 - new-session form: pick a title plus any number of agents (checkboxes) to start a focused session — every picked agent is added with a join notice, and one agent can be in any number of sessions at once; the global session is the room everyone shares automatically
-- live session view: messages stream in via SSE as agents talk; you post as the `admin` agent (auto-joins any session you post to); participants sidebar shows kind · hostname
+- live session view: messages stream in via SSE as agents talk; you post as the `admin` agent (auto-joins any session you post to); participants sidebar shows kind · hostname, with an **Add to meeting** picker below it listing every connected role not in the session yet — adding one writes a join notice, wakes its wait loop, and updates every open panel live. Hidden agent clients and evicted agents are never offered.
 - read marks: every chat message carries a `✓k/N` chip showing how many of the session's agent participants (other than the sender) have received it — k flips to N (green) as their wait polls pick the message up, live via SSE
 - @mentions in the composer: type `@` for autocomplete over the other participants (plus `@all`) — mentioned agents are the ones expected to reply
 - shared context: view and edit session-level key/value notes
@@ -227,6 +235,7 @@ All endpoints take `Authorization: Bearer <token>` unless noted. Tokens: admin (
 | GET | /api/v1/agents | any non-kind | list registered instances (name, title, kind, hostname, workdir, presence) |
 | POST | /api/v1/agents/{name}/revoke | admin | evict an agent (kick): revoke its tokens and hide it from listings, participants and mentions until it re-registers; posts a system notice in every session it was in |
 | POST | /api/v1/agents/rename | instance or admin | rename an agent's display title: instance token `{client_session, display_name}` (siblings of the caller's own identity — used by the plugin to follow session title changes), admin `{agent, display_name}` (any agent). The id never changes |
+| GET | /api/v1/agents/roles | instance | list the **roles** (per-client-session siblings) of the caller's agent client, `{identity, roles: [{client_session, agent, display_name, removed}]}` — the eager-activation feed the OpenCode plugin consumes at startup |
 | POST | /api/v1/sessions | agent | create session (creator auto-joins) |
 | GET | /api/v1/sessions?joined=1 | any | list sessions (all, or just mine) |
 | GET | /api/v1/sessions/{id} | participant | session detail + participants |

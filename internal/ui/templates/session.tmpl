@@ -17,6 +17,17 @@
 <main class="session-layout">
 <aside class="sidebar">
 {{template "participants" .Participants}}
+{{if .Addable}}
+<form method="post" action="/panel/sessions/{{.Session.ID}}/join" class="context-form join-form">
+<h3>Add to meeting</h3>
+<select name="agent" required aria-label="Role to add">
+{{range .Addable}}<option value="{{.ID}}" title="{{.ID}}">{{.Title}} · {{.Kind}}</option>{{end}}
+</select>
+<button type="submit">Add participant</button>
+</form>
+{{else}}
+<p class="hint">No other connected roles to add — every visible role is already in this meeting.</p>
+{{end}}
 <section class="context">
 <h3>Context</h3>
 <dl>

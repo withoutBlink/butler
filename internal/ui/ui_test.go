@@ -342,6 +342,133 @@ func TestPanelKickAgent(t *testing.T) {
 	}
 }
 
+// TestPanelJoinParticipant: the session view's participants area adds a role
+// to an existing meeting. The picker offers visible non-participants only —
+// roles, never hidden agent clients or evicted agents — the POST writes the
+// participant row plus a join notice and lands back on the session, and
+// duplicate/unknown/admin submits are rejected.
+func TestPanelJoinParticipant(t *testing.T) {
+	srv, st, _, adminTok := newPanel(t)
+	ctx := context.Background()
+	if _, err := st.CreateAgent(ctx, "admin", "Admin", "human", "", "", ""); err != nil {
+		t.Fatalf("create admin: %v", err)
+	}
+	// A role in the meeting, a role to add, an evicted role, and an agent
+	// client (hidden while it has a live role sibling).
+	if _, err := st.CreateAgent(ctx, "opencode:fix-read-marks", "Fix read marks", "opencode", "h", "/w", "ses_one"); err != nil {
+		t.Fatalf("create participant: %v", err)
+	}
+	if _, err := st.CreateAgent(ctx, "opencode:polish-panel", "Polish panel", "opencode", "h", "/w", "ses_two"); err != nil {
+		t.Fatalf("create addable: %v", err)
+	}
+	if _, err := st.CreateAgent(ctx, "opencode:dead-session", "Dead session", "opencode", "h", "/w", "ses_dead"); err != nil {
+		t.Fatalf("create dead: %v", err)
+	}
+	if err := st.RemoveAgent(ctx, "opencode:dead-session"); err != nil {
+		t.Fatalf("evict dead: %v", err)
+	}
+	if _, err := st.CreateAgent(ctx, "opencode:h:butler", "opencode:h:butler", "opencode", "h", "/w", ""); err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	if _, err := st.CreateSession(ctx, "s1", "meeting", "admin", []string{"opencode:fix-read-marks"}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	client := newBrowser(t)
+	login(t, client, srv.URL, adminTok)
+
+	resp, err := client.Get(srv.URL + "/panel/sessions/s1")
+	if err != nil {
+		t.Fatalf("session view: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `action="/panel/sessions/s1/join"`) {
+		t.Fatalf("session view missing add-participant form:\n%s", string(body))
+	}
+	if !strings.Contains(string(body), `value="opencode:polish-panel"`) {
+		t.Fatalf("picker missing the addable role:\n%s", string(body))
+	}
+	if strings.Contains(string(body), `value="opencode:fix-read-marks"`) {
+		t.Fatalf("picker offers a current participant:\n%s", string(body))
+	}
+	if strings.Contains(string(body), `value="opencode:dead-session"`) {
+		t.Fatalf("picker offers an evicted agent:\n%s", string(body))
+	}
+	if strings.Contains(string(body), `value="opencode:h:butler"`) {
+		t.Fatalf("picker offers a hidden agent client:\n%s", string(body))
+	}
+
+	join := func(agent string) int {
+		t.Helper()
+		resp, err := client.PostForm(srv.URL+"/panel/sessions/s1/join", url.Values{"agent": {agent}})
+		if err != nil {
+			t.Fatalf("join %s: %v", agent, err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	// Rejected submits: unknown, evicted, hidden client, admin, duplicate.
+	for _, agent := range []string{"opencode:nope", "opencode:dead-session", "opencode:h:butler", "admin", "opencode:fix-read-marks"} {
+		if got := join(agent); got != http.StatusBadRequest {
+			t.Fatalf("join %q: got %d, want 400", agent, got)
+		}
+	}
+
+	// Happy path: 303 back to the session; participant row + join notice.
+	resp, err = client.PostForm(srv.URL+"/panel/sessions/s1/join", url.Values{"agent": {"opencode:polish-panel"}})
+	if err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("join: %d", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/panel/sessions/s1" {
+		t.Fatalf("join redirect: %q", loc)
+	}
+	parts, err := st.Participants(ctx, "s1")
+	if err != nil {
+		t.Fatalf("participants: %v", err)
+	}
+	found := false
+	for _, a := range parts {
+		if a.ID == "opencode:polish-panel" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("added role is not a participant: %+v", parts)
+	}
+	msgs, err := st.SessionLatestMessages(ctx, "s1", 20)
+	if err != nil {
+		t.Fatalf("messages: %v", err)
+	}
+	noticed := false
+	for _, m := range msgs {
+		if m.Kind == "system" && m.SenderID == "opencode:polish-panel" && strings.Contains(m.Content, "joined the session") {
+			noticed = true
+		}
+	}
+	if !noticed {
+		t.Fatalf("missing join notice for the added role: %+v", msgs)
+	}
+
+	// The view now lists it as a participant and stops offering it.
+	resp, err = client.Get(srv.URL + "/panel/sessions/s1")
+	if err != nil {
+		t.Fatalf("session view: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), "Polish panel") {
+		t.Fatalf("session view missing the added participant:\n%s", string(body))
+	}
+	if strings.Contains(string(body), `value="opencode:polish-panel"`) {
+		t.Fatalf("picker still offers a participant:\n%s", string(body))
+	}
+}
+
 func TestOriginCheck(t *testing.T) {
 	srv, _, _, adminTok := newPanel(t)
 	client := newBrowser(t)

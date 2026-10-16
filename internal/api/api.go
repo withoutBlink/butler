@@ -84,6 +84,7 @@ func (a *API) Routes() http.Handler {
 	route("POST /api/v1/kinds", a.createKind)
 	route("POST /api/v1/kinds/{id}/rotate", a.rotateKind)
 	route("GET /api/v1/agents", a.listAgents)
+	route("GET /api/v1/agents/roles", a.agentRoles)
 	route("POST /api/v1/agents/{id}/revoke", a.revokeAgentTokens)
 	route("POST /api/v1/agents/rename", a.renameAgent)
 	route("GET /api/v1/sessions", a.listSessions)
@@ -319,6 +320,44 @@ func (a *API) listAgents(w http.ResponseWriter, r *http.Request) {
 		out = append(out, toAgentJSON(&agents[i]))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"agents": out})
+}
+
+// agentRoles lists the roles (per-client-session siblings) of the caller's
+// agent client, removed ones flagged. The OpenCode relay plugin calls this
+// at startup to re-activate every role of its client that still exists as
+// an OpenCode session — eager activation instead of waiting for each
+// session's next model request. Instance-token auth only: an agent only
+// sees its own identity's roles.
+func (a *API) agentRoles(w http.ResponseWriter, r *http.Request) {
+	agent := a.requireAgent(w, r)
+	if agent == nil {
+		return
+	}
+	rows, err := a.Store.AgentsForIdentity(r.Context(), agent.Kind, agent.Hostname, agent.Workdir)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "store error")
+		return
+	}
+	type roleJSON struct {
+		ClientSession string `json:"client_session"`
+		Agent         string `json:"agent"`
+		DisplayName   string `json:"display_name"`
+		Removed       bool   `json:"removed"`
+	}
+	out := make([]roleJSON, 0, len(rows))
+	for i := range rows {
+		row := &rows[i]
+		if row.ClientSession == "" {
+			continue // the client itself, not a role
+		}
+		out = append(out, roleJSON{
+			ClientSession: row.ClientSession,
+			Agent:         row.ID,
+			DisplayName:   row.DisplayName,
+			Removed:       row.RemovedAt != nil,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"identity": agent.ID, "roles": out})
 }
 
 // registerAgent exchanges a kind token plus hostname/workdir for a stable

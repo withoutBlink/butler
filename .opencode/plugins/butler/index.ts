@@ -1,44 +1,56 @@
-// Butler relay plugin — per-OpenCode-session butler identities.
+// Butler relay plugin — one butler role per OpenCode session.
 //
-// butler-mcp (the MCP server OpenCode spawns) registers the app-level
-// identity (kind, hostname, workdir) and writes its instance token to
-// <workdir>/.butler/instance.json. One OpenCode app hosts many sessions and
-// the MCP server cannot tell them apart — so this plugin, which CAN, gives
-// every OpenCode session its own butler agent:
+// Vocabulary (matches the panel):
+//   - agent client — the app-level butler identity (kind, hostname,
+//     workdir) that butler-mcp (the MCP server OpenCode spawns) registers
+//     at startup, writing its instance token to
+//     <workdir>/.butler/instance.json. Pure backend plumbing: once it has
+//     live roles the panel hides it (the roles represent it) and it only
+//     serves as the registration conduit and the fallback relay.
+//   - role — this plugin's per-OpenCode-session butler agent: the same
+//     identity plus the OpenCode session id as the client_session
+//     discriminator, sibling-registered via the instance token. The name
+//     is minted from the session title, e.g. "opencode:fix-read-marks",
+//     so a human can tell the roles apart in the panel and @mentions.
 //
-//   - On a session's first model request, the plugin sibling-registers a
-//     butler agent (same kind/hostname/workdir + the OpenCode session id as
-//     the client_session discriminator) using the app instance token. The
-//     name is minted from the session title, e.g. "opencode:fix-read-marks",
-//     so a human can tell the sessions apart in the panel and @mentions.
-//   - Each session agent long-polls /api/v1/wait and relays its messages
-//     into ITS OWN OpenCode session only — @mentioning a specific session
-//     agent wakes exactly that session. Read marks advance per session
-//     agent (wait batches mark what reached the session's context).
+// Role activation is EAGER:
+//   - at startup the plugin asks butler for every role of its agent client
+//     (GET /api/v1/agents/roles) and re-registers each one whose OpenCode
+//     session still exists — dormant sessions come back online without
+//     waiting for a model request. Evicted (kicked) roles stay out until
+//     their session itself acts; roles of deleted sessions are skipped.
+//   - any session touch activates its role: a model request, a viewed
+//     session (session.viewed) or an incoming user prompt
+//     (session.inbox.enqueued). Sessions of other locations are ignored —
+//     they belong to other agent clients (their own plugin instance).
+//
+// Delivery:
+//   - Each role long-polls /api/v1/wait and relays its messages into ITS
+//     OWN OpenCode session only — @mentioning a specific role wakes
+//     exactly that session. Read marks advance per role (wait batches mark
+//     what reached the session's context).
 //   - The plugin also shadows the butler MCP tools (send_message,
-//     read_session, …) under their same effective names. Their executors see
-//     the calling session's id, so replies and history reads act as that
-//     session's agent. Sessions without a registered agent (and Code Mode
-//     calls without session context) fall back to the app-level identity —
-//     the pre-plugin behavior.
-//   - The app-level relay loop (messages of the shared identity → the most
+//     read_session, …) under their same effective names. Their executors
+//     see the calling session's id, so replies and history reads act as
+//     that session's role. Sessions without a registered role (and Code
+//     Mode calls without session context) fall back to the agent client.
+//   - The app-level relay loop (the agent client's own messages → the most
 //     recently active session, or a dedicated "Butler" bridge session)
-//     keeps running for sessions that have no agent yet and for butler
-//     sessions where only the app identity participates; a per-seq delivery
-//     map dedupes so the active session never sees a message twice.
+//     keeps serving sessions without a live role; a per-seq delivery map
+//     dedupes so the active session never sees a message twice.
 //
 // Options (when loaded via the `plugins` array in opencode.json):
 //   stateFile  — explicit path to the instance.json state file
 //   bridge     — always deliver the app-level relay to the "Butler" session
 //   delivery   — "queue" (default) or "steer"
 //
-// Known limitation: deleting an OpenCode session leaves its butler agent
-// behind — kick it from the panel to evict it (kick revokes the token, stops
-// this loop and hides the agent until it re-registers). A new OpenCode
-// session with the same title mints a "-2" name.
+// Known limitation: deleting an OpenCode session leaves its role behind
+// (loop stops, role stays with a dead token; the next startup skips it) —
+// kick it from the panel to evict it for good. A new OpenCode session with
+// the same title mints a "-2" name.
 
 import { Plugin } from "@opencode/plugin"
-import { existsSync, readFileSync } from "node:fs"
+import { appendFileSync, existsSync, readFileSync } from "node:fs"
 import * as path from "node:path"
 
 interface ButlerInstance {
@@ -98,6 +110,16 @@ export default Plugin.define({
 
     const controller = new AbortController()
     const aborted = () => controller.signal.aborted
+
+    // TEMP DIAGNOSTIC — plugin lifecycle probe (remove after diagnosis):
+    // records every plugin (re)load so we can see when OpenCode spins
+    // plugin contexts up and down.
+    try {
+      appendFileSync(
+        path.join(ctx.location.directory, ".butler", "plugin-load.log"),
+        `${new Date().toISOString()} plugin init\n`,
+      )
+    } catch {}
 
     // ---- app-level identity (instance.json, written by butler-mcp) ----
 
@@ -214,10 +236,14 @@ export default Plugin.define({
 
     const waitForTitle = async (sid: string): Promise<string | undefined> => {
       // Titles are generated shortly after the first exchange; poll until
-      // the session has one (or is gone).
+      // the session has one (or is gone). Sessions of another location are
+      // skipped too — they belong to a different agent client (another
+      // plugin instance in that directory owns their roles).
       for (let i = 0; i < 30; i++) {
         try {
           const info = await ctx.session.get({ sessionID: sid })
+          const dir = (info as any)?.location?.directory
+          if (dir && dir !== ctx.location.directory) return undefined
           if (info?.title) return info.title
         } catch {
           return undefined // deleted or unavailable session
@@ -274,22 +300,37 @@ export default Plugin.define({
 
     const startSessionLoop = (entry: SessionAgent) => {
       void (async () => {
-        // Initialize the cursor to the server's latest seq (skip history);
-        // agents use read_session for anything older.
+        // The cursor persists in plugin storage: OpenCode tears plugin
+        // contexts down when no client work is active, killing every wait
+        // loop with them — roles then show offline even though the opencode
+        // service process keeps running. A persisted cursor makes the next
+        // activation deliver everything that arrived during the dead window
+        // instead of skipping it. First run: start at the server's latest
+        // seq (skip history; agents use read_session for anything older).
+        const cursorKey = `butler:cursor:${entry.sid}`
+        let savedCursor = -1
+        try {
+          const saved = await ctx.storage.get(cursorKey)
+          if (typeof saved === "number") savedCursor = saved
+        } catch {}
         let backoff = 0
-        for (;;) {
-          if (aborted()) return
-          try {
-            const res = await butlerFetch(entry, "/api/v1/seq")
-            if (res.status === 401) throw new Error("401")
-            if (!res.ok) throw new Error(`seq: HTTP ${res.status}`)
-            const body = (await res.json()) as { latest_seq?: number }
-            entry.cursor = body.latest_seq ?? 0
-            break
-          } catch (err: any) {
-            if (aborted() || err?.name === "AbortError") return
-            backoff = Math.min(backoff ? backoff * 2 : 2_000, MAX_BACKOFF_MS)
-            await sleep(backoff, controller.signal)
+        if (savedCursor >= 0) {
+          entry.cursor = savedCursor
+        } else {
+          for (;;) {
+            if (aborted()) return
+            try {
+              const res = await butlerFetch(entry, "/api/v1/seq")
+              if (res.status === 401) throw new Error("401")
+              if (!res.ok) throw new Error(`seq: HTTP ${res.status}`)
+              const body = (await res.json()) as { latest_seq?: number }
+              entry.cursor = body.latest_seq ?? 0
+              break
+            } catch (err: any) {
+              if (aborted() || err?.name === "AbortError") return
+              backoff = Math.min(backoff ? backoff * 2 : 2_000, MAX_BACKOFF_MS)
+              await sleep(backoff, controller.signal)
+            }
           }
         }
         backoff = 0
@@ -323,6 +364,15 @@ export default Plugin.define({
               if (!ok) return // target session is gone — stop this loop
             }
             entry.cursor = Math.max(entry.cursor, body.latest_seq ?? entry.cursor)
+            if (entry.cursor > savedCursor) {
+              // Persist only after the batch was relayed: at-least-once —
+              // a teardown between relay and persist may re-deliver a
+              // batch, one before the relay retries it.
+              savedCursor = entry.cursor
+              try {
+                await ctx.storage.set(cursorKey, entry.cursor)
+              } catch {}
+            }
           } catch (err: any) {
             if (aborted() || err?.name === "AbortError") return
             backoff = Math.min(backoff ? backoff * 2 : 2_000, MAX_BACKOFF_MS)
@@ -443,6 +493,72 @@ export default Plugin.define({
 
     const resolveTarget = async (): Promise<string | undefined> =>
       opts.bridge ? await resolveBridge() : lastActive?.sessionID ?? (await resolveBridge())
+
+    // ---- eager role activation ----
+    //
+    // The butler server remembers every role (client_session) this agent
+    // client ever registered — ids are stable — so at startup we ask for
+    // the list and re-activate each role whose OpenCode session still
+    // exists. Sessions that are open but dormant come back online without
+    // waiting for a model request. Evicted (kicked) roles stay out until
+    // their session itself acts; roles whose session no longer exists fail
+    // ctx.session.get inside ensureSessionAgent and are skipped.
+    void (async () => {
+      const inst = await instanceReady
+      if (!inst) return
+      for (;;) {
+        if (aborted()) return
+        try {
+          const res = await butlerFetch(getApp()!, "/api/v1/agents/roles")
+          if (res.status === 401) {
+            const fresh = readInstance()
+            if (fresh) {
+              app = fresh
+              continue
+            }
+          }
+          if (!res.ok) throw new Error(`roles: HTTP ${res.status}`)
+          const body = (await res.json()) as {
+            roles?: { client_session: string, agent: string, removed?: boolean }[]
+          }
+          let activated = 0
+          for (const r of body.roles ?? []) {
+            if (!r.client_session || r.removed) continue
+            void ensureSessionAgent(r.client_session)
+            activated++
+          }
+          console.log(`[butler] activated ${activated} role(s) of ${inst.agent}`)
+          return
+        } catch (err: any) {
+          if (aborted() || err?.name === "AbortError") return
+          // butler down or the client token dead (kicked client, waiting
+          // for butler-mcp's next registration) — retry quietly.
+          await sleep(30_000, controller.signal)
+        }
+      }
+    })()
+
+    // Roles also activate on ANY session touch, not just model requests: a
+    // session the user opens (session.viewed) or messages
+    // (session.inbox.enqueued) gets its role registered even if the model
+    // never runs. ensureSessionAgent skips sessions belonging to other
+    // locations — those are other agent clients' sessions.
+    void (async () => {
+      try {
+        const stream = (ctx.event as any).subscribe({ signal: controller.signal }) as AsyncIterable<any>
+        for await (const ev of stream) {
+          const type = ev?.type
+          if (type !== "session.viewed" && type !== "session.inbox.enqueued") continue
+          const sid = ev?.data?.sessionID
+          if (typeof sid !== "string") continue
+          const dir = ev?.location?.directory
+          if (dir && dir !== ctx.location.directory) continue
+          void ensureSessionAgent(sid)
+        }
+      } catch {
+        // stream aborted on unload
+      }
+    })()
 
     void (async () => {
       const instance = await instanceReady

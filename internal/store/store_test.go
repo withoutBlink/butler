@@ -885,3 +885,78 @@ func TestRemoveAgent(t *testing.T) {
 		t.Fatalf("revived agent not a participant")
 	}
 }
+
+// TestAgentClientHiddenByRoles: an app-level identity ("agent client") is
+// backend plumbing once it has a live role — listings and participants hide
+// it (the role represents it); with no roles, or after every role is
+// evicted, it is the visible fallback again.
+func TestAgentClientHiddenByRoles(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	if _, err := s.CreateAgent(ctx, "admin", "Admin", "human", "", "", ""); err != nil {
+		t.Fatalf("create admin: %v", err)
+	}
+	client, err := s.CreateAgent(ctx, "opencode:host:butler", "opencode:host:butler", "opencode", "host", "/w", "")
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+
+	listed := func(id string) bool {
+		agents, err := s.ListAgents(ctx)
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		for _, a := range agents {
+			if a.ID == id {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !listed(client.ID) {
+		t.Fatal("client without roles should be listed (it is the only presence)")
+	}
+
+	role, err := s.CreateAgent(ctx, "opencode:fix-read-marks", "Fix read marks", "opencode", "host", "/w", "ses_one")
+	if err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+	if _, err := s.CreateSession(ctx, "s1", "meeting", "admin", []string{client.ID, role.ID}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	if listed(client.ID) {
+		t.Fatal("client with a live role should be hidden from listings")
+	}
+	if !listed(role.ID) {
+		t.Fatal("role should be listed")
+	}
+	parts, err := s.Participants(ctx, "s1")
+	if err != nil {
+		t.Fatalf("participants: %v", err)
+	}
+	for _, p := range parts {
+		if p.ID == client.ID {
+			t.Fatal("client should be hidden from participants")
+		}
+	}
+	found := false
+	for _, p := range parts {
+		if p.ID == role.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("role should be a visible participant")
+	}
+
+	// Evicting the only role: the client becomes the visible fallback again.
+	if err := s.RemoveAgent(ctx, role.ID); err != nil {
+		t.Fatalf("remove role: %v", err)
+	}
+	if !listed(client.ID) {
+		t.Fatal("client should be visible once every role is evicted")
+	}
+}

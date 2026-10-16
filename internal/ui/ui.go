@@ -178,6 +178,7 @@ func (p *Panel) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /panel/", p.dashboard)
 	mux.HandleFunc("POST /panel/sessions", p.createSession)
 	mux.HandleFunc("GET /panel/sessions/{id}", p.sessionView)
+	mux.HandleFunc("POST /panel/sessions/{id}/join", p.joinParticipant)
 	mux.HandleFunc("POST /panel/sessions/{id}/messages", p.postMessage)
 	mux.HandleFunc("POST /panel/sessions/{id}/context", p.putContext)
 	mux.HandleFunc("GET /panel/sessions/{id}/stream", p.stream)
@@ -465,6 +466,43 @@ type sessionViewData struct {
 	// current without a page reload.
 	Agents string
 	Reads  string
+	// Addable are the visible agents (roles) not yet in the session — the
+	// participants-area "add to meeting" picker.
+	Addable []agentOption
+}
+
+// agentOption is one entry of the session view's add-participant picker.
+type agentOption struct {
+	ID    string
+	Title string
+	Kind  string
+}
+
+// addableAgents lists visible agents that are not participants yet. Hidden
+// agent clients and evicted agents never show (ListAgents filters them) —
+// the picker offers roles only, matching the panel's vocabulary.
+func (p *Panel) addableAgents(ctx context.Context, parts []store.Agent) []agentOption {
+	out := []agentOption{}
+	agents, err := p.Store.ListAgents(ctx)
+	if err != nil {
+		p.Log.Error("list agents", "err", err)
+		return out
+	}
+	inSession := map[string]bool{}
+	for _, a := range parts {
+		inSession[a.ID] = true
+	}
+	for _, a := range agents {
+		if a.ID == AdminAgentID || inSession[a.ID] {
+			continue
+		}
+		title := a.DisplayName
+		if title == "" || title == a.ID {
+			title = a.Kind
+		}
+		out = append(out, agentOption{ID: a.ID, Title: title, Kind: a.Kind})
+	}
+	return out
 }
 
 // uiMsg is a message plus the panel's read state for it.
@@ -588,7 +626,67 @@ func (p *Panel) sessionView(w http.ResponseWriter, r *http.Request) {
 	p.render(w, http.StatusOK, "session.tmpl", sessionViewData{
 		Session: *sess, Participants: parts, Messages: attachReadState(rs, msgs), ContextItems: items, LatestSeq: latest,
 		Mentionables: string(mentionables), Agents: string(agentsJSON), Reads: string(readsJSON),
+		Addable: p.addableAgents(ctx, parts),
 	})
+}
+
+// joinParticipant is the participants-area "add" form on the session view:
+// it adds one more agent (a role) to an existing meeting. JoinSession writes
+// the participant row plus a "joined the session" system notice in one
+// transaction; the fanout wakes the new participant's wait loop and every
+// panel viewing the session. admin is not addable (it joins implicitly when
+// posting) and hidden agent clients / evicted agents are rejected here —
+// the picker is fed by the same visible list, this re-validates the submit.
+func (p *Panel) joinParticipant(w http.ResponseWriter, r *http.Request) {
+	if !p.requirePanel(w, r) {
+		return
+	}
+	if !sameOrigin(r) {
+		http.Error(w, "cross-origin rejected", http.StatusForbidden)
+		return
+	}
+	sid := r.PathValue("id")
+	ctx := r.Context()
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+	if err := parsePanelForm(r); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	agentID := strings.TrimSpace(r.PostFormValue("agent"))
+	if agentID == "" {
+		http.Error(w, "agent is required", http.StatusBadRequest)
+		return
+	}
+	if agentID == AdminAgentID {
+		http.Error(w, "admin participates by posting, not by joining", http.StatusBadRequest)
+		return
+	}
+	sess, err := p.Store.GetSession(ctx, sid)
+	if err != nil {
+		p.httpError(w, "session not found", 404)
+		return
+	}
+	if sess.Status != "active" {
+		http.Error(w, "session is "+sess.Status, http.StatusConflict)
+		return
+	}
+	if _, err := p.Store.GetVisibleAgent(ctx, agentID); err != nil {
+		http.Error(w, "unknown agent "+agentID, http.StatusBadRequest)
+		return
+	}
+	if ok, err := p.Store.IsParticipant(ctx, sid, agentID); err != nil {
+		p.httpError(w, "store error", 500)
+		return
+	} else if ok {
+		http.Error(w, agentID+" is already a participant", http.StatusBadRequest)
+		return
+	}
+	if _, err := p.Store.JoinSession(ctx, sid, agentID); err != nil {
+		p.httpError(w, "store error", 500)
+		return
+	}
+	p.fanout(ctx, sid)
+	http.Redirect(w, r, "/panel/sessions/"+sid, http.StatusSeeOther)
 }
 
 func (p *Panel) postMessage(w http.ResponseWriter, r *http.Request) {

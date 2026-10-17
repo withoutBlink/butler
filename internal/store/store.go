@@ -3,15 +3,12 @@ package store
 import (
 	"context"
 	"database/sql"
-	"embed"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"path"
 	"path/filepath"
-	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -20,8 +17,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-//go:embed migrations/*.sql
-var migrationsFS embed.FS
+//go:embed schema.sql
+var schemaSQL string
 
 var (
 	ErrNotFound = errors.New("not found")
@@ -110,9 +107,9 @@ func Open(path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	s := &Store{db: db}
-	if err := s.migrate(); err != nil {
+	if err := s.ensureSchema(); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("migrate: %w", err)
+		return nil, fmt.Errorf("schema: %w", err)
 	}
 	return s, nil
 }
@@ -121,60 +118,18 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-func (s *Store) migrate() error {
-	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)`); err != nil {
-		return err
-	}
-	var current int
-	if err := s.db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&current); err != nil {
-		return err
-	}
-	entries, err := migrationsFS.ReadDir("migrations")
-	if err != nil {
-		return err
-	}
-	names := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
-			continue
-		}
-		names = append(names, e.Name())
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		v, err := strconv.Atoi(strings.SplitN(name, "_", 2)[0])
-		if err != nil {
-			return fmt.Errorf("bad migration name %q", name)
-		}
-		if v <= current {
-			continue
-		}
-		content, err := migrationsFS.ReadFile("migrations/" + name)
-		if err != nil {
+// ensureSchema applies schema.sql. There is no migration history: butler is
+// pre-release and the schema file is the single source of truth. Every
+// statement is CREATE ... IF NOT EXISTS, so opening an existing database is a
+// no-op; a database from an older schema is NOT upgraded in place — recreate
+// it (`butler reset`).
+func (s *Store) ensureSchema() error {
+	for _, stmt := range splitSQL(schemaSQL) {
+		if _, err := s.db.Exec(stmt); err != nil {
 			return err
-		}
-		if err := s.apply(v, string(content)); err != nil {
-			return fmt.Errorf("apply %s: %w", name, err)
 		}
 	}
 	return nil
-}
-
-func (s *Store) apply(version int, script string) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	for _, stmt := range splitSQL(script) {
-		if _, err := tx.Exec(stmt); err != nil {
-			return err
-		}
-	}
-	if _, err := tx.Exec(`INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`, version, time.Now().Unix()); err != nil {
-		return err
-	}
-	return tx.Commit()
 }
 
 func splitSQL(script string) []string {
@@ -404,91 +359,6 @@ func (s *Store) SessionsForAgent(ctx context.Context, agentID string) ([]string,
 		sids = append(sids, sid)
 	}
 	return sids, rows.Err()
-}
-
-// UniqueAgentName derives a short but recognizable name from the agent kind,
-// the hostname and the basename of the working directory, joined by ":" so
-// the three parts stay visually distinct — e.g.
-// "opencode:t3mcenter-arm:butler" — appending a counter suffix until it is
-// unused. Parts are truncated (kind ≤16, hostname ≤20, dir ≤20, total ≤48)
-// so the name stays readable even for long hosts and paths.
-func (s *Store) UniqueAgentName(ctx context.Context, kind, hostname, workdir string) string {
-	parts := []string{
-		truncateSlug(sanitizeName(kind), 16),
-		truncateSlug(sanitizeName(hostname), 20),
-		truncateSlug(sanitizeName(path.Base(workdir)), 20),
-	}
-	var kept []string
-	for _, p := range parts {
-		if p != "" {
-			kept = append(kept, p)
-		}
-	}
-	return s.uniqueName(ctx, strings.Join(kept, ":"))
-}
-
-// UniqueSessionAgentName mints the name of a per-client-session agent from
-// the kind and a slug of its display name — normally the client session's
-// title, e.g. "Fix read marks" → "opencode:fix-read-marks" — so a human can
-// tell the agents of two same-workdir client sessions apart in transcripts
-// and @mentions. Falls back to the workdir basename when the display name
-// has no usable characters. Names are minted once; a later title change does
-// not remint (existing identities keep their names).
-func (s *Store) UniqueSessionAgentName(ctx context.Context, kind, displayName, workdir string) string {
-	slug := sanitizeName(displayName)
-	if slug == "" {
-		slug = sanitizeName(path.Base(workdir))
-	}
-	base := truncateSlug(sanitizeName(kind), 16) + ":" + truncateSlug(slug, 36)
-	return s.uniqueName(ctx, strings.Trim(base, "-:"))
-}
-
-// uniqueName trims a candidate to ≤48 chars and appends -2, -3, … until it
-// collides with no existing agent.
-func (s *Store) uniqueName(ctx context.Context, base string) string {
-	if base == "" {
-		base = "agent"
-	}
-	if len(base) > 48 {
-		base = strings.Trim(base[:48], "-:")
-	}
-	name := base
-	for i := 2; ; i++ {
-		if _, err := s.GetAgent(ctx, name); errors.Is(err, ErrNotFound) {
-			return name
-		}
-		suffix := fmt.Sprintf("-%d", i)
-		cand := base
-		if len(cand) > 48-len(suffix) {
-			cand = strings.Trim(cand[:48-len(suffix)], "-:")
-		}
-		name = cand + suffix
-	}
-}
-
-func truncateSlug(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return strings.Trim(s[:n], "-")
-}
-
-func sanitizeName(s string) string {
-	var b strings.Builder
-	lastDash := true // suppress leading dash
-	for _, r := range strings.ToLower(s) {
-		switch {
-		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
-			b.WriteRune(r)
-			lastDash = false
-		default:
-			if !lastDash {
-				b.WriteByte('-')
-				lastDash = true
-			}
-		}
-	}
-	return strings.Trim(b.String(), "-")
 }
 
 func scanAgent(row *sql.Row) (*Agent, error) {

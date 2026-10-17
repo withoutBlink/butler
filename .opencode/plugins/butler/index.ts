@@ -9,9 +9,9 @@
 //     serves as the registration conduit and the fallback relay.
 //   - role — this plugin's per-OpenCode-session butler agent: the same
 //     identity plus the OpenCode session id as the client_session
-//     discriminator, sibling-registered via the instance token. The name
-//     is minted from the session title, e.g. "opencode:fix-read-marks",
-//     so a human can tell the roles apart in the panel and @mentions.
+//     discriminator, sibling-registered via the instance token. Its id is a
+//     random UUID (the only identity); its display name is the session
+//     title, pushed to butler on renames so the panel stays readable.
 //
 // Role activation is EAGER:
 //   - at startup the plugin asks butler for every role of its agent client
@@ -46,11 +46,10 @@
 //
 // Known limitation: deleting an OpenCode session leaves its role behind
 // (loop stops, role stays with a dead token; the next startup skips it) —
-// kick it from the panel to evict it for good. A new OpenCode session with
-// the same title mints a "-2" name.
+// kick it from the panel to evict it for good.
 
 import { Plugin } from "@opencode/plugin"
-import { appendFileSync, existsSync, readFileSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
 import * as path from "node:path"
 
 interface ButlerInstance {
@@ -110,16 +109,6 @@ export default Plugin.define({
 
     const controller = new AbortController()
     const aborted = () => controller.signal.aborted
-
-    // TEMP DIAGNOSTIC — plugin lifecycle probe (remove after diagnosis):
-    // records every plugin (re)load so we can see when OpenCode spins
-    // plugin contexts up and down.
-    try {
-      appendFileSync(
-        path.join(ctx.location.directory, ".butler", "plugin-load.log"),
-        `${new Date().toISOString()} plugin init\n`,
-      )
-    } catch {}
 
     // ---- app-level identity (instance.json, written by butler-mcp) ----
 

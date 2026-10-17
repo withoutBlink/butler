@@ -2,10 +2,8 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 
@@ -179,35 +177,6 @@ func TestSessionsForAgent(t *testing.T) {
 	}
 }
 
-func TestUniqueAgentName(t *testing.T) {
-	ctx := context.Background()
-	s := newTestStore(t)
-
-	// kind:hostname:basename, ":"-joined; long host parts truncate.
-	if got := s.UniqueAgentName(ctx, "codex", "Andrews-MacBook-Pro.local", "/Users/andrew/work/butler"); got != "codex:andrews-macbook-pro:butler" {
-		t.Fatalf("got %q", got)
-	}
-	first := s.UniqueAgentName(ctx, "codex", "host", "/tmp/proj")
-	if _, err := s.CreateAgent(ctx, first, first, "codex", "host", "/tmp/proj", ""); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	// Different directory, same basename: distinct identity, suffixed name.
-	if got := s.UniqueAgentName(ctx, "codex", "host", "/other/proj"); got != "codex:host:proj-2" {
-		t.Fatalf("expected suffix, got %q", got)
-	}
-	// Different directories on one host get distinct names, no suffix needed.
-	if got := s.UniqueAgentName(ctx, "codex", "host", "/tmp/other"); got != "codex:host:other" {
-		t.Fatalf("got %q", got)
-	}
-	// Long parts are truncated to a total cap.
-	long := s.UniqueAgentName(ctx, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "/tmp/cccccccccccccccccccccccccccccccccccc")
-	if len(long) > 48 {
-		t.Fatalf("expected truncation, got %q", long)
-	}
-	if got := s.UniqueAgentName(ctx, "!!!", "???", "/???"); got != "agent" {
-		t.Fatalf("expected fallback, got %q", got)
-	}
-}
 
 func TestMessageSeqMonotonic(t *testing.T) {
 	ctx := context.Background()
@@ -614,123 +583,6 @@ func TestMarkRead(t *testing.T) {
 	}
 }
 
-// TestMigration004AdminAgent builds a pre-004 database with a "you" agent
-// holding messages, participants, mentions and read cursors, then opens it
-// with the store and verifies the rename to "admin" reached every table.
-func TestMigration004AdminAgent(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "butler.db")
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)")
-	if err != nil {
-		t.Fatalf("open raw db: %v", err)
-	}
-	ctx := context.Background()
-	for _, name := range []string{"001_init.sql", "002_mentions.sql", "003_read_marks.sql"} {
-		script, err := migrationsFS.ReadFile("migrations/" + name)
-		if err != nil {
-			t.Fatalf("read migration %s: %v", name, err)
-		}
-		if _, err := db.Exec(string(script)); err != nil {
-			t.Fatalf("apply %s: %v", name, err)
-		}
-	}
-	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)`,
-		`INSERT INTO schema_migrations (version, applied_at) VALUES (1, 0), (2, 0), (3, 0)`,
-		`INSERT INTO agents (id, display_name, kind, created_at) VALUES ('you', 'You', 'human', 0)`,
-		`INSERT INTO sessions (id, title, created_by, created_at) VALUES ('global', 'Global', 'you', 0)`,
-		`INSERT INTO participants (session_id, agent_id, joined_at) VALUES ('global', 'you', 0)`,
-		`INSERT INTO messages (id, session_id, sender_id, kind, content, mentions, created_at) VALUES ('m1', 'global', 'you', 'chat', 'hi there', '["you"]', 0)`,
-		`INSERT INTO read_marks (session_id, agent_id, last_seq) VALUES ('global', 'you', 1)`,
-		`INSERT INTO context_items (session_id, key, value, author_id, updated_at) VALUES ('global', 'note', 'v', 'you', 0)`,
-	}
-	for _, q := range stmts {
-		if _, err := db.Exec(q); err != nil {
-			t.Fatalf("seed %q: %v", q, err)
-		}
-	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("close raw db: %v", err)
-	}
-
-	s, err := Open(path)
-	if err != nil {
-		t.Fatalf("open store (applies 004): %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-
-	if _, err := s.GetAgent(ctx, "you"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("old you agent must be gone, got %v", err)
-	}
-	ag, err := s.GetAgent(ctx, "admin")
-	if err != nil || ag.DisplayName != "Admin" || ag.Kind != "human" {
-		t.Fatalf("admin agent: %v %+v", err, ag)
-	}
-	sess, err := s.GetSession(ctx, "global")
-	if err != nil || sess.CreatedBy != "admin" {
-		t.Fatalf("global session creator: %v %+v", err, sess)
-	}
-	if ok, err := s.IsParticipant(ctx, "global", "admin"); err != nil || !ok {
-		t.Fatalf("admin participant: %v %v", ok, err)
-	}
-	msg, err := s.GetMessage(ctx, "m1")
-	if err != nil || msg.SenderID != "admin" {
-		t.Fatalf("message sender: %v %+v", err, msg)
-	}
-	if !msg.MentionsAgent("admin") || msg.MentionsAgent("you") {
-		t.Fatalf("mentions should follow the rename: %+v", msg.Mentions)
-	}
-	marks, err := s.ReadMarks(ctx, "global")
-	if err != nil || marks["admin"] != 1 {
-		t.Fatalf("read marks: %v %v", err, marks)
-	}
-	item, err := s.GetContextItem(ctx, "global", "note")
-	if err != nil || item.AuthorID != "admin" {
-		t.Fatalf("context author: %v %+v", err, item)
-	}
-
-	// The rename is idempotent from the store's perspective: re-opening
-	// applies nothing new and everything still resolves.
-	if err := s.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-	s2, err := Open(path)
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
-	t.Cleanup(func() { s2.Close() })
-	if _, err := s2.GetAgent(ctx, "admin"); err != nil {
-		t.Fatalf("admin after reopen: %v", err)
-	}
-}
-
-// TestUniqueSessionAgentName: per-client-session names are minted from the
-// kind and a slug of the client session's title, with the workdir basename
-// as fallback and counter suffixes on collision.
-func TestUniqueSessionAgentName(t *testing.T) {
-	ctx := context.Background()
-	s := newTestStore(t)
-
-	if got := s.UniqueSessionAgentName(ctx, "opencode", "Fix read marks!", "/w/butler"); got != "opencode:fix-read-marks" {
-		t.Fatalf("got %q", got)
-	}
-	first := s.UniqueSessionAgentName(ctx, "opencode", "Fix read marks!", "/w/butler")
-	if _, err := s.CreateAgent(ctx, first, "Fix read marks!", "opencode", "h", "/w/butler", "ses_one"); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	// Same title, different session: suffix.
-	if got := s.UniqueSessionAgentName(ctx, "opencode", "Fix read marks", "/w/butler"); got != "opencode:fix-read-marks-2" {
-		t.Fatalf("expected suffix, got %q", got)
-	}
-	// A title with no usable characters falls back to the workdir basename.
-	if got := s.UniqueSessionAgentName(ctx, "opencode", "???", "/w/butler"); got != "opencode:butler" {
-		t.Fatalf("expected workdir fallback, got %q", got)
-	}
-	// Very long titles truncate within the total cap.
-	long := s.UniqueSessionAgentName(ctx, "opencode", strings.Repeat("word ", 20), "/w/butler")
-	if len(long) > 48 {
-		t.Fatalf("expected truncation, got %q", long)
-	}
-}
 
 // TestClientSessionIdentity: FindInstance discriminates the app-level agent
 // (client_session "") from its per-session siblings, and sibling identity is

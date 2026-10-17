@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"testing"
 	"time"
@@ -24,8 +25,21 @@ const adminTok = "test-admin-token-0123456789"
 
 // newTestAPI boots the API with a "test" kind and registers three agent
 // instances (alpha, beta, gamma) through the real /register endpoint. The
-// returned map is keyed by the server-generated agent names.
-func newTestAPI(t *testing.T) (*httptest.Server, string, string, map[string]string) {
+// returned map is keyed by the harness hostname.
+// testAgent is a harness-registered agent: its server-minted UUID id (the
+// identity, stable across re-registration) and its instance token.
+type testAgent struct {
+	ID    string
+	Token string
+}
+
+var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+// isUUID reports whether s is a canonical version-4 UUID — what every agent
+// identity is now.
+func isUUID(s string) bool { return uuidRe.MatchString(s) }
+
+func newTestAPI(t *testing.T) (*httptest.Server, string, string, map[string]testAgent) {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(filepath.Join(dir, "butler.db"))
@@ -51,12 +65,12 @@ func newTestAPI(t *testing.T) (*httptest.Server, string, string, map[string]stri
 	}
 	srv := httptest.NewServer(a.Routes())
 	t.Cleanup(srv.Close)
-	tokens := map[string]string{}
+	agents := map[string]testAgent{}
 	for _, h := range []string{"alpha", "beta", "gamma"} {
-		name, tok := registerAgent(t, srv, kindTok, h, "/tmp/"+h)
-		tokens[name] = tok
+		id, tok := registerAgent(t, srv, kindTok, h, "/tmp/"+h)
+		agents[h] = testAgent{ID: id, Token: tok}
 	}
-	return srv, adminTok, kindTok, tokens
+	return srv, adminTok, kindTok, agents
 }
 
 func registerAgent(t *testing.T, srv *httptest.Server, kindTok, hostname, workdir string) (string, string) {
@@ -112,24 +126,24 @@ func req(t *testing.T, method, url, token string, body any) (*http.Response, map
 }
 
 func TestSessionMessageFlow(t *testing.T) {
-	srv, _, _, tokens := newTestAPI(t)
+	srv, _, _, agents := newTestAPI(t)
 	base := srv.URL
 
-	resp, body := req(t, "POST", base+"/api/v1/sessions", tokens["test:alpha:alpha"], map[string]any{
+	resp, body := req(t, "POST", base+"/api/v1/sessions", agents["alpha"].Token, map[string]any{
 		"title":        "build feature",
-		"participants": []string{"test:beta:beta"},
+		"participants": []string{agents["beta"].ID},
 	})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create session: %d %v", resp.StatusCode, body)
 	}
 	sid := body["id"].(string)
 
-	resp, body = req(t, "POST", base+"/api/v1/sessions/"+sid+"/messages", tokens["test:alpha:alpha"], map[string]any{"content": "hello beta"})
+	resp, body = req(t, "POST", base+"/api/v1/sessions/"+sid+"/messages", agents["alpha"].Token, map[string]any{"content": "hello beta"})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("post message: %d %v", resp.StatusCode, body)
 	}
 
-	resp, body = req(t, "GET", base+"/api/v1/wait?after=0&timeout=2", tokens["test:beta:beta"], nil)
+	resp, body = req(t, "GET", base+"/api/v1/wait?after=0&timeout=2", agents["beta"].Token, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("wait: %d %v", resp.StatusCode, body)
 	}
@@ -138,13 +152,13 @@ func TestSessionMessageFlow(t *testing.T) {
 		t.Fatalf("expected 1 message, got %v", msgs)
 	}
 	first := msgs[0].(map[string]any)
-	if first["content"] != "hello beta" || first["sender_id"] != "test:alpha:alpha" || first["kind"] != "chat" {
+	if first["content"] != "hello beta" || first["sender_id"] != agents["alpha"].ID || first["kind"] != "chat" {
 		t.Fatalf("bad message: %v", first)
 	}
 	latest := int64(body["latest_seq"].(float64))
 
 	start := time.Now()
-	resp, body = req(t, "GET", base+"/api/v1/wait?after="+strconv.FormatInt(latest, 10)+"&timeout=1", tokens["test:beta:beta"], nil)
+	resp, body = req(t, "GET", base+"/api/v1/wait?after="+strconv.FormatInt(latest, 10)+"&timeout=1", agents["beta"].Token, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("timed wait: %d %v", resp.StatusCode, body)
 	}
@@ -155,40 +169,40 @@ func TestSessionMessageFlow(t *testing.T) {
 		t.Fatalf("wait returned too fast: %v", time.Since(start))
 	}
 
-	resp, body = req(t, "POST", base+"/api/v1/sessions/"+sid+"/messages", tokens["test:gamma:gamma"], map[string]any{"content": "hi"})
+	resp, body = req(t, "POST", base+"/api/v1/sessions/"+sid+"/messages", agents["gamma"].Token, map[string]any{"content": "hi"})
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("gamma should not be able to post: %d %v", resp.StatusCode, body)
 	}
 
-	resp, body = req(t, "POST", base+"/api/v1/sessions/"+sid+"/join", tokens["test:gamma:gamma"], nil)
+	resp, body = req(t, "POST", base+"/api/v1/sessions/"+sid+"/join", agents["gamma"].Token, nil)
 	if resp.StatusCode != http.StatusOK || body["joined"] != true {
 		t.Fatalf("join: %d %v", resp.StatusCode, body)
 	}
-	resp, body = req(t, "POST", base+"/api/v1/sessions/"+sid+"/join", tokens["test:gamma:gamma"], nil)
+	resp, body = req(t, "POST", base+"/api/v1/sessions/"+sid+"/join", agents["gamma"].Token, nil)
 	if resp.StatusCode != http.StatusOK || body["joined"] != false {
 		t.Fatalf("second join: %d %v", resp.StatusCode, body)
 	}
 
-	resp, body = req(t, "GET", base+"/api/v1/wait?after=0&timeout=2", tokens["test:gamma:gamma"], nil)
+	resp, body = req(t, "GET", base+"/api/v1/wait?after=0&timeout=2", agents["gamma"].Token, nil)
 	msgs = body["messages"].([]any)
 	if len(msgs) != 2 {
 		t.Fatalf("expected 2 messages for gamma, got %d", len(msgs))
 	}
 	sys := msgs[1].(map[string]any)
-	if sys["kind"] != "system" || sys["sender_id"] != "test:gamma:gamma" {
+	if sys["kind"] != "system" || sys["sender_id"] != agents["gamma"].ID {
 		t.Fatalf("bad system message: %v", sys)
 	}
 
-	resp, body = req(t, "PUT", base+"/api/v1/sessions/"+sid+"/context/deploy_url", tokens["test:beta:beta"], map[string]any{"value": "http://x"})
+	resp, body = req(t, "PUT", base+"/api/v1/sessions/"+sid+"/context/deploy_url", agents["beta"].Token, map[string]any{"value": "http://x"})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("put context: %d %v", resp.StatusCode, body)
 	}
-	resp, body = req(t, "GET", base+"/api/v1/sessions/"+sid+"/context/deploy_url", tokens["test:beta:beta"], nil)
+	resp, body = req(t, "GET", base+"/api/v1/sessions/"+sid+"/context/deploy_url", agents["beta"].Token, nil)
 	if resp.StatusCode != http.StatusOK || body["value"] != "http://x" {
 		t.Fatalf("get context: %d %v", resp.StatusCode, body)
 	}
 
-	resp, body = req(t, "GET", base+"/api/v1/messages?after=0", tokens["test:beta:beta"], nil)
+	resp, body = req(t, "GET", base+"/api/v1/messages?after=0", agents["beta"].Token, nil)
 	msgs = body["messages"].([]any)
 	if len(msgs) != 3 {
 		t.Fatalf("catchup expected 3 messages (chat, join, context), got %d", len(msgs))
@@ -196,18 +210,22 @@ func TestSessionMessageFlow(t *testing.T) {
 }
 
 func TestRegistration(t *testing.T) {
-	srv, adminTok, kindTok, tokens := newTestAPI(t)
+	srv, adminTok, kindTok, agents := newTestAPI(t)
 	base := srv.URL
 
-	// Re-registering the same (kind, hostname, workdir) yields the same name
-	// and REPLACES the previous instance: only the newest token works.
+	// Re-registering the same (kind, hostname, workdir) yields the same
+	// identity (a UUID) and REPLACES the previous instance: only the newest
+	// token works.
 	name1, tok1 := registerAgent(t, srv, kindTok, "alpha", "/tmp/alpha")
-	if name1 != "test:alpha:alpha" {
-		t.Fatalf("expected test:alpha:alpha, got %q", name1)
+	if name1 != agents["alpha"].ID {
+		t.Fatalf("expected the harness alpha identity %q, got %q", agents["alpha"].ID, name1)
+	}
+	if !isUUID(name1) {
+		t.Fatalf("agent id should be a UUID, got %q", name1)
 	}
 	name2, tok2 := registerAgent(t, srv, kindTok, "alpha", "/tmp/alpha")
 	if name2 != name1 {
-		t.Fatalf("expected stable name, got %q vs %q", name2, name1)
+		t.Fatalf("expected stable identity, got %q vs %q", name2, name1)
 	}
 	resp, body := req(t, "GET", base+"/api/v1/sessions", tok1, nil)
 	if resp.StatusCode != http.StatusUnauthorized {
@@ -218,20 +236,20 @@ func TestRegistration(t *testing.T) {
 		t.Fatalf("new instance token should work: %d %v", resp.StatusCode, body)
 	}
 
-	// Same host, different workdir: a distinct identity and a distinct name.
+	// Same host, different workdir: a distinct identity (a fresh UUID).
 	name3, _ := registerAgent(t, srv, kindTok, "alpha", "/tmp/other")
 	if name3 == name1 {
 		t.Fatalf("different workdir should be a different agent: %q", name3)
 	}
-	if name3 != "test:alpha:other" {
-		t.Fatalf("expected dir-derived name, got %q", name3)
+	if !isUUID(name3) {
+		t.Fatalf("distinct identity should still be a UUID, got %q", name3)
 	}
 
-	// Different paths with the same basename slug collide on the derived name
-	// and get a counter suffix.
+	// Different paths with the same basename are distinct identities too —
+	// UUIDs never collide, so no counter suffix is ever minted.
 	name4, _ := registerAgent(t, srv, kindTok, "alpha", "/elsewhere/alpha")
-	if name4 != "test:alpha:alpha-2" {
-		t.Fatalf("expected suffixed name, got %q", name4)
+	if name4 == name1 || name4 == name3 || !isUUID(name4) {
+		t.Fatalf("expected a distinct UUID identity, got %q", name4)
 	}
 
 	// Kind tokens are register-only.
@@ -246,7 +264,7 @@ func TestRegistration(t *testing.T) {
 
 	// An instance token without a client_session is a bad sibling
 	// registration (400); the admin token cannot register at all.
-	resp, body = req(t, "POST", base+"/api/v1/register", tokens["test:beta:beta"], map[string]any{})
+	resp, body = req(t, "POST", base+"/api/v1/register", agents["beta"].Token, map[string]any{})
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("sibling register without client_session: %d %v", resp.StatusCode, body)
 	}
@@ -277,7 +295,7 @@ func TestRegistration(t *testing.T) {
 	found := false
 	for _, a := range body["agents"].([]any) {
 		m := a.(map[string]any)
-		if m["id"] == "test:alpha:alpha" {
+		if m["id"] == agents["alpha"].ID {
 			found = true
 			if m["hostname"] != "alpha" || m["workdir"] != "/tmp/alpha" {
 				t.Fatalf("agent missing registration info: %v", m)
@@ -290,7 +308,7 @@ func TestRegistration(t *testing.T) {
 
 	// Revoking evicts the agent: token dead, hidden from listings, and a
 	// live process can revive it by re-registering.
-	resp, body = req(t, "POST", base+"/api/v1/agents/test:alpha:alpha/revoke", adminTok, nil)
+	resp, body = req(t, "POST", base+"/api/v1/agents/"+agents["alpha"].ID+"/revoke", adminTok, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("revoke: %d %v", resp.StatusCode, body)
 	}
@@ -307,7 +325,7 @@ func TestRegistration(t *testing.T) {
 		t.Fatalf("list agents: %d %v", resp.StatusCode, body)
 	}
 	for _, a := range body["agents"].([]any) {
-		if m := a.(map[string]any); m["id"] == "test:alpha:alpha" {
+		if m := a.(map[string]any); m["id"] == agents["alpha"].ID {
 			t.Fatalf("evicted agent should be hidden: %v", m)
 		}
 	}
@@ -320,7 +338,7 @@ func TestRegistration(t *testing.T) {
 	resp, body = req(t, "GET", base+"/api/v1/agents", adminTok, nil)
 	found = false
 	for _, a := range body["agents"].([]any) {
-		if m := a.(map[string]any); m["id"] == "test:alpha:alpha" {
+		if m := a.(map[string]any); m["id"] == agents["alpha"].ID {
 			found = true
 		}
 	}
@@ -341,11 +359,11 @@ func TestRegistration(t *testing.T) {
 // kicks the previous instance: old token 401, identity stays a participant,
 // and the sessions it joined get a system message.
 func TestRegistrationReplacesInstance(t *testing.T) {
-	srv, _, kindTok, tokens := newTestAPI(t)
+	srv, _, kindTok, agents := newTestAPI(t)
 	base := srv.URL
 
 	// alpha (from the harness) creates a session it participates in.
-	resp, body := req(t, "POST", base+"/api/v1/sessions", tokens["test:alpha:alpha"], map[string]any{"title": "takeover"})
+	resp, body := req(t, "POST", base+"/api/v1/sessions", agents["alpha"].Token, map[string]any{"title": "takeover"})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create session: %d %v", resp.StatusCode, body)
 	}
@@ -362,7 +380,7 @@ func TestRegistrationReplacesInstance(t *testing.T) {
 	tok, _ := body["token"].(string)
 
 	// The previous instance's token is dead.
-	resp, body = req(t, "GET", base+"/api/v1/sessions", tokens["test:alpha:alpha"], nil)
+	resp, body = req(t, "GET", base+"/api/v1/sessions", agents["alpha"].Token, nil)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("previous instance token should be revoked: %d %v", resp.StatusCode, body)
 	}
@@ -374,7 +392,7 @@ func TestRegistrationReplacesInstance(t *testing.T) {
 	}
 	found := false
 	for _, p := range body["participants"].([]any) {
-		if p.(map[string]any)["id"] == "test:alpha:alpha" {
+		if p.(map[string]any)["id"] == agents["alpha"].ID {
 			found = true
 		}
 	}
@@ -392,7 +410,7 @@ func TestRegistrationReplacesInstance(t *testing.T) {
 		t.Fatalf("expected the announcement message, got %v", msgs)
 	}
 	m := msgs[0].(map[string]any)
-	if m["kind"] != "system" || m["sender_id"] != "test:alpha:alpha" || m["content"] != "test:alpha:alpha reconnected (previous instance replaced)" {
+	if m["kind"] != "system" || m["sender_id"] != agents["alpha"].ID || m["content"] != agents["alpha"].ID+" reconnected (previous instance replaced)" {
 		t.Fatalf("bad announcement: %v", m)
 	}
 
@@ -404,7 +422,7 @@ func TestRegistrationReplacesInstance(t *testing.T) {
 }
 
 func TestAuthAndAdmin(t *testing.T) {
-	srv, adminTok, _, tokens := newTestAPI(t)
+	srv, adminTok, _, agents := newTestAPI(t)
 	base := srv.URL
 
 	resp, _ := req(t, "GET", base+"/api/v1/sessions", "", nil)
@@ -416,7 +434,7 @@ func TestAuthAndAdmin(t *testing.T) {
 		t.Fatalf("bad token: %d", resp.StatusCode)
 	}
 
-	resp, body := req(t, "POST", base+"/api/v1/kinds", tokens["test:alpha:alpha"], map[string]any{"id": "evil"})
+	resp, body := req(t, "POST", base+"/api/v1/kinds", agents["alpha"].Token, map[string]any{"id": "evil"})
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("kind create by non-admin: %d %v", resp.StatusCode, body)
 	}
@@ -434,7 +452,7 @@ func TestAuthAndAdmin(t *testing.T) {
 		t.Fatalf("duplicate kind: %d %v", resp.StatusCode, body)
 	}
 
-	resp, body = req(t, "GET", base+"/api/v1/kinds", tokens["test:alpha:alpha"], nil)
+	resp, body = req(t, "GET", base+"/api/v1/kinds", agents["alpha"].Token, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("list kinds: %d %v", resp.StatusCode, body)
 	}
@@ -457,7 +475,7 @@ func TestAuthAndAdmin(t *testing.T) {
 		t.Fatalf("rotated kind token should register: %d", resp.StatusCode)
 	}
 	// Rotating the kind token leaves existing instance tokens valid.
-	resp, _ = req(t, "GET", base+"/api/v1/sessions", tokens["test:alpha:alpha"], nil)
+	resp, _ = req(t, "GET", base+"/api/v1/sessions", agents["alpha"].Token, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("instance token should survive kind rotation: %d", resp.StatusCode)
 	}
@@ -499,23 +517,23 @@ func TestAuthAndAdmin(t *testing.T) {
 }
 
 func TestIdempotentMessagePost(t *testing.T) {
-	srv, _, _, tokens := newTestAPI(t)
+	srv, _, _, agents := newTestAPI(t)
 	base := srv.URL
-	_, body := req(t, "POST", base+"/api/v1/sessions", tokens["test:alpha:alpha"], map[string]any{"title": "t"})
+	_, body := req(t, "POST", base+"/api/v1/sessions", agents["alpha"].Token, map[string]any{"title": "t"})
 	sid := body["id"].(string)
 	msgBody := map[string]any{"id": "fixed-msg-id", "content": "same"}
-	resp, first := req(t, "POST", base+"/api/v1/sessions/"+sid+"/messages", tokens["test:alpha:alpha"], msgBody)
+	resp, first := req(t, "POST", base+"/api/v1/sessions/"+sid+"/messages", agents["alpha"].Token, msgBody)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("first post: %d %v", resp.StatusCode, first)
 	}
-	resp, second := req(t, "POST", base+"/api/v1/sessions/"+sid+"/messages", tokens["test:alpha:alpha"], msgBody)
+	resp, second := req(t, "POST", base+"/api/v1/sessions/"+sid+"/messages", agents["alpha"].Token, msgBody)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("retry post: %d %v", resp.StatusCode, second)
 	}
 	if first["seq"].(float64) != second["seq"].(float64) {
 		t.Fatalf("seq mismatch: %v vs %v", first["seq"], second["seq"])
 	}
-	_, body = req(t, "GET", base+"/api/v1/sessions/"+sid+"/messages", tokens["test:alpha:alpha"], nil)
+	_, body = req(t, "GET", base+"/api/v1/sessions/"+sid+"/messages", agents["alpha"].Token, nil)
 	msgs := body["messages"].([]any)
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(msgs))
@@ -523,19 +541,19 @@ func TestIdempotentMessagePost(t *testing.T) {
 }
 
 func TestArchiveBlocksPosting(t *testing.T) {
-	srv, _, _, tokens := newTestAPI(t)
+	srv, _, _, agents := newTestAPI(t)
 	base := srv.URL
-	_, body := req(t, "POST", base+"/api/v1/sessions", tokens["test:alpha:alpha"], map[string]any{"title": "t"})
+	_, body := req(t, "POST", base+"/api/v1/sessions", agents["alpha"].Token, map[string]any{"title": "t"})
 	sid := body["id"].(string)
-	resp, body := req(t, "PATCH", base+"/api/v1/sessions/"+sid, tokens["test:alpha:alpha"], map[string]any{"status": "archived"})
+	resp, body := req(t, "PATCH", base+"/api/v1/sessions/"+sid, agents["alpha"].Token, map[string]any{"status": "archived"})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("archive: %d %v", resp.StatusCode, body)
 	}
-	resp, body = req(t, "POST", base+"/api/v1/sessions/"+sid+"/messages", tokens["test:alpha:alpha"], map[string]any{"content": "hi"})
+	resp, body = req(t, "POST", base+"/api/v1/sessions/"+sid+"/messages", agents["alpha"].Token, map[string]any{"content": "hi"})
 	if resp.StatusCode != http.StatusConflict {
 		t.Fatalf("post to archived: %d %v", resp.StatusCode, body)
 	}
-	resp, body = req(t, "PATCH", base+"/api/v1/sessions/"+sid, tokens["test:beta:beta"], map[string]any{"status": "active"})
+	resp, body = req(t, "PATCH", base+"/api/v1/sessions/"+sid, agents["beta"].Token, map[string]any{"status": "active"})
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("non-creator patch: %d %v", resp.StatusCode, body)
 	}
@@ -543,7 +561,7 @@ func TestArchiveBlocksPosting(t *testing.T) {
 
 // newTestAPIGlobal boots the API the way `butler serve` does: a "admin" agent
 // and the global session every agent joins at registration.
-func newTestAPIGlobal(t *testing.T) (*httptest.Server, string, string, map[string]string) {
+func newTestAPIGlobal(t *testing.T) (*httptest.Server, string, string, map[string]testAgent) {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(filepath.Join(dir, "butler.db"))
@@ -576,20 +594,20 @@ func newTestAPIGlobal(t *testing.T) (*httptest.Server, string, string, map[strin
 	}
 	srv := httptest.NewServer(a.Routes())
 	t.Cleanup(srv.Close)
-	tokens := map[string]string{}
+	agents := map[string]testAgent{}
 	for _, h := range []string{"alpha", "beta"} {
-		name, tok := registerAgent(t, srv, kindTok, h, "/tmp/"+h)
-		tokens[name] = tok
+		id, tok := registerAgent(t, srv, kindTok, h, "/tmp/"+h)
+		agents[h] = testAgent{ID: id, Token: tok}
 	}
-	return srv, adminTok, kindTok, tokens
+	return srv, adminTok, kindTok, agents
 }
 
 func TestRegisterAutoJoinsGlobal(t *testing.T) {
-	srv, _, _, tokens := newTestAPIGlobal(t)
+	srv, _, _, agents := newTestAPIGlobal(t)
 	base := srv.URL
 
 	// Both registered agents (and "admin") are participants of the global session.
-	resp, body := req(t, "GET", base+"/api/v1/sessions/"+store.GlobalSessionID, tokens["test:alpha:alpha"], nil)
+	resp, body := req(t, "GET", base+"/api/v1/sessions/"+store.GlobalSessionID, agents["alpha"].Token, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("get global: %d %v", resp.StatusCode, body)
 	}
@@ -599,7 +617,7 @@ func TestRegisterAutoJoinsGlobal(t *testing.T) {
 	}
 
 	// beta sees the global join notices and can post there.
-	resp, body = req(t, "GET", base+"/api/v1/messages?after=0", tokens["test:beta:beta"], nil)
+	resp, body = req(t, "GET", base+"/api/v1/messages?after=0", agents["beta"].Token, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("catchup: %d %v", resp.StatusCode, body)
 	}
@@ -612,14 +630,14 @@ func TestRegisterAutoJoinsGlobal(t *testing.T) {
 		t.Fatalf("expected a global join notice last, got %v", last)
 	}
 
-	resp, body = req(t, "POST", base+"/api/v1/sessions/"+store.GlobalSessionID+"/messages", tokens["test:beta:beta"], map[string]any{"content": "hello everyone"})
+	resp, body = req(t, "POST", base+"/api/v1/sessions/"+store.GlobalSessionID+"/messages", agents["beta"].Token, map[string]any{"content": "hello everyone"})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("post to global: %d %v", resp.StatusCode, body)
 	}
 
 	// alpha's wait (across all joined sessions) picks the global message.
 	latest := int64(body["seq"].(float64))
-	resp, body = req(t, "GET", base+"/api/v1/wait?after="+strconv.FormatInt(latest-1, 10)+"&timeout=2", tokens["test:alpha:alpha"], nil)
+	resp, body = req(t, "GET", base+"/api/v1/wait?after="+strconv.FormatInt(latest-1, 10)+"&timeout=2", agents["alpha"].Token, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("wait: %d %v", resp.StatusCode, body)
 	}
@@ -630,24 +648,24 @@ func TestRegisterAutoJoinsGlobal(t *testing.T) {
 }
 
 func TestMentionFlow(t *testing.T) {
-	srv, _, _, tokens := newTestAPIGlobal(t)
+	srv, _, _, agents := newTestAPIGlobal(t)
 	base := srv.URL
 
 	// An exact-id mention in the global session resolves to the mentioned agent.
-	resp, body := req(t, "POST", base+"/api/v1/sessions/"+store.GlobalSessionID+"/messages", tokens["test:alpha:alpha"], map[string]any{
-		"content": "@test:beta:beta please take the failing test",
+	resp, body := req(t, "POST", base+"/api/v1/sessions/"+store.GlobalSessionID+"/messages", agents["alpha"].Token, map[string]any{
+		"content": "@" + agents["beta"].ID + " please take the failing test",
 	})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("post mention: %d %v", resp.StatusCode, body)
 	}
 	mentions, ok := body["mentions"].([]any)
-	if !ok || len(mentions) != 1 || mentions[0] != "test:beta:beta" {
-		t.Fatalf("expected mentions [test:beta:beta], got %v", body)
+	if !ok || len(mentions) != 1 || mentions[0] != agents["beta"].ID {
+		t.Fatalf("expected mentions [%s], got %v", agents["beta"].ID, body)
 	}
 	seq := int64(body["seq"].(float64))
 
 	// The mentioned agent sees the mentions list on wait.
-	resp, body = req(t, "GET", base+"/api/v1/wait?after="+strconv.FormatInt(seq-1, 10)+"&timeout=2", tokens["test:beta:beta"], nil)
+	resp, body = req(t, "GET", base+"/api/v1/wait?after="+strconv.FormatInt(seq-1, 10)+"&timeout=2", agents["beta"].Token, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("wait: %d %v", resp.StatusCode, body)
 	}
@@ -656,15 +674,15 @@ func TestMentionFlow(t *testing.T) {
 		t.Fatalf("expected 1 message, got %v", msgs)
 	}
 	m := msgs[0].(map[string]any)
-	if m["content"] != "@test:beta:beta please take the failing test" {
+	if m["content"] != "@"+agents["beta"].ID+" please take the failing test" {
 		t.Fatalf("bad message: %v", m)
 	}
-	if mentions, ok := m["mentions"].([]any); !ok || len(mentions) != 1 || mentions[0] != "test:beta:beta" {
+	if mentions, ok := m["mentions"].([]any); !ok || len(mentions) != 1 || mentions[0] != agents["beta"].ID {
 		t.Fatalf("wait response should carry mentions, got %v", m)
 	}
 
 	// Unmentioned messages (and @unknown tokens) resolve to no mentions.
-	resp, body = req(t, "POST", base+"/api/v1/sessions/"+store.GlobalSessionID+"/messages", tokens["test:alpha:alpha"], map[string]any{"content": "fyi only, no mention"})
+	resp, body = req(t, "POST", base+"/api/v1/sessions/"+store.GlobalSessionID+"/messages", agents["alpha"].Token, map[string]any{"content": "fyi only, no mention"})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("post fyi: %d %v", resp.StatusCode, body)
 	}
@@ -846,32 +864,39 @@ func registerSibling(t *testing.T, srv *httptest.Server, tok, clientSession, dis
 // title) so a human can tell them apart, joined to the global session, and
 // re-registering one replaces its token without the app-level announcement.
 func TestSiblingRegistration(t *testing.T) {
-	srv, adminTok, kindTok, tokens := newTestAPIGlobal(t)
+	srv, adminTok, kindTok, agents := newTestAPIGlobal(t)
 	base := srv.URL
 
-	appTok := tokens["test:alpha:alpha"] // the app-level instance token
+	appTok := agents["alpha"].Token // the app-level instance token
 
-	// Sibling "sessions" of the alpha identity, named by title.
+	// Sibling "sessions" of the alpha identity: each is a fresh UUID identity,
+	// labeled with its OpenCode session title. The app-level identity keeps
+	// its own id.
 	b1 := registerSibling(t, srv, appTok, "ses_one", "Fix read marks")
-	if b1["name"] != "test:fix-read-marks" {
-		t.Fatalf("expected title-derived name, got %q", b1["name"])
+	role1, _ := b1["name"].(string)
+	if !isUUID(role1) || role1 == agents["alpha"].ID {
+		t.Fatalf("expected a fresh UUID role, got %q", role1)
 	}
 	if b1["client_session"] != "ses_one" {
 		t.Fatalf("client_session echo: %v", b1)
 	}
+	if b1["display_name"] != "Fix read marks" {
+		t.Fatalf("display_name should be the title: %v", b1)
+	}
 	b2 := registerSibling(t, srv, appTok, "ses_two", "Dark theme polish")
-	if b2["name"] != "test:dark-theme-polish" {
-		t.Fatalf("expected test:dark-theme-polish, got %q", b2["name"])
+	if b2["display_name"] != "Dark theme polish" || b2["name"] == role1 {
+		t.Fatalf("second role should be distinct and titled: %v", b2)
 	}
-	// Same title again: minted name collides, counter suffix disambiguates.
+	// The same title on a different session is still a distinct identity.
 	b3 := registerSibling(t, srv, appTok, "ses_three", "Fix read marks")
-	if b3["name"] != "test:fix-read-marks-2" {
-		t.Fatalf("expected suffixed name, got %q", b3["name"])
+	if b3["name"] == b1["name"] {
+		t.Fatalf("different session should be a different identity: %q", b3["name"])
 	}
-	// A sibling with no usable title falls back to the workdir basename.
+	// A sibling that is not titled yet is labeled with its own id.
 	b4 := registerSibling(t, srv, appTok, "ses_four", "")
-	if name, _ := b4["name"].(string); name != "test:alpha" {
-		t.Fatalf("expected workdir fallback name, got %q", b4["name"])
+	role4, _ := b4["name"].(string)
+	if b4["display_name"] != role4 {
+		t.Fatalf("untitled sibling should be labeled with its id: %v", b4)
 	}
 
 	tok1, _ := b1["token"].(string)
@@ -896,8 +921,8 @@ func TestSiblingRegistration(t *testing.T) {
 	// re-registers them on every app restart).
 	before := latestSeq(t, base, appTok)
 	b1b := registerSibling(t, srv, appTok, "ses_one", "Fix read marks (renamed)")
-	if b1b["name"] != "test:fix-read-marks" {
-		t.Fatalf("stable sibling name: %q", b1b["name"])
+	if b1b["name"] != b1["name"] {
+		t.Fatalf("sibling identity should be stable: %q vs %q", b1b["name"], b1["name"])
 	}
 	if b1b["replaced"] != true {
 		t.Fatalf("expected replaced=true: %v", b1b)
@@ -915,7 +940,7 @@ func TestSiblingRegistration(t *testing.T) {
 		t.Fatalf("list agents: %d", resp.StatusCode)
 	}
 	for _, a := range body["agents"].([]any) {
-		if m := a.(map[string]any); m["id"] == "test:fix-read-marks" {
+		if m := a.(map[string]any); m["id"] == b1["name"] {
 			if m["display_name"] != "Fix read marks (renamed)" {
 				t.Fatalf("display name should follow the rename: %v", m)
 			}
@@ -933,7 +958,7 @@ func TestSiblingRegistration(t *testing.T) {
 		t.Fatalf("kind token still registers app-level: %d %v", resp.StatusCode, body)
 	}
 	kindName, _ := body["name"].(string)
-	if kindName != "test:alpha:alpha" {
+	if kindName != agents["alpha"].ID {
 		t.Fatalf("app-level name unchanged: %q", kindName)
 	}
 }
@@ -944,9 +969,9 @@ func TestSiblingRegistration(t *testing.T) {
 // has a live role it is hidden from the agents list; evicting every role
 // makes it the visible fallback again.
 func TestAgentRoles(t *testing.T) {
-	srv, adminTok, kindTok, tokens := newTestAPIGlobal(t)
+	srv, adminTok, kindTok, agents := newTestAPIGlobal(t)
 	base := srv.URL
-	appTok := tokens["test:alpha:alpha"]
+	appTok := agents["alpha"].Token
 
 	// Auth surface: instance tokens only.
 	resp, _ := req(t, "GET", base+"/api/v1/agents/roles", "", nil)
@@ -967,7 +992,7 @@ func TestAgentRoles(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("roles: %d %v", resp.StatusCode, body)
 	}
-	if body["identity"] != "test:alpha:alpha" {
+	if body["identity"] != agents["alpha"].ID {
 		t.Fatalf("identity: %v", body)
 	}
 	if roles, ok := body["roles"].([]any); !ok || len(roles) != 0 {
@@ -985,7 +1010,7 @@ func TestAgentRoles(t *testing.T) {
 		}
 		return false
 	}
-	if !agentListed(adminTok, "test:alpha:alpha") {
+	if !agentListed(adminTok, agents["alpha"].ID) {
 		t.Fatal("client without roles should be listed")
 	}
 
@@ -1018,7 +1043,7 @@ func TestAgentRoles(t *testing.T) {
 	}
 
 	// A live role hides the client; the roles themselves are listed.
-	if agentListed(adminTok, "test:alpha:alpha") {
+	if agentListed(adminTok, agents["alpha"].ID) {
 		t.Fatal("client with a live role should be hidden")
 	}
 	if !agentListed(adminTok, role1) || !agentListed(adminTok, role2) {
@@ -1041,7 +1066,7 @@ func TestAgentRoles(t *testing.T) {
 	if removedCount != 1 {
 		t.Fatalf("evicted role should be flagged: %v", body["roles"])
 	}
-	if agentListed(adminTok, "test:alpha:alpha") {
+	if agentListed(adminTok, agents["alpha"].ID) {
 		t.Fatal("client should stay hidden while role2 is live")
 	}
 
@@ -1050,7 +1075,7 @@ func TestAgentRoles(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("revoke role2: %d", resp.StatusCode)
 	}
-	if !agentListed(adminTok, "test:alpha:alpha") {
+	if !agentListed(adminTok, agents["alpha"].ID) {
 		t.Fatal("client should be visible once every role is evicted")
 	}
 }
@@ -1072,15 +1097,16 @@ func latestSeq(t *testing.T, base, tok string) int64 {
 // changes; kind tokens are rejected; cross-identity renames 404; the admin
 // always shows online.
 func TestRenameAgent(t *testing.T) {
-	srv, adminTok, kindTok, tokens := newTestAPIGlobal(t)
+	srv, adminTok, kindTok, agents := newTestAPIGlobal(t)
 	base := srv.URL
 
-	appTok := tokens["test:alpha:alpha"]
-	betaTok := tokens["test:beta:beta"]
+	appTok := agents["alpha"].Token
+	betaTok := agents["beta"].Token
 
 	b1 := registerSibling(t, srv, appTok, "ses_one", "Fix read marks")
-	if b1["name"] != "test:fix-read-marks" {
-		t.Fatalf("expected title-derived name, got %q", b1["name"])
+	roleID, _ := b1["name"].(string)
+	if !isUUID(roleID) {
+		t.Fatalf("expected a UUID role identity, got %q", roleID)
 	}
 	sibTok, _ := b1["token"].(string)
 
@@ -1091,7 +1117,7 @@ func TestRenameAgent(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("self rename: %d %v", resp.StatusCode, body)
 	}
-	if body["id"] != "test:fix-read-marks" || body["display_name"] != "Fix read marks v2" {
+	if body["id"] != roleID || body["display_name"] != "Fix read marks v2" {
 		t.Fatalf("rename echo: %v", body)
 	}
 
@@ -1122,12 +1148,12 @@ func TestRenameAgent(t *testing.T) {
 
 	// The admin renames any agent by id.
 	resp, body = req(t, "POST", base+"/api/v1/agents/rename", adminTok, map[string]any{
-		"agent": "test:fix-read-marks", "display_name": "Fix read marks v4",
+		"agent": roleID, "display_name": "Fix read marks v4",
 	})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("admin rename: %d %v", resp.StatusCode, body)
 	}
-	if body["id"] != "test:fix-read-marks" || body["display_name"] != "Fix read marks v4" {
+	if body["id"] != roleID || body["display_name"] != "Fix read marks v4" {
 		t.Fatalf("admin rename echo: %v", body)
 	}
 
@@ -1167,7 +1193,7 @@ func TestRenameAgent(t *testing.T) {
 	for _, a := range body["agents"].([]any) {
 		m := a.(map[string]any)
 		switch m["id"] {
-		case "test:fix-read-marks":
+		case roleID:
 			seenRenamed = true
 			if m["display_name"] != "Fix read marks v4" {
 				t.Fatalf("rename persisted: %v", m)

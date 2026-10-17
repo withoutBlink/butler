@@ -275,7 +275,7 @@ func resetCmd(args []string) {
 		os.Exit(1)
 	}
 
-	fmt.Println("empty database created (agent \"you\" bootstrapped, global session created)")
+	fmt.Println("empty database created (agent \"admin\" bootstrapped, global session created)")
 	fmt.Println("admin token unchanged — it lives in its own file")
 	fmt.Println(`next: re-issue kind tokens ("butler kind add <id>"), update your agents' configs, then start the server`)
 }

@@ -22,6 +22,12 @@ import (
 	"butler/internal/store"
 )
 
+var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+// isUUID reports whether s is a canonical version-4 UUID — what every agent
+// identity is now (the id is the identity, the display name is a label).
+func isUUID(s string) bool { return uuidRe.MatchString(s) }
+
 // newButlerBackend boots the API with codex/opencode kinds; the returned map
 // holds the single kind token of each.
 func newButlerBackend(t *testing.T) (*httptest.Server, string, map[string]string) {
@@ -59,7 +65,7 @@ func newButlerBackend(t *testing.T) (*httptest.Server, string, map[string]string
 
 // registerInstance exchanges a kind token for an instance token on a fresh
 // client, exactly like cmd/butler-mcp does at startup.
-func registerInstance(t *testing.T, backendURL, kindToken, hostname, workdir string) *mcpserver.Client {
+func registerInstance(t *testing.T, backendURL, kindToken, hostname, workdir string) (*mcpserver.Client, string) {
 	t.Helper()
 	client, err := mcpserver.NewClient(backendURL, kindToken)
 	if err != nil {
@@ -70,7 +76,7 @@ func registerInstance(t *testing.T, backendURL, kindToken, hostname, workdir str
 		t.Fatalf("register %s: %v", hostname, err)
 	}
 	client.SetToken(reg.Token)
-	return client
+	return client, reg.Name
 }
 
 // connectMCPClient registers an instance and returns a connected MCP session
@@ -132,7 +138,7 @@ func TestClientRegister(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 	c1.SetToken(reg1.Token)
-	if reg1.Name != "codex:myhost:proj" || reg1.Kind != "codex" || reg1.Hostname != "myhost" || reg1.Workdir != "/tmp/proj" {
+	if !isUUID(reg1.Name) || reg1.Kind != "codex" || reg1.Hostname != "myhost" || reg1.Workdir != "/tmp/proj" {
 		t.Fatalf("bad register result: %+v", reg1)
 	}
 	if reg1.Replaced {
@@ -200,9 +206,9 @@ func TestClientRegister(t *testing.T) {
 
 func TestToolE2E(t *testing.T) {
 	backend, _, kinds := newButlerBackend(t)
-	alpha, alphaName := connectMCPClient(t, backend.URL, kinds["codex"], "alpha", "/tmp/proj")
-	if alphaName != "codex:alpha:proj" {
-		t.Fatalf("unexpected agent name %q", alphaName)
+	alpha, alphaID := connectMCPClient(t, backend.URL, kinds["codex"], "alpha", "/tmp/proj")
+	if !isUUID(alphaID) {
+		t.Fatalf("unexpected agent id %q", alphaID)
 	}
 
 	ctx := context.Background()
@@ -259,7 +265,7 @@ func TestToolE2E(t *testing.T) {
 		t.Fatalf("wait returned too fast: %v", time.Since(start))
 	}
 
-	beta := registerInstance(t, backend.URL, kinds["opencode"], "beta", "/tmp/proj")
+	beta, betaID := registerInstance(t, backend.URL, kinds["opencode"], "beta", "/tmp/proj")
 	if _, err := beta.JoinSession(ctx, sid); err != nil {
 		t.Fatalf("beta join: %v", err)
 	}
@@ -268,7 +274,7 @@ func TestToolE2E(t *testing.T) {
 	}
 
 	out, isErr = callTool(t, alpha, "wait_for_messages", map[string]any{"timeout_seconds": 5})
-	if isErr || !strings.Contains(out, "opencode:beta:proj: hi alpha, beta here") {
+	if isErr || !strings.Contains(out, betaID+": hi alpha, beta here") {
 		t.Fatalf("wait after activity: %q isErr=%v", out, isErr)
 	}
 	if !strings.Contains(out, "system") {
@@ -281,8 +287,8 @@ func TestToolE2E(t *testing.T) {
 	}
 	for _, want := range []string{
 		"e2e test",
-		"codex:alpha:proj (codex@alpha)*",
-		"opencode:beta:proj (opencode@beta)*",
+		alphaID + " (codex@alpha)*",
+		betaID + " (opencode@beta)*",
 		"hello from alpha",
 		"hi alpha, beta here",
 	} {
@@ -306,7 +312,7 @@ func TestToolE2E(t *testing.T) {
 	}
 
 	out, isErr = callTool(t, alpha, "list_sessions", nil)
-	if isErr || !strings.Contains(out, "e2e test") || !strings.Contains(out, "you are codex:alpha:proj") {
+	if isErr || !strings.Contains(out, "e2e test") || !strings.Contains(out, "you are "+alphaID) {
 		t.Fatalf("list_sessions: %q isErr=%v", out, isErr)
 	}
 
@@ -386,7 +392,7 @@ func TestWaitMentionFormatting(t *testing.T) {
 		t.Fatalf("ensure global: %v", err)
 	}
 
-	alpha, _ := connectMCPClient(t, backend.URL, kinds["codex"], "alpha", "/tmp/proj")
+	alpha, alphaID := connectMCPClient(t, backend.URL, kinds["codex"], "alpha", "/tmp/proj")
 	beta, _ := connectMCPClient(t, backend.URL, kinds["opencode"], "beta", "/tmp/proj")
 
 	// Registration auto-joined both agents: the global session shows up.
@@ -402,7 +408,7 @@ func TestWaitMentionFormatting(t *testing.T) {
 	}
 
 	// beta posts a mention and an FYI message in the global session.
-	out, isErr = callTool(t, beta, "send_message", map[string]any{"session": store.GlobalSessionID, "content": "@codex:alpha:proj please review the diff"})
+	out, isErr = callTool(t, beta, "send_message", map[string]any{"session": store.GlobalSessionID, "content": "@" + alphaID + " please review the diff"})
 	if isErr {
 		t.Fatalf("beta send mention: %s", out)
 	}
@@ -419,7 +425,7 @@ func TestWaitMentionFormatting(t *testing.T) {
 		"2 new message(s)",
 		"1 @-mention you (reply expected)",
 		"1 are FYI",
-		"(mentioned you): @codex:alpha:proj please review the diff",
+		"(mentioned you): @" + alphaID + " please review the diff",
 		"heads up: build is green",
 	} {
 		if !strings.Contains(out, want) {

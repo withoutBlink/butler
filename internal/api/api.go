@@ -361,20 +361,25 @@ func (a *API) agentRoles(w http.ResponseWriter, r *http.Request) {
 }
 
 // registerAgent exchanges a kind token plus hostname/workdir for a stable
-// agent identity (name) and a fresh instance token. The same registration key
-// (kind, hostname, workdir, client_session) always maps to the same name;
-// registering again REPLACES the previous instance: its token is revoked (its
-// process gets 401 on its next call) and the sessions it joined get a system
-// message.
+// agent identity (a UUID id) and a fresh instance token. The same registration
+// key (kind, hostname, workdir, client_session) always maps to the same
+// identity; registering again REPLACES the previous instance: its token is
+// revoked (its process gets 401 on its next call) and the sessions it joined
+// get a system message.
 //
 // Two auth paths:
 //   - kind token: registers the app-level identity (client_session ""). This
 //     is what butler-mcp does at startup.
 //   - instance token: registers a per-client-session SIBLING of the caller —
 //     same kind/hostname/workdir, keyed by the body's client_session and
-//     named from its display_name. The relay plugin uses this to give every
-//     OpenCode session its own butler identity without ever seeing the kind
-//     token; an instance token can only mint siblings of its own identity.
+//     labeled with its display_name (the OpenCode session title). The relay
+//     plugin uses this to give every OpenCode session its own butler identity
+//     without ever seeing the kind token; an instance token can only mint
+//     siblings of its own identity.
+//
+// The id is the identity (never changes); display_name is a label and can be
+// updated later via POST /api/v1/agents/rename. Identities without a title
+// (app-level agents, roles that are not titled yet) are labeled with the id.
 func (a *API) registerAgent(w http.ResponseWriter, r *http.Request) {
 	ident, ok := identity(r)
 	if !ok {
@@ -436,17 +441,15 @@ func (a *API) registerAgent(w http.ResponseWriter, r *http.Request) {
 		a.Log.Info("revived agent", "id", agent.ID)
 	}
 	if agent == nil {
-		var name string
-		if clientSession != "" {
-			name = a.Store.UniqueSessionAgentName(ctx, kindID, displayName, workdir)
-			if displayName == "" {
-				displayName = name
-			}
-		} else {
-			name = a.Store.UniqueAgentName(ctx, kindID, hostname, workdir)
-			displayName = name
+		// The id is the identity: a fresh UUID. It carries no derived
+		// meaning, so there are no name collisions to resolve. The display
+		// name is the label: a role uses its client-session title, anything
+		// without one is labeled with the id itself.
+		id := ids.UUID()
+		if displayName == "" {
+			displayName = id
 		}
-		agent, err = a.Store.CreateAgent(ctx, name, displayName, kindID, hostname, workdir, clientSession)
+		agent, err = a.Store.CreateAgent(ctx, id, displayName, kindID, hostname, workdir, clientSession)
 		if err != nil {
 			a.writeStoreErr(w, err)
 			return
@@ -473,7 +476,7 @@ func (a *API) registerAgent(w http.ResponseWriter, r *http.Request) {
 	if replaced && clientSession == "" {
 		a.announceReplacement(ctx, agent.ID)
 	}
-	a.Log.Info("registered agent", "kind", kindID, "name", agent.ID, "hostname", hostname, "workdir", workdir, "client_session", clientSession, "replaced", replaced)
+	a.Log.Info("registered agent", "kind", kindID, "id", agent.ID, "display_name", agent.DisplayName, "hostname", hostname, "workdir", workdir, "client_session", clientSession, "replaced", replaced)
 	// Every agent joins the global session — the default room shared by all
 	// connected agents. Idempotent: re-registering an existing identity
 	// changes nothing (its participant row already exists).
@@ -488,13 +491,14 @@ func (a *API) registerAgent(w http.ResponseWriter, r *http.Request) {
 	a.Store.TouchAgent(ctx, agent.ID)
 	writeJSON(w, http.StatusCreated, struct {
 		Name          string `json:"name"`
+		DisplayName   string `json:"display_name"`
 		Token         string `json:"token"`
 		Kind          string `json:"kind"`
 		Hostname      string `json:"hostname"`
 		Workdir       string `json:"workdir"`
 		ClientSession string `json:"client_session,omitempty"`
 		Replaced      bool   `json:"replaced"`
-	}{Name: agent.ID, Token: tok, Kind: kindID, Hostname: agent.Hostname, Workdir: agent.Workdir, ClientSession: agent.ClientSession, Replaced: replaced})
+	}{Name: agent.ID, DisplayName: agent.DisplayName, Token: tok, Kind: kindID, Hostname: agent.Hostname, Workdir: agent.Workdir, ClientSession: agent.ClientSession, Replaced: replaced})
 }
 
 // announceReplacement posts a system message in every session the identity

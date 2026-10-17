@@ -1034,3 +1034,163 @@ func TestSSEStreamReads(t *testing.T) {
 		t.Fatalf("expected reads event for codex:alpha:proj, got %v", events)
 	}
 }
+
+// The panel's session lifecycle controls: archive freezes a session (the
+// composer, add-participant picker and context form go away; the API and the
+// panel already refuse writes on a non-active session) and reopen restores
+// it; delete removes the session and everything scoped to it for good. The
+// fixed global session offers neither control and refuses both requests.
+func TestPanelArchiveAndDeleteSession(t *testing.T) {
+	srv, st, _, adminTok := newPanel(t)
+	ctx := context.Background()
+	if _, err := st.CreateAgent(ctx, "admin", "Admin", "human", "", "", ""); err != nil {
+		t.Fatalf("create admin: %v", err)
+	}
+	if _, err := st.CreateAgent(ctx, "role-x", "Fix read marks", "opencode", "h", "/w", "ses_x"); err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+	if _, err := st.CreateSession(ctx, "s1", "panel lifecycle", "admin", []string{"role-x"}); err != nil {
+		t.Fatalf("create s1: %v", err)
+	}
+	if _, err := st.CreateSession(ctx, "s2", "doomed", "admin", nil); err != nil {
+		t.Fatalf("create s2: %v", err)
+	}
+	if _, err := st.InsertMessage(ctx, &store.Message{SessionID: "s2", SenderID: "admin", Kind: "chat", Content: "soon gone"}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if _, err := st.EnsureGlobalSession(ctx, "admin"); err != nil {
+		t.Fatalf("global session: %v", err)
+	}
+
+	client := newBrowser(t)
+	login(t, client, srv.URL, adminTok)
+
+	// Both controls on the dashboard rows; the global session is marked fixed.
+	resp, err := client.Get(srv.URL + "/panel/")
+	if err != nil {
+		t.Fatalf("dashboard: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	for _, want := range []string{
+		`action="/panel/sessions/s1/status"`,
+		`name="status" value="archived"`,
+		`action="/panel/sessions/s1/delete"`,
+		`action="/panel/sessions/s2/delete"`,
+		`title="The global session is fixed`,
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("dashboard missing %q in:\n%s", want, string(body))
+		}
+	}
+	if strings.Contains(string(body), `action="/panel/sessions/global/status"`) || strings.Contains(string(body), `action="/panel/sessions/global/delete"`) {
+		t.Fatalf("global session must offer no lifecycle controls:\n%s", string(body))
+	}
+
+	// Archive from the dashboard: back to the dashboard, session frozen.
+	resp, err = client.PostForm(srv.URL+"/panel/sessions/s1/status", url.Values{"status": {"archived"}})
+	if err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/panel/" {
+		t.Fatalf("archive redirect: %d %s", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	if sess, err := st.GetSession(ctx, "s1"); err != nil || sess.Status != "archived" {
+		t.Fatalf("status should be archived: %v %+v", err, sess)
+	}
+
+	// The session page is read-only now, and offers reopen + delete.
+	resp, err = client.Get(srv.URL + "/panel/sessions/s1")
+	if err != nil {
+		t.Fatalf("session view: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), "Archived — this session is frozen") {
+		t.Fatalf("archived banner missing:\n%s", string(body))
+	}
+	if strings.Contains(string(body), `id="compose"`) || strings.Contains(string(body), "Set context</button>") {
+		t.Fatalf("archived session must not offer the composer or context form:\n%s", string(body))
+	}
+	if !strings.Contains(string(body), `name="status" value="active"`) || !strings.Contains(string(body), `action="/panel/sessions/s1/delete"`) {
+		t.Fatalf("archived session should offer reopen + delete:\n%s", string(body))
+	}
+
+	// Reopen from the session page: back to the session, writable again.
+	resp, err = client.PostForm(srv.URL+"/panel/sessions/s1/status", url.Values{"status": {"active"}, "from": {"session"}})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/panel/sessions/s1" {
+		t.Fatalf("reopen redirect: %d %s", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	if sess, err := st.GetSession(ctx, "s1"); err != nil || sess.Status != "active" {
+		t.Fatalf("status should be active again: %v %+v", err, sess)
+	}
+	resp, err = client.Get(srv.URL + "/panel/sessions/s1")
+	if err != nil {
+		t.Fatalf("session view: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `id="compose"`) {
+		t.Fatalf("reopened session should offer the composer:\n%s", string(body))
+	}
+
+	// A bogus status is rejected, not stored.
+	resp, err = client.PostForm(srv.URL+"/panel/sessions/s1/status", url.Values{"status": {"deleted"}})
+	if err != nil {
+		t.Fatalf("bad status: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad status should 400: %d", resp.StatusCode)
+	}
+
+	// The global session refuses both requests even when asked directly.
+	resp, err = client.PostForm(srv.URL+"/panel/sessions/global/status", url.Values{"status": {"archived"}})
+	if err != nil {
+		t.Fatalf("archive global: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("archiving global should 409: %d", resp.StatusCode)
+	}
+	resp, err = client.PostForm(srv.URL+"/panel/sessions/global/delete", nil)
+	if err != nil {
+		t.Fatalf("delete global: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("deleting global should 409: %d", resp.StatusCode)
+	}
+	if sess, err := st.GetSession(ctx, store.GlobalSessionID); err != nil || sess.Status != "active" {
+		t.Fatalf("global session must survive untouched: %v %+v", err, sess)
+	}
+
+	// Delete s2: gone with its messages, dashboard redirect, unknown is a 404.
+	resp, err = client.PostForm(srv.URL+"/panel/sessions/s2/delete", nil)
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/panel/" {
+		t.Fatalf("delete redirect: %d %s", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	if _, err := st.GetSession(ctx, "s2"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("session should be gone: %v", err)
+	}
+	if msgs, err := st.SessionLatestMessages(ctx, "s2", 10); err != nil || len(msgs) != 0 {
+		t.Fatalf("messages should be gone with it: %v %v", msgs, err)
+	}
+	resp, err = client.PostForm(srv.URL+"/panel/sessions/nope/delete", nil)
+	if err != nil {
+		t.Fatalf("delete unknown: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("deleting an unknown session should 404: %d", resp.StatusCode)
+	}
+}

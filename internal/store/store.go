@@ -552,6 +552,14 @@ func (s *Store) ListSessions(ctx context.Context, joinedBy string) ([]Session, e
 }
 
 func (s *Store) SetSessionStatus(ctx context.Context, id, status string) error {
+	if status != "active" && status != "archived" {
+		return fmt.Errorf("%w: status must be active or archived", ErrConflict)
+	}
+	// The global session is the fixed default room: every agent joins it, and
+	// archiving it would hide the one session that is always there.
+	if id == GlobalSessionID {
+		return fmt.Errorf("%w: the global session is fixed", ErrConflict)
+	}
 	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET status = ? WHERE id = ?`, status, id)
 	if err != nil {
 		return err
@@ -564,6 +572,67 @@ func (s *Store) SetSessionStatus(ctx context.Context, id, status string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// DeleteSession removes a session and everything scoped to it (messages,
+// participants, context items, read cursors) in one transaction, returning
+// the ids of the participants it had — the caller wakes their wait loops (an
+// open session simply stops appearing in their next batch). Deletion is
+// permanent: unlike a kick there is no soft-remove row, and message history
+// goes with it. The global session is refused for the same reason it cannot
+// be archived.
+func (s *Store) DeleteSession(ctx context.Context, id string) ([]string, error) {
+	if id == GlobalSessionID {
+		return nil, fmt.Errorf("%w: the global session is fixed", ErrConflict)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT agent_id FROM participants WHERE session_id = ?`, id)
+	if err != nil {
+		return nil, err
+	}
+	participants := []string{}
+	for rows.Next() {
+		var a string
+		if err := rows.Scan(&a); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		participants = append(participants, a)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	// messages.session_id carries no cascade (it is history) and read_marks
+	// has no FK at all, so both are deleted explicitly; participants and
+	// context_items cascade.
+	for _, stmt := range []string{
+		`DELETE FROM messages WHERE session_id = ?`,
+		`DELETE FROM read_marks WHERE session_id = ?`,
+		`DELETE FROM participants WHERE session_id = ?`,
+		`DELETE FROM context_items WHERE session_id = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt, id); err != nil {
+			return nil, err
+		}
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE id = ?`, id)
+	if err != nil {
+		return nil, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, fmt.Errorf("%w: session %q", ErrNotFound, id)
+	}
+	return participants, tx.Commit()
 }
 
 func (s *Store) JoinSession(ctx context.Context, sessionID, agentID string) (bool, error) {

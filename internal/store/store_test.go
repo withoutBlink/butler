@@ -322,6 +322,70 @@ func TestJoinNoticeUsesDisplayName(t *testing.T) {
 	}
 }
 
+// Deleting a session takes its messages, participants, context items and read
+// cursors with it and reports who was in it (so the caller can wake those
+// wait loops); the fixed global session refuses to be deleted or archived.
+func TestDeleteSession(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	mustAgent(t, s, "a")
+	mustAgent(t, s, "b")
+	if _, err := s.CreateSession(ctx, "s1", "doomed", "a", []string{"b"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	msg, err := s.InsertMessage(ctx, &Message{SessionID: "s1", SenderID: "a", Kind: "chat", Content: "hi"})
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if _, _, err := s.UpsertContext(ctx, "s1", "k", "v", "a"); err != nil {
+		t.Fatalf("context: %v", err)
+	}
+	if err := s.MarkRead(ctx, "s1", "b", msg.Seq); err != nil {
+		t.Fatalf("mark read: %v", err)
+	}
+
+	parts, err := s.DeleteSession(ctx, "s1")
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if len(parts) != 2 {
+		t.Fatalf("delete should report the participants, got %v", parts)
+	}
+	if _, err := s.GetSession(ctx, "s1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("session should be gone: %v", err)
+	}
+	if msgs, err := s.SessionLatestMessages(ctx, "s1", 10); err != nil || len(msgs) != 0 {
+		t.Fatalf("messages should be gone: %v %v", msgs, err)
+	}
+	if marks, err := s.ReadMarks(ctx, "s1"); err != nil || len(marks) != 0 {
+		t.Fatalf("read marks should be gone: %v %v", marks, err)
+	}
+	if items, err := s.ListContext(ctx, "s1"); err != nil || len(items) != 0 {
+		t.Fatalf("context should be gone: %v %v", items, err)
+	}
+	if ps, err := s.Participants(ctx, "s1"); err != nil || len(ps) != 0 {
+		t.Fatalf("participants should be gone: %v %v", ps, err)
+	}
+	if _, err := s.DeleteSession(ctx, "s1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second delete should be not found: %v", err)
+	}
+
+	// The global session is fixed: no delete, no archive, and only the two
+	// documented statuses are accepted.
+	if _, err := s.EnsureGlobalSession(ctx, "a"); err != nil {
+		t.Fatalf("global session: %v", err)
+	}
+	if _, err := s.DeleteSession(ctx, GlobalSessionID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("deleting the global session should be refused: %v", err)
+	}
+	if err := s.SetSessionStatus(ctx, GlobalSessionID, "archived"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("archiving the global session should be refused: %v", err)
+	}
+	if err := s.SetSessionStatus(ctx, "s1", "closed"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("an unknown status should be refused: %v", err)
+	}
+}
+
 func TestMessagesSince(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)

@@ -29,15 +29,16 @@
 <section class="sessions">
 <h2>Sessions</h2>
 <table>
-<tr><th>Title</th><th>Status</th><th>Participants</th><th>Last activity</th></tr>
+<tr><th>Title</th><th>Status</th><th>Participants</th><th>Last activity</th><th></th></tr>
 {{range .Sessions}}
-<tr>
+<tr{{if ne .Session.Status "active"}} class="archived"{{end}}>
 <td><a href="/panel/sessions/{{.Session.ID}}">{{.Session.Title}}</a>{{if .LastPreview}}<div class="preview">{{short .LastPreview}}</div>{{end}}</td>
 <td>{{.Session.Status}}</td>
 <td>{{range $i, $p := .Participants}}{{if $i}}, {{end}}<span class="id" title="{{$p.ID}}">{{$p.DisplayName}}</span>{{end}}</td>
 <td>{{if .LastAt}}{{ts .LastAt}}{{else}}—{{end}}</td>
+<td class="sess-actions">{{if .Global}}<span class="hint" title="The global session is fixed: every agent joins it, and it cannot be archived or deleted">fixed</span>{{else}}<form method="post" action="/panel/sessions/{{.Session.ID}}/status" class="inline"><input type="hidden" name="status" value="{{if ne .Session.Status "active"}}active{{else}}archived{{end}}"><button type="submit" class="kick" title="{{if ne .Session.Status "active"}}Reopen this session (posting and joining work again){{else}}Archive this session: it stays readable but frozen — no posts, context writes or joins until reopened{{end}}">{{if ne .Session.Status "active"}}reopen{{else}}archive{{end}}</button></form><form method="post" action="/panel/sessions/{{.Session.ID}}/delete" class="inline"><button type="submit" class="kick danger" title="Delete this session permanently — its messages, participants and context go with it" onclick="return confirm('Delete session “{{.Session.Title}}” permanently? Its messages, participants and context are gone for good.')">delete</button></form>{{end}}</td>
 </tr>
-{{else}}<tr><td colspan="4">no sessions yet</td></tr>{{end}}
+{{else}}<tr><td colspan="5">no sessions yet</td></tr>{{end}}
 </table>
 </section>
 <section class="agents">

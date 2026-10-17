@@ -179,6 +179,8 @@ func (p *Panel) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /panel/sessions", p.createSession)
 	mux.HandleFunc("GET /panel/sessions/{id}", p.sessionView)
 	mux.HandleFunc("POST /panel/sessions/{id}/join", p.joinParticipant)
+	mux.HandleFunc("POST /panel/sessions/{id}/status", p.setSessionStatus)
+	mux.HandleFunc("POST /panel/sessions/{id}/delete", p.deleteSession)
 	mux.HandleFunc("POST /panel/sessions/{id}/messages", p.postMessage)
 	mux.HandleFunc("POST /panel/sessions/{id}/context", p.putContext)
 	mux.HandleFunc("GET /panel/sessions/{id}/stream", p.stream)
@@ -264,6 +266,9 @@ type dashSessionRow struct {
 	Participants []store.Agent
 	LastPreview  string
 	LastAt       *int64
+	// Global marks the fixed global session: no archive/reopen/delete control
+	// (the store refuses both), everyone is in it.
+	Global bool
 }
 
 type dashData struct {
@@ -300,7 +305,7 @@ func (p *Panel) dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	rows := make([]dashSessionRow, 0, len(sessions))
 	for _, sess := range sessions {
-		row := dashSessionRow{Session: sess}
+		row := dashSessionRow{Session: sess, Global: sess.ID == store.GlobalSessionID}
 		if parts, err := p.Store.Participants(ctx, sess.ID); err == nil {
 			row.Participants = parts
 		}
@@ -470,6 +475,12 @@ type sessionViewData struct {
 	// Addable are the visible agents (roles) not yet in the session — the
 	// participants-area "add to meeting" picker.
 	Addable []agentOption
+	// Archived reports a frozen session (status != active): readable, but the
+	// composer, add-participant picker and context form are hidden and the
+	// header offers Reopen instead of Archive. Global marks the fixed global
+	// session, which offers neither archive nor delete.
+	Archived bool
+	Global   bool
 }
 
 // agentOption is one entry of the session view's add-participant picker.
@@ -664,7 +675,9 @@ func (p *Panel) sessionView(w http.ResponseWriter, r *http.Request) {
 	p.render(w, http.StatusOK, "session.tmpl", sessionViewData{
 		Session: *sess, Participants: parts, Messages: p.attachReadState(ctx, rs, msgs), ContextItems: items, LatestSeq: latest,
 		Mentionables: string(mentionables), Agents: string(agentsJSON), Reads: string(readsJSON),
-		Addable: p.addableAgents(ctx, parts),
+		Addable:  p.addableAgents(ctx, parts),
+		Archived: sess.Status != "active",
+		Global:   sid == store.GlobalSessionID,
 	})
 }
 
@@ -725,6 +738,86 @@ func (p *Panel) joinParticipant(w http.ResponseWriter, r *http.Request) {
 	}
 	p.fanout(ctx, sid)
 	http.Redirect(w, r, "/panel/sessions/"+sid, http.StatusSeeOther)
+}
+
+// setSessionStatus is the panel's Archive / Reopen control. Archiving freezes
+// a session: the API and the panel already refuse posting, context writes and
+// joins on a non-active session, so an archived room stays readable but
+// silent until it is reopened. The fixed global session is refused by the
+// store. The form's "from" field (whitelisted, never a free-form URL) decides
+// where the browser lands: the session page when the control was there, the
+// dashboard otherwise.
+func (p *Panel) setSessionStatus(w http.ResponseWriter, r *http.Request) {
+	if !p.requirePanel(w, r) {
+		return
+	}
+	if !sameOrigin(r) {
+		http.Error(w, "cross-origin rejected", http.StatusForbidden)
+		return
+	}
+	sid := r.PathValue("id")
+	ctx := r.Context()
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+	if err := parsePanelForm(r); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	status := strings.TrimSpace(r.PostFormValue("status"))
+	if status != "active" && status != "archived" {
+		http.Error(w, "status must be active or archived", http.StatusBadRequest)
+		return
+	}
+	if err := p.Store.SetSessionStatus(ctx, sid, status); err != nil {
+		p.storeErr(w, err)
+		return
+	}
+	p.Log.Info("panel set session status", "id", sid, "status", status)
+	p.fanout(ctx, sid)
+	if r.PostFormValue("from") == "session" {
+		http.Redirect(w, r, "/panel/sessions/"+sid, http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/panel/", http.StatusSeeOther)
+}
+
+// deleteSession is the panel's Delete control: the session and everything
+// scoped to it (messages, participants, context items, read cursors) are gone
+// for good — the button carries a confirm() because there is no undo, and no
+// soft-removed row either. Participants' wait loops and any open stream for
+// the session are woken so it stops showing up on their next poll.
+func (p *Panel) deleteSession(w http.ResponseWriter, r *http.Request) {
+	if !p.requirePanel(w, r) {
+		return
+	}
+	if !sameOrigin(r) {
+		http.Error(w, "cross-origin rejected", http.StatusForbidden)
+		return
+	}
+	sid := r.PathValue("id")
+	ctx := r.Context()
+	participants, err := p.Store.DeleteSession(ctx, sid)
+	if err != nil {
+		p.storeErr(w, err)
+		return
+	}
+	p.Log.Info("panel deleted session", "id", sid, "participants", len(participants))
+	p.Hub.NotifySession(sid)
+	p.Hub.Notify(participants)
+	http.Redirect(w, r, "/panel/", http.StatusSeeOther)
+}
+
+// storeErr maps store errors onto panel responses: missing rows are 404s,
+// refusals (the fixed global session, a bad status) are 409s, anything else
+// is a store error.
+func (p *Panel) storeErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		p.httpError(w, "not found", http.StatusNotFound)
+	case errors.Is(err, store.ErrConflict):
+		p.httpError(w, strings.TrimPrefix(err.Error(), store.ErrConflict.Error()+": "), http.StatusConflict)
+	default:
+		p.httpError(w, "store error", http.StatusInternalServerError)
+	}
 }
 
 func (p *Panel) postMessage(w http.ResponseWriter, r *http.Request) {

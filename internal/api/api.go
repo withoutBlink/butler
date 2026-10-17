@@ -91,6 +91,7 @@ func (a *API) Routes() http.Handler {
 	route("POST /api/v1/sessions", a.createSession)
 	route("GET /api/v1/sessions/{id}", a.getSession)
 	route("PATCH /api/v1/sessions/{id}", a.patchSession)
+	route("DELETE /api/v1/sessions/{id}", a.deleteSession)
 	route("POST /api/v1/sessions/{id}/join", a.joinSession)
 	route("GET /api/v1/sessions/{id}/messages", a.sessionMessages)
 	route("POST /api/v1/sessions/{id}/messages", a.postMessage)
@@ -862,6 +863,38 @@ func (a *API) patchSession(w http.ResponseWriter, r *http.Request) {
 	}
 	sess.Status = req.Status
 	writeJSON(w, http.StatusOK, sess)
+}
+
+// deleteSession removes a session for good: its messages, participants,
+// context items and read cursors go with it (no soft-removed row — unlike a
+// kick, history is not kept). Same auth rule as a status change: the session
+// creator or admin, and the store refuses the fixed global session. Waiting
+// agents and any open panel stream are woken so the session stops appearing
+// for them on the next poll.
+func (a *API) deleteSession(w http.ResponseWriter, r *http.Request) {
+	ident, ok := a.requireAuth(w, r)
+	if !ok {
+		return
+	}
+	sid := r.PathValue("id")
+	sess, err := a.Store.GetSession(r.Context(), sid)
+	if err != nil {
+		a.writeStoreErr(w, err)
+		return
+	}
+	if !ident.Admin && (ident.Agent == nil || ident.Agent.ID != sess.CreatedBy) {
+		writeErr(w, http.StatusForbidden, "only the session creator or admin may delete it")
+		return
+	}
+	participants, err := a.Store.DeleteSession(r.Context(), sid)
+	if err != nil {
+		a.writeStoreErr(w, err)
+		return
+	}
+	a.Hub.NotifySession(sid)
+	a.Hub.Notify(participants)
+	a.Log.Info("deleted session", "id", sid, "title", sess.Title, "participants", len(participants))
+	writeJSON(w, http.StatusOK, map[string]any{"id": sid, "deleted": true})
 }
 
 func (a *API) joinSession(w http.ResponseWriter, r *http.Request) {

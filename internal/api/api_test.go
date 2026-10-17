@@ -1222,3 +1222,57 @@ func TestRenameAgent(t *testing.T) {
 		t.Fatalf("agents list incomplete: %v", body)
 	}
 }
+
+// A session can be deleted by its creator or admin (never by an unrelated
+// agent), the fixed global session refuses both delete and archive, and the
+// deletion is complete: the session, its messages and its participants go.
+func TestDeleteSessionAPI(t *testing.T) {
+	srv, adminTok, _, agents := newTestAPIGlobal(t)
+	base := srv.URL
+
+	resp, body := req(t, "POST", base+"/api/v1/sessions", agents["alpha"].Token, map[string]any{
+		"title":        "doomed",
+		"participants": []string{agents["beta"].ID},
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create session: %d %v", resp.StatusCode, body)
+	}
+	sid := body["id"].(string)
+	if resp, body = req(t, "POST", base+"/api/v1/sessions/"+sid+"/messages", agents["alpha"].Token, map[string]any{"content": "gone soon"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("post: %d %v", resp.StatusCode, body)
+	}
+
+	// An agent that is neither creator nor admin may not delete it.
+	if resp, body = req(t, "DELETE", base+"/api/v1/sessions/"+sid, agents["beta"].Token, nil); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("non-creator delete should 403: %d %v", resp.StatusCode, body)
+	}
+	// Unknown sessions are 404s, and the global session is fixed.
+	if resp, _ = req(t, "DELETE", base+"/api/v1/sessions/nope", adminTok, nil); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown session should 404: %d", resp.StatusCode)
+	}
+	if resp, body = req(t, "DELETE", base+"/api/v1/sessions/global", adminTok, nil); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("deleting global should 409: %d %v", resp.StatusCode, body)
+	}
+	if resp, body = req(t, "PATCH", base+"/api/v1/sessions/global", adminTok, map[string]any{"status": "archived"}); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("archiving global should 409: %d %v", resp.StatusCode, body)
+	}
+
+	// The creator can, and everything scoped to it is gone.
+	if resp, body = req(t, "DELETE", base+"/api/v1/sessions/"+sid, agents["alpha"].Token, nil); resp.StatusCode != http.StatusOK || body["deleted"] != true {
+		t.Fatalf("delete: %d %v", resp.StatusCode, body)
+	}
+	if resp, _ = req(t, "GET", base+"/api/v1/sessions/"+sid, adminTok, nil); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("deleted session should 404: %d", resp.StatusCode)
+	}
+	if resp, body = req(t, "GET", base+"/api/v1/sessions/"+sid+"/messages?after=0", agents["beta"].Token, nil); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("messages of a deleted session should 404: %d %v", resp.StatusCode, body)
+	}
+	if resp, body = req(t, "GET", base+"/api/v1/sessions", adminTok, nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("list sessions: %d %v", resp.StatusCode, body)
+	}
+	for _, s := range body["sessions"].([]any) {
+		if s.(map[string]any)["id"] == sid {
+			t.Fatalf("deleted session still listed: %v", s)
+		}
+	}
+}

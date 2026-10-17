@@ -474,7 +474,7 @@ func (a *API) registerAgent(w http.ResponseWriter, r *http.Request) {
 	// siblings are re-registered by their own plugin on every app restart —
 	// announcing each would spam every session they joined.
 	if replaced && clientSession == "" {
-		a.announceReplacement(ctx, agent.ID)
+		a.announceReplacement(ctx, agent)
 	}
 	a.Log.Info("registered agent", "kind", kindID, "id", agent.ID, "display_name", agent.DisplayName, "hostname", hostname, "workdir", workdir, "client_session", clientSession, "replaced", replaced)
 	// Every agent joins the global session — the default room shared by all
@@ -504,16 +504,16 @@ func (a *API) registerAgent(w http.ResponseWriter, r *http.Request) {
 // announceReplacement posts a system message in every session the identity
 // participates in, so panels and waiting agents see that the previous
 // instance was kicked and this identity is now driven by a new process.
-func (a *API) announceReplacement(ctx context.Context, name string) {
-	sids, err := a.Store.SessionsForAgent(ctx, name)
+func (a *API) announceReplacement(ctx context.Context, agent *store.Agent) {
+	sids, err := a.Store.SessionsForAgent(ctx, agent.ID)
 	if err != nil {
-		a.Log.Error("list sessions for agent", "err", err, "agent", name)
+		a.Log.Error("list sessions for agent", "err", err, "agent", agent.ID)
 		return
 	}
-	content := name + " reconnected (previous instance replaced)"
+	content := store.NoticeLabel(agent) + " reconnected (previous instance replaced)"
 	for _, sid := range sids {
 		if _, err := a.Store.InsertMessage(ctx, &store.Message{
-			ID: ids.New(), SessionID: sid, SenderID: name, Kind: "system", Content: content,
+			ID: ids.New(), SessionID: sid, SenderID: agent.ID, Kind: "system", Content: content,
 		}); err != nil {
 			a.Log.Error("announce replacement", "err", err, "session", sid)
 			continue
@@ -639,7 +639,7 @@ func (a *API) announceEviction(ctx context.Context, agent *store.Agent) {
 		a.Log.Error("list sessions for agent", "err", err, "agent", agent.ID)
 		return
 	}
-	content := agent.ID + " was kicked by admin (tokens revoked; hidden until it re-registers)"
+	content := store.NoticeLabel(agent) + " was kicked by admin (tokens revoked; hidden until it re-registers)"
 	for _, sid := range sids {
 		if _, err := a.Store.InsertMessage(ctx, &store.Message{
 			ID: ids.New(), SessionID: sid, SenderID: agent.ID, Kind: "system", Content: content,

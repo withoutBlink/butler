@@ -158,7 +158,7 @@ func TestSessionViewAndPost(t *testing.T) {
 	}
 	var hasJoin, hasPost bool
 	for _, m := range msgs {
-		if m.Kind == "system" && strings.Contains(m.Content, "admin joined") {
+		if m.Kind == "system" && strings.Contains(m.Content, "Admin joined the session") {
 			hasJoin = true
 		}
 		if m.SenderID == "admin" && m.Content == "hello from the panel" {
@@ -188,21 +188,24 @@ func TestSessionViewAndPost(t *testing.T) {
 // The panel's message list shows the sender's display name (the session
 // title), not the UUID: the id stays only as the identity tooltip and in
 // data-sender for the read-mark math. Read-mark tooltips name the readers
-// too, and a sender who is no longer a participant (a kicked agent's
-// history) has no title left to show, so it keeps its id.
+// too, and a sender who has left the session (a kicked agent's history) is
+// resolved from its surviving agents row, so the list shows a UUID only for
+// an identity whose display name *is* its id.
 func TestMessageSenderShowsDisplayName(t *testing.T) {
 	srv, st, _, adminTok := newPanel(t)
 	ctx := context.Background()
 	const (
 		dev    = "2ad4443c-a473-4af8-a781-4b483d84d8d3"
 		tester = "fb3b3d41-fc49-4492-bb2a-5586e537c071"
-		ghost  = "bbbbbbbb-0000-0000-0000-000000000000"
+		kicked = "cccccccc-0000-0000-0000-000000000000"
+		plain  = "dddddddd-0000-0000-0000-000000000000"
 	)
 	for _, a := range []struct{ id, display string }{
 		{"admin", "Admin"},
 		{dev, "Develop butler"},
 		{tester, "Butler tester"},
-		{ghost, "Gone away"},
+		{kicked, "Kicked Role"},
+		{plain, ""}, // untitled: its id is its label
 	} {
 		if _, err := st.CreateAgent(ctx, a.id, a.display, "opencode", "h", "/w", "ses_"+a.id); err != nil {
 			t.Fatalf("create %s: %v", a.id, err)
@@ -213,7 +216,7 @@ func TestMessageSenderShowsDisplayName(t *testing.T) {
 	}
 	// JoinSession writes the join notice — a system message whose sender must
 	// show its title too (join notices used to read as UUIDs).
-	for _, id := range []string{dev, tester} {
+	for _, id := range []string{dev, tester, kicked} {
 		if _, err := st.JoinSession(ctx, "s1", id); err != nil {
 			t.Fatalf("join %s: %v", id, err)
 		}
@@ -225,8 +228,15 @@ func TestMessageSenderShowsDisplayName(t *testing.T) {
 	if err := st.MarkRead(ctx, "s1", tester, msg.Seq); err != nil {
 		t.Fatalf("mark read: %v", err)
 	}
-	if _, err := st.InsertMessage(ctx, &store.Message{SessionID: "s1", SenderID: ghost, Kind: "chat", Content: "old news"}); err != nil {
-		t.Fatalf("insert ghost: %v", err)
+	// History of a kicked role keeps its title: the agents row survives.
+	if _, err := st.InsertMessage(ctx, &store.Message{SessionID: "s1", SenderID: kicked, Kind: "chat", Content: "before I was kicked"}); err != nil {
+		t.Fatalf("insert kicked: %v", err)
+	}
+	if err := st.RemoveAgent(ctx, kicked); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if _, err := st.InsertMessage(ctx, &store.Message{SessionID: "s1", SenderID: plain, Kind: "chat", Content: "untitled here"}); err != nil {
+		t.Fatalf("insert untitled: %v", err)
 	}
 
 	client := newBrowser(t)
@@ -243,13 +253,19 @@ func TestMessageSenderShowsDisplayName(t *testing.T) {
 	for _, want := range []string{
 		`<b title="` + dev + `">Develop butler</b>`,
 		`<b title="` + tester + `">Butler tester</b>`, // join notice
-		`<b title="` + ghost + `">` + ghost + `</b>`,  // not a participant: no title
+		`<b title="` + kicked + `">Kicked Role</b>`,   // left the session: row survives
+		`<b title="` + plain + `">` + plain + `</b>`,  // untitled: the id is the label
 		`title="Butler tester"`,                       // read-mark tooltip names the reader
 		`✓1/1`,
 	} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("session view missing %q in:\n%s", want, string(body))
 		}
+	}
+	// The kicked role is gone as a participant (its title survives only in
+	// the message list, where it names its own history).
+	if strings.Contains(string(body), `<span class="id">Kicked Role</span>`) {
+		t.Fatalf("kicked role should not be a participant:\n%s", string(body))
 	}
 }
 
@@ -363,8 +379,10 @@ func TestPanelKickAgent(t *testing.T) {
 	}
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
-	// The eviction notice in the sessions preview may name the agent; what
-	// must be gone is its agents-table row (kick form) and its pick.
+	// The eviction notice in the sessions preview and the message list names
+	// the agent by its display title (that's the point of the notice); what
+	// must be gone is the participant row, the agents-table row (kick form)
+	// and its pick.
 	if strings.Contains(string(body), `action="/panel/agents/opencode:fix-read-marks/revoke"`) {
 		t.Fatalf("evicted agent still has a kick form:\n%s", string(body))
 	}
@@ -377,10 +395,10 @@ func TestPanelKickAgent(t *testing.T) {
 	}
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if strings.Contains(string(body), "Fix read marks") {
+	if strings.Contains(string(body), `<span class="id">Fix read marks</span>`) {
 		t.Fatalf("evicted agent should not be a participant:\n%s", string(body))
 	}
-	if !strings.Contains(string(body), "was kicked by admin") {
+	if !strings.Contains(string(body), "Fix read marks was kicked by admin") {
 		t.Fatalf("session view missing eviction notice:\n%s", string(body))
 	}
 	// The row survives in the store: history (messages, sessions) still

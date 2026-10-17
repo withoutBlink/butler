@@ -287,6 +287,41 @@ func TestJoinSession(t *testing.T) {
 	}
 }
 
+// Server-generated notices name the agent the way humans see it: the display
+// title (a role's client-session title), with the id as the fallback for an
+// untitled identity — app-level identities carry their own id as label by
+// design, so for them both forms are the same string.
+func TestJoinNoticeUsesDisplayName(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	mustAgent(t, s, "admin")
+	const role = "2ad4443c-a473-4af8-a781-4b483d84d8d3"
+	if _, err := s.CreateAgent(ctx, role, "Develop butler", "opencode", "h", "/w", "ses_dev"); err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+	if _, err := s.CreateAgent(ctx, "untitled", "", "opencode", "h", "/w", "ses_bare"); err != nil {
+		t.Fatalf("create untitled: %v", err)
+	}
+	if _, err := s.CreateSession(ctx, "s1", "meeting", "admin", nil); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	for _, id := range []string{role, "untitled"} {
+		if _, err := s.JoinSession(ctx, "s1", id); err != nil {
+			t.Fatalf("join %s: %v", id, err)
+		}
+	}
+	msgs, err := s.SessionLatestMessages(ctx, "s1", 10)
+	if err != nil {
+		t.Fatalf("messages: %v", err)
+	}
+	if len(msgs) != 2 || msgs[0].SenderID != role || msgs[0].Content != "Develop butler joined the session" {
+		t.Fatalf("notice should carry the display name: %+v", msgs)
+	}
+	if msgs[1].SenderID != "untitled" || msgs[1].Content != "untitled joined the session" {
+		t.Fatalf("untitled identity should fall back to its id: %+v", msgs)
+	}
+}
+
 func TestMessagesSince(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)

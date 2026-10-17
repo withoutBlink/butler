@@ -587,11 +587,34 @@ func (s *Store) JoinSession(ctx context.Context, sessionID, agentID string) (boo
 	if n == 0 {
 		return false, tx.Commit()
 	}
+	// The notice names the agent the way humans see it — its display title;
+	// untitled identities (app-level ones are labeled with their own id by
+	// design) fall back to the id. Resolved at insert time, exactly like
+	// mentions: a later rename does not rewrite a stored notice.
+	label := agentID
+	var display string
+	if err := tx.QueryRowContext(ctx, `SELECT display_name FROM agents WHERE id = ?`, agentID).Scan(&display); err == nil && display != "" {
+		label = display
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO messages (id, session_id, sender_id, kind, content, created_at) VALUES (?, ?, ?, 'system', ?, ?)`,
-		ids.New(), sessionID, agentID, agentID+" joined the session", now); err != nil {
+		ids.New(), sessionID, agentID, label+" joined the session", now); err != nil {
 		return false, err
 	}
 	return true, tx.Commit()
+}
+
+// NoticeLabel is how server-generated notices (join, eviction, replacement)
+// name an agent: its display title, or the id for an untitled identity.
+// App-level identities carry their own id as display name by design, so for
+// them this is the same string either way.
+func NoticeLabel(a *Agent) string {
+	if a == nil {
+		return ""
+	}
+	if a.DisplayName != "" {
+		return a.DisplayName
+	}
+	return a.ID
 }
 
 func (s *Store) IsParticipant(ctx context.Context, sessionID, agentID string) (bool, error) {

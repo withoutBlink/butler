@@ -413,7 +413,7 @@ func agentCmd(args []string) {
 		for _, sid := range sids {
 			if _, err := st.InsertMessage(ctx, &store.Message{
 				ID: ids.New(), SessionID: sid, SenderID: id, Kind: "system",
-				Content: id + " was kicked by admin (tokens revoked; hidden until it re-registers)",
+				Content: store.NoticeLabel(agent) + " was kicked by admin (tokens revoked; hidden until it re-registers)",
 			}); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: eviction notice for %s: %v\n", sid, err)
 			}

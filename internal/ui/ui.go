@@ -439,7 +439,7 @@ func (p *Panel) announceEviction(ctx context.Context, agent *store.Agent) {
 		p.Log.Error("list sessions for agent", "err", err, "agent", agent.ID)
 		return
 	}
-	content := agent.ID + " was kicked by admin (tokens revoked; hidden until it re-registers)"
+	content := store.NoticeLabel(agent) + " was kicked by admin (tokens revoked; hidden until it re-registers)"
 	for _, sid := range sids {
 		if _, err := p.Store.InsertMessage(ctx, &store.Message{
 			ID: ids.New(), SessionID: sid, SenderID: agent.ID, Kind: "system", Content: content,
@@ -550,16 +550,26 @@ func (p *Panel) loadReadState(ctx context.Context, sid string) readState {
 // attachReadState computes per-message read marks for rendering: a chat
 // message counts as read for each agent participant other than the sender
 // whose cursor has reached its seq. Non-chat kinds never show marks. Every
-// message also gets the sender's display name (the participants' titles are
-// what the panel shows; the id stays available as data-sender and the
-// tooltip) — senders no longer in the session (a kicked agent's history) fall
-// back to their id.
-func attachReadState(rs readState, msgs []store.Message) []uiMsg {
+// message also gets the sender's display name — the id stays available as
+// data-sender and the tooltip, and the name is looked up in the agents row
+// when the sender is no longer a participant (a kicked agent's history still
+// renders as a name, not a UUID). Only an identity whose display name *is*
+// its id (an untitled app-level identity) shows a UUID in the list.
+func (p *Panel) attachReadState(ctx context.Context, rs readState, msgs []store.Message) []uiMsg {
 	out := make([]uiMsg, len(msgs))
 	nameOf := func(id string) string {
 		if n, ok := rs.names[id]; ok && n != "" {
 			return n
 		}
+		// Not a participant: resolve from the row itself (removed agents
+		// keep their row) and remember it for the rest of the batch.
+		if a, err := p.Store.GetAgent(ctx, id); err == nil {
+			if n := store.NoticeLabel(a); n != "" {
+				rs.names[id] = n
+				return n
+			}
+		}
+		rs.names[id] = id
 		return id
 	}
 	for i, m := range msgs {
@@ -652,7 +662,7 @@ func (p *Panel) sessionView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.render(w, http.StatusOK, "session.tmpl", sessionViewData{
-		Session: *sess, Participants: parts, Messages: attachReadState(rs, msgs), ContextItems: items, LatestSeq: latest,
+		Session: *sess, Participants: parts, Messages: p.attachReadState(ctx, rs, msgs), ContextItems: items, LatestSeq: latest,
 		Mentionables: string(mentionables), Agents: string(agentsJSON), Reads: string(readsJSON),
 		Addable: p.addableAgents(ctx, parts),
 	})
@@ -770,7 +780,7 @@ func (p *Panel) postMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.fanout(ctx, sid)
-	p.renderFragment(w, "message", attachReadState(p.loadReadState(ctx, sid), []store.Message{*msg})[0])
+	p.renderFragment(w, "message", p.attachReadState(ctx, p.loadReadState(ctx, sid), []store.Message{*msg})[0])
 }
 
 func (p *Panel) putContext(w http.ResponseWriter, r *http.Request) {
@@ -875,7 +885,7 @@ func (p *Panel) stream(w http.ResponseWriter, r *http.Request) {
 		if len(msgs) == 0 {
 			return
 		}
-		vms := attachReadState(p.loadReadState(ctx, sid), msgs)
+		vms := p.attachReadState(ctx, p.loadReadState(ctx, sid), msgs)
 		for _, vm := range vms {
 			writeSSE(w, flusher, "message", p.fragment("message", vm))
 			cursor = vm.Seq

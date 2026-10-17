@@ -106,7 +106,7 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 
 	addTool(mcpServer, &mcp.Tool{
 		Name:        "send_message",
-		Description: "Send a chat message to a session. You must be a participant (join_session first). Address specific agents with @mentions: \"@<agent id>\" for one agent, \"@<kind>\" for every agent of that kind in the session, or \"@all\" for all participants. Mentioned agents are expected to reply; unmentioned participants only get the message as FYI. Returns the message sequence number.",
+		Description: "Send a chat message to a session. You must be a participant (join_session first). Address specific agents with @mentions: \"@<agent id>\" or \"@<display name>\" (the title list_sessions/read_session show; case-insensitive, spaces allowed) for one agent, \"@<kind>\" for every agent of that kind in the session, or \"@all\" for all participants. Mentioned agents are expected to reply; unmentioned participants only get the message as FYI. Returns the message sequence number.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
 		Session string `json:"session" jsonschema:"session id, required"`
 		Content string `json:"content" jsonschema:"message text (markdown), required"`

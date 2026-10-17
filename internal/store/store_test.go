@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -176,7 +177,6 @@ func TestSessionsForAgent(t *testing.T) {
 		t.Fatalf("sessions for ghost: %v %v", err, sids)
 	}
 }
-
 
 func TestMessageSeqMonotonic(t *testing.T) {
 	ctx := context.Background()
@@ -583,7 +583,6 @@ func TestMarkRead(t *testing.T) {
 	}
 }
 
-
 // TestClientSessionIdentity: FindInstance discriminates the app-level agent
 // (client_session "") from its per-session siblings, and sibling identity is
 // stable across re-registration.
@@ -810,5 +809,95 @@ func TestAgentClientHiddenByRoles(t *testing.T) {
 	}
 	if !listed(client.ID) {
 		t.Fatal("client should be visible once every role is evicted")
+	}
+}
+
+// TestParticipantsAlphabetical: participant and agent lists are ordered by
+// display name, case-insensitively — ids are UUIDs now, so id order would
+// look random in the panel.
+func TestParticipantsAlphabetical(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	for _, a := range []struct{ id, display string }{
+		{"id-zeta", "zeta"},
+		{"id-alpha", "Alpha"},
+		{"id-beta", "beta"},
+	} {
+		if _, err := s.CreateAgent(ctx, a.id, a.display, "test", "", "", ""); err != nil {
+			t.Fatalf("create %s: %v", a.id, err)
+		}
+	}
+	if _, err := s.CreateSession(ctx, "s1", "order", "id-zeta", []string{"id-zeta", "id-alpha", "id-beta"}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	names := func(as []Agent) []string {
+		out := []string{}
+		for _, a := range as {
+			out = append(out, a.DisplayName)
+		}
+		return out
+	}
+	want := []string{"Alpha", "beta", "zeta"}
+	parts, err := s.Participants(ctx, "s1")
+	if err != nil {
+		t.Fatalf("participants: %v", err)
+	}
+	if got := names(parts); !reflect.DeepEqual(got, want) {
+		t.Fatalf("participants order: %v, want %v", got, want)
+	}
+	agents, err := s.ListAgents(ctx)
+	if err != nil {
+		t.Fatalf("list agents: %v", err)
+	}
+	if got := names(agents); !reflect.DeepEqual(got, want) {
+		t.Fatalf("agents order: %v, want %v", got, want)
+	}
+}
+
+// TestMentionByDisplayName: the panel's @autocomplete inserts display titles
+// ("@Develop butler"), so mentions resolve by display name as well —
+// case-insensitively, spaces allowed, the longest name at an "@" wins, and
+// only for agents that are participants.
+func TestMentionByDisplayName(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	mustAgent(t, s, "admin")
+	for _, r := range []struct{ id, display string }{
+		{"role-a", "Alpha"},
+		{"role-b", "Beta 2"},
+		{"role-c", "Beta"},
+		{"role-d", "Outside"},
+	} {
+		if _, err := s.CreateAgent(ctx, r.id, r.display, "opencode", "h", "/w", "ses_"+r.id); err != nil {
+			t.Fatalf("create %s: %v", r.id, err)
+		}
+	}
+	if _, err := s.CreateSession(ctx, "s1", "room", "admin", []string{"role-a", "role-b", "role-c"}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	mentions := func(content string) []string {
+		t.Helper()
+		m, err := s.InsertMessage(ctx, &Message{SessionID: "s1", SenderID: "admin", Kind: "chat", Content: content})
+		if err != nil {
+			t.Fatalf("insert %q: %v", content, err)
+		}
+		return m.Mentions
+	}
+	cases := []struct {
+		content string
+		want    []string
+	}{
+		{"@Alpha please take a look", []string{"role-a"}},
+		{"hey @alpha and @Beta hi", []string{"role-a", "role-c"}},
+		{"@Beta 2 please", []string{"role-b"}}, // longest name wins
+		{"@Beta hi", []string{"role-c"}},
+		{"@Outside hello", nil},                // not a participant
+		{"@role-a direct", []string{"role-a"}}, // ids still work
+		{"mail a@alpha.example", nil},          // mid-word "@" is no mention
+	}
+	for _, tc := range cases {
+		if got := mentions(tc.content); !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("mentions(%q) = %v, want %v", tc.content, got, tc.want)
+		}
 	}
 }

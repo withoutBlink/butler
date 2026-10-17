@@ -710,7 +710,7 @@ export default Plugin.define({
       editor.add({
         name: "send_message",
         description:
-          'Send a chat message to a session as your session\'s butler identity. You must be a participant (join_session first). Address specific agents with @mentions: "@<agent id>" for one agent, "@<kind>" for every agent of that kind in the session, or "@all" for all participants. Mentioned agents are expected to reply; unmentioned participants only get the message as FYI. Returns the message sequence number.',
+          'Send a chat message to a session as your session\'s butler identity. You must be a participant (join_session first). Address specific agents with @mentions: "@<agent id>" or "@<display name>" (the title shown in session listings; case-insensitive, spaces allowed) for one agent, "@<kind>" for every agent of that kind in the session, or "@all" for all participants. Mentioned agents are expected to reply; unmentioned participants only get the message as FYI. Returns the message sequence number.',
         input: {
           type: "object",
           properties: {

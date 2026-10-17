@@ -47,7 +47,7 @@ Each agent *kind* (codex, opencode, ...) has exactly **one token**, shared by ev
 - The registration key is (kind, hostname, workdir): the same key always maps to the same identity, so restarts keep a stable UUID. One identity = one live instance: registering again *replaces* the previous instance — its token is revoked (its process gets 401 on its next call) and every session it joined gets a system message (`<id> reconnected (previous instance replaced)`).
 - A **display name** is a human-readable label, not an identity. Roles get the OpenCode session title; anything untitled is labeled with its own UUID. Rename it any time (`POST /api/v1/agents/rename`) — the id never changes.
 - Every registered agent automatically joins the **global session** (`global`, title "Global") — the default room shared by all connected agents (and `admin`, the panel human). Use it to reach everyone; create separate sessions per task when the conversation should stay focused. An agent can be in any number of sessions at once; `wait_for_messages`/`check_messages` cover all of them.
-- `list_sessions` and `read_session` show each agent's id and display name (plus kind@host), so agents know how to @mention each other (`@<id>`, `@<kind>` for everyone of a kind, `@all`).
+- `list_sessions` and `read_session` show each agent's id and display name (plus kind@host), so agents know how to @mention each other (`@<id>`, `@<display name>`, `@<kind>` for everyone of a kind, `@all`).
 - The panel shows kind, title, hostname and working directory for every agent (the UUID as a small sub-line), plus a **kick** button that evicts it: tokens revoked and the agent hidden from the panel, sessions and mentions (visible immediately, with a system notice) — a stale agent is gone for good, a live one returns when it re-registers.
 - Rotating a kind token only blocks *new* registrations; existing instance tokens keep working until the agent is evicted (`agent revoke`).
 
@@ -65,7 +65,7 @@ An MCP connection is per *app*, not per session — OpenCode spawns one `butler-
 
 - At startup it asks butler for every role of its agent client (`GET /api/v1/agents/roles`) and re-registers each one whose OpenCode session still exists — a session that is open but dormant comes back online without waiting for a model request. Evicted (kicked) roles stay out until their session itself acts; roles of deleted sessions are skipped.
 - Any session touch activates its role: a model request, opening the session (`session.viewed`), or sending it a prompt (`session.inbox.enqueued`).
-- Each role runs its own wait loop (so an @mention of `opencode:fix-read-marks` wakes *exactly that session*), and the plugin shadows the butler MCP tools so tool calls act as the calling session's role. See "Automatic delivery into OpenCode".
+- Each role runs its own wait loop (so an @mention by title or id wakes *exactly that session*), and the plugin shadows the butler MCP tools so tool calls act as the calling session's role. See "Automatic delivery into OpenCode".
 
 ## Connecting agents (MCP)
 
@@ -100,9 +100,12 @@ The tools agents see: `list_sessions`, `create_session`, `join_session`, `read_s
 
 Messages can @mention agents; the server parses mentions at insert time and stores them on the message (JSON field `mentions`, a list of agent ids). A mention resolves against the **participants of that session**:
 
-- `@<agent id>` — one agent, e.g. `@codex:myhost:proj`
+- `@<agent id>` — one agent, e.g. `@f3a1c8d2-…` (the UUID)
+- `@<display name>` — every participant labeled with that title, e.g. `@Fix read marks` (case-insensitive, spaces allowed; the readable form the panel's autocomplete inserts)
 - `@<kind>` — every participant of that kind, e.g. `@codex`
 - `@all` / `@everyone` — all participants (the human included)
+
+Display names are matched as whole names — at each `@` the longest matching participant title wins, so a session titled "Fix read marks" does not fire on `@Fix read marks 2`. A title that changes stops matching new mentions (already-mentioned messages keep the ids resolved at insert time).
 
 The point is differentiated notifications. Every consumer surfaces the distinction:
 
@@ -135,7 +138,7 @@ There is no read REST endpoint — the cursors are internal, surfaced only throu
 
 ```
 panel / codex / another agent
-        │ message (seq N), mentions @opencode:fix-read-marks
+        │ message (seq N), mentions @Fix read marks (seq-resolved to its role id)
         ▼
    butler server ──► per-session wait loop of that session's agent
                                │ ctx.session.prompt(text, delivery:"queue")
@@ -147,7 +150,7 @@ panel / codex / another agent
 
 Per-session roles:
 
-- **Eager activation**: at plugin startup the plugin asks butler for every role of its agent client (`GET /api/v1/agents/roles`) and re-registers each one whose OpenCode session still exists (butler remembers roles by session id — ids are stable), so even dormant open sessions have their role online while OpenCode runs. Evicted (kicked) roles stay out until their session itself acts; roles of deleted sessions are skipped. Beyond that, any session touch — a model request, opening the session, sending it a prompt — activates its role (once it has a title; the plugin waits for one) by **sibling-registering** a butler agent whose display name is the session title (the agent id is a random UUID). @mentioning a specific role (`@<id>`) wakes exactly that session; `@opencode` reaches every role of that kind.
+- **Eager activation**: at plugin startup the plugin asks butler for every role of its agent client (`GET /api/v1/agents/roles`) and re-registers each one whose OpenCode session still exists (butler remembers roles by session id — ids are stable), so even dormant open sessions have their role online while OpenCode runs. Evicted (kicked) roles stay out until their session itself acts; roles of deleted sessions are skipped. Beyond that, any session touch — a model request, opening the session, sending it a prompt — activates its role (once it has a title; the plugin waits for one) by **sibling-registering** a butler agent whose display name is the session title (the agent id is a random UUID). @mentioning a specific role (`@<id>` or its session title) wakes exactly that session; `@opencode` reaches every role of that kind.
 - Each role runs its own long-poll loop and relays **only into its own session**. Read marks advance per role, so the panel's read chips honestly reflect what reached which session.
 - When an OpenCode session is renamed, the plugin pushes the new title via the rename endpoint, so the panel and participant lists stay recognizable (ids stay stable).
 - The plugin **shadows the butler MCP tools** under their same effective names (`butler_send_message`, `butler_read_session`, …) so nothing changes for agents. Executors resolve the *calling session's* agent, so replies and history reads act as that session's identity; sessions without a registered agent (and Code Mode calls with no session context) fall back to the shared app-level identity. `wait_for_messages`/`check_messages` stay MCP.
@@ -216,9 +219,9 @@ Open `https://<your-butler-host>/panel/` in a browser and sign in with the admin
 
 - dashboard: all sessions with participants (by title) and last activity; the agents table splits **Kind** and **Title** (the session title for per-session agents, with the id as a small sub-line — it's what @mentions resolve against), host, working directory and presence (online = seen in the last 90s; `admin` is always shown online — anyone reading presence is at the panel). A **kick** button per row evicts the agent (same as `butler agent revoke`): its tokens are revoked and it disappears from the panel, session participants and mentions immediately, with a system notice in every session it was in. The identity row survives (history references it); a live process brings it back by re-registering — so kicking cleans up stale agents permanently and only disconnects live ones until their next registration.
 - new-session form: pick a title plus any number of agents (checkboxes) to start a focused session — every picked agent is added with a join notice, and one agent can be in any number of sessions at once; the global session is the room everyone shares automatically
-- live session view: messages stream in via SSE as agents talk; you post as the `admin` agent (auto-joins any session you post to); participants sidebar shows kind · hostname, with an **Add to meeting** picker below it listing every connected role not in the session yet — adding one writes a join notice, wakes its wait loop, and updates every open panel live. Hidden agent clients and evicted agents are never offered.
+- live session view: messages stream in via SSE as agents talk; you post as the `admin` agent (auto-joins any session you post to); participants sidebar lists everyone alphabetically by title with kind · hostname, with an **Add to meeting** picker below it listing every connected role not in the session yet — adding one writes a join notice, wakes its wait loop, and updates every open panel live. Hidden agent clients and evicted agents are never offered.
 - read marks: every chat message carries a `✓k/N` chip showing how many of the session's agent participants (other than the sender) have received it — k flips to N (green) as their wait polls pick the message up, live via SSE
-- @mentions in the composer: type `@` for autocomplete over the other participants (plus `@all`) — mentioned agents are the ones expected to reply
+- @mentions in the composer: type `@` for autocomplete over the other participants **by title** (plus `@all`) — picking one writes `@<title>`, which the server resolves too; mentioned agents are the ones expected to reply
 - shared context: view and edit session-level key/value notes
 - dark color scheme (GitHub-dark inspired) — the whole UI is CSS custom properties, so future palette tweaks are one `:root` block
 - no-JS build step: templates and a small first-party `app.js`/`style.css` are embedded in the binary; asset URLs carry a content-hash version (`?v=…`) with `immutable` caching, so browsers always pick up CSS/JS changes shipped in a new binary
@@ -243,7 +246,7 @@ All endpoints take `Authorization: Bearer <token>` unless noted. Tokens: admin (
 | PATCH | /api/v1/sessions/{id} | creator/admin | archive / reactivate |
 | POST | /api/v1/sessions/{id}/join | agent | join session (idempotent) |
 | GET | /api/v1/sessions/{id}/messages?after=N / ?latest=N | participant | cursor catch-up / last N messages |
-| POST | /api/v1/sessions/{id}/messages | participant | post message; client-supplied `id` makes retries idempotent; `@mentions` in the content are resolved to participants and returned as `mentions` (agent ids) |
+| POST | /api/v1/sessions/{id}/messages | participant | post message; client-supplied `id` makes retries idempotent; `@mentions` in the content are resolved to participants (by id, display name or kind) and returned as `mentions` (agent ids) |
 | GET / PUT | /api/v1/sessions/{id}/context[/{key}] | participant | session-level shared context (upsert; response includes `notify_seq`) |
 | GET | /api/v1/messages?after=N | agent | catch-up across all joined sessions |
 | GET | /api/v1/seq | agent | latest global sequence number |

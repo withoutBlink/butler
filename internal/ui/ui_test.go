@@ -786,7 +786,7 @@ func TestSessionViewMentionables(t *testing.T) {
 	if _, err := st.CreateAgent(ctx, "admin", "Admin", "human", "", "", ""); err != nil {
 		t.Fatalf("create you: %v", err)
 	}
-	if _, err := st.CreateAgent(ctx, "codex:alpha:proj", "codex:alpha:proj", "codex", "h", "/w", ""); err != nil {
+	if _, err := st.CreateAgent(ctx, "codex:alpha:proj", "Alpha bot", "codex", "h", "/w", ""); err != nil {
 		t.Fatalf("create agent: %v", err)
 	}
 	if _, err := st.CreateSession(ctx, "s1", "room", "admin", []string{"codex:alpha:proj"}); err != nil {
@@ -801,12 +801,21 @@ func TestSessionViewMentionables(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	// The composer carries the @autocomplete targets (other participants + all,
-	// "admin" itself excluded) as a JSON data attribute. html/template escapes
-	// quotes in attribute values as &#34;.
-	want := `data-mentionables="[&#34;all&#34;,&#34;codex:alpha:proj&#34;]"`
+	// The composer carries the @autocomplete targets (other participants by
+	// display title + all, "admin" itself excluded) as a JSON data attribute.
+	// html/template escapes quotes in attribute values as &#34;.
+	want := `data-mentionables="[&#34;all&#34;,&#34;Alpha bot&#34;]"`
 	if !strings.Contains(string(body), want) {
 		t.Fatalf("session view missing mentionables %q in:\n%s", want, string(body))
+	}
+	// The id is not offered when the agent has a title (the id still shows
+	// up in the data-agents map, which is what read marks resolve against).
+	frag := string(body)
+	const attr = `data-mentionables="`
+	frag = frag[strings.Index(frag, attr)+len(attr):]
+	frag = frag[:strings.Index(frag, `"`)]
+	if strings.Contains(frag, "codex:alpha:proj") {
+		t.Fatalf("mentionables should list titles, not ids: %s", frag)
 	}
 }
 

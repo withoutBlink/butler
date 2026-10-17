@@ -689,6 +689,19 @@ func TestMentionFlow(t *testing.T) {
 	if _, ok := body["mentions"]; ok {
 		t.Fatalf("unmentioned message should omit mentions, got %v", body)
 	}
+
+	// A role's display title is what the panel's @autocomplete inserts, so a
+	// title mention ("@Fix read marks") resolves to that role.
+	sib := registerSibling(t, srv, agents["alpha"].Token, "ses_mention", "Fix read marks")
+	roleID, _ := sib["name"].(string)
+	resp, body = req(t, "POST", base+"/api/v1/sessions/"+store.GlobalSessionID+"/messages", agents["beta"].Token, map[string]any{"content": "@Fix read marks please review"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("post title mention: %d %v", resp.StatusCode, body)
+	}
+	mentions, ok = body["mentions"].([]any)
+	if !ok || len(mentions) != 1 || mentions[0] != roleID {
+		t.Fatalf("expected mentions [%s], got %v", roleID, body)
+	}
 }
 
 // newReadTestAPI boots a minimal API whose store is returned to the test so

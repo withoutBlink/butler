@@ -275,10 +275,10 @@ type dashData struct {
 }
 
 type agentRow struct {
-	ID       string
-	Kind     string
+	ID   string
+	Kind string
 	// Title is the display title (the OpenCode/codex session title for
-	// per-session agents, the minted id otherwise). Sub shows the id when
+	// per-session agents, its own UUID otherwise). Sub shows the id when
 	// it differs — it is what @mentions resolve against.
 	Title    string
 	Sub      string
@@ -458,7 +458,8 @@ type sessionViewData struct {
 	ContextItems []store.ContextItem
 	LatestSeq    int64
 	// Mentionables is a JSON array of @autocomplete targets for the
-	// composer: every other participant plus "all".
+	// composer: every other participant's display name plus "all" (the
+	// server resolves @<title> as well as @<id>, @<kind> and @all).
 	Mentionables string
 	// Agents is a JSON array of the session's agent participant ids and
 	// Reads a JSON object of agent id -> highest read seq. app.js uses
@@ -601,11 +602,23 @@ func (p *Panel) sessionView(w http.ResponseWriter, r *http.Request) {
 	}
 	targets := make([]string, 0, len(parts)+1)
 	targets = append(targets, "all")
+	seenTarget := map[string]bool{"all": true}
 	for _, pa := range parts {
 		if pa.ID == AdminAgentID {
 			continue
 		}
-		targets = append(targets, pa.ID)
+		// The menu shows display names (session titles), not ids: picking
+		// one writes "@<title>" and the server resolves names too. Untitled
+		// identities are labeled with their id, so the id stays mentionable.
+		label := pa.DisplayName
+		if label == "" {
+			label = pa.ID
+		}
+		if seenTarget[label] {
+			continue
+		}
+		seenTarget[label] = true
+		targets = append(targets, label)
 	}
 	mentionables, err := json.Marshal(targets)
 	if err != nil {

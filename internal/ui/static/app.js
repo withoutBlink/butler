@@ -140,8 +140,9 @@
   }
 
   // @mention autocomplete: typing "@" (or "@par") in the composer shows the
-  // session's other participants plus "all"; picking one completes the name.
-  // Mentions are resolved server-side to agents that must reply.
+  // session's other participants by display title plus "all"; picking one
+  // completes the mention with the title. The server resolves both titles and
+  // ids, so either form addresses an agent that must reply.
   function setupMentions(form) {
     var input = form.querySelector('textarea[name=content]');
     if (!input) return;

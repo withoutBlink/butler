@@ -408,7 +408,7 @@ func (s *Store) queryAgents(ctx context.Context, q string, args ...any) ([]Agent
 }
 
 // clientHidden matches app-level identities ("agent clients",
-// client_session '') that have at least one live role: once the client is
+// client_session empty) that have at least one live role: once the client is
 // represented by its per-session roles it becomes backend plumbing — the
 // panel, participants and mention resolution skip it, while its token,
 // wait loop and registration path keep working (auth and delivery queries
@@ -421,14 +421,16 @@ func clientHidden(alias string) string {
 	  AND r.removed_at IS NULL)`
 }
 
-// ListAgents returns the visible (non-removed, non-hidden-client) agents.
+// ListAgents returns the visible (non-removed, non-hidden-client) agents,
+// ordered by display name (case-insensitive) so panel lists stay alphabetical
+// — ids are UUIDs now, so id order would look random.
 // Kicked agents stay hidden until they re-register; agent clients with live
 // roles are hidden — the roles represent them.
 func (s *Store) ListAgents(ctx context.Context) ([]Agent, error) {
 	return s.queryAgents(ctx, `SELECT `+agentCols+`
 		FROM agents
 		WHERE removed_at IS NULL AND NOT (`+clientHidden("agents")+`)
-		ORDER BY id`)
+		ORDER BY display_name COLLATE NOCASE, id`)
 }
 
 func (s *Store) TouchAgent(ctx context.Context, id string) {
@@ -604,12 +606,14 @@ func (s *Store) IsParticipant(ctx context.Context, sessionID, agentID string) (b
 	return true, nil
 }
 
+// Participants lists a session's visible participants ordered by display name
+// (case-insensitive) — what the panel's participants sidebar renders.
 func (s *Store) Participants(ctx context.Context, sessionID string) ([]Agent, error) {
 	return s.queryAgents(ctx, `SELECT `+agentCols+`
 		FROM agents a JOIN participants p ON p.agent_id = a.id
 		WHERE p.session_id = ? AND a.removed_at IS NULL
 		  AND NOT (`+clientHidden("a")+`)
-		ORDER BY a.id`, sessionID)
+		ORDER BY a.display_name COLLATE NOCASE, a.id`, sessionID)
 }
 
 // AgentsForIdentity returns every agent row of one agent client's identity
@@ -658,15 +662,15 @@ func (s *Store) InsertMessage(ctx context.Context, m *Message) (*Message, error)
 }
 
 // resolveMentions maps the @tokens in content to the participant agents they
-// address: "@<agent id>" (exact), "@<kind>" (every participant of that kind)
-// and "@all"/"@everyone"/"@here" (all participants). Tokens that match no
-// participant resolve to nothing — mentioning only reaches agents already in
-// the session.
+// address: "@<agent id>" (exact), "@<kind>" (every participant of that kind),
+// "@<display name>" (every participant labeled with that name — the readable
+// form the panel's autocomplete inserts) and "@all"/"@everyone"/"@here" (all
+// participants). Names match case-insensitively and may contain spaces; at an
+// "@" the longest matching name wins, so "Beta 2" does not also trigger
+// "Beta". Tokens that match no participant resolve to nothing — mentioning
+// only reaches agents already in the session.
 func (s *Store) resolveMentions(ctx context.Context, sessionID, content string) []string {
 	tokens := mentionTokens(content)
-	if len(tokens) == 0 {
-		return nil
-	}
 	participants, err := s.Participants(ctx, sessionID)
 	if err != nil {
 		// Fail open: store the message without mentions rather than
@@ -695,7 +699,55 @@ func (s *Store) resolveMentions(ctx context.Context, sessionID, content string) 
 			}
 		}
 	}
+	for _, name := range mentionedNames(content, participants) {
+		for _, p := range participants {
+			if strings.EqualFold(p.DisplayName, name) {
+				add(p.ID)
+			}
+		}
+	}
 	return mentions
+}
+
+// mentionedNames returns the participant display names mentioned as
+// "@<name>" in content: case-insensitive, spaces allowed. At each "@" the
+// longest matching name wins, so a name that merely prefixes a longer one
+// ("Beta" vs "Beta 2") does not fire on the longer name's mention. Untitled
+// identities (display name == id) are excluded — their id path already
+// covers them.
+func mentionedNames(content string, participants []Agent) []string {
+	lower := strings.ToLower(content)
+	var names []string
+	seen := map[string]bool{}
+	for i := 0; i < len(lower); i++ {
+		if lower[i] != '@' {
+			continue
+		}
+		// The "@" must open a token: not mid-word (so a@b is no mention).
+		if i > 0 && isMentionChar(lower[i-1]) {
+			continue
+		}
+		rest := lower[i+1:]
+		best := ""
+		for _, p := range participants {
+			name := strings.ToLower(p.DisplayName)
+			if name == "" || strings.EqualFold(name, p.ID) || len(name) <= len(best) {
+				continue
+			}
+			if !strings.HasPrefix(rest, name) {
+				continue
+			}
+			if after := rest[len(name):]; after != "" && isMentionChar(after[0]) {
+				continue // part of a longer word ("@Alpha2")
+			}
+			best = name
+		}
+		if best != "" && !seen[best] {
+			seen[best] = true
+			names = append(names, best)
+		}
+	}
+	return names
 }
 
 // mentionTokens extracts the distinct @tokens in content: an "@" followed by

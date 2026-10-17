@@ -260,6 +260,7 @@ func TestJoinSession(t *testing.T) {
 	s := newTestStore(t)
 	mustAgent(t, s, "a")
 	mustAgent(t, s, "b")
+	mustAgent(t, s, "c")
 	if _, err := s.CreateSession(ctx, "s1", "one", "a", nil); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
@@ -281,6 +282,21 @@ func TestJoinSession(t *testing.T) {
 	msgs, _ = s.MessagesSince(ctx, "", "s1", 0, 10)
 	if len(msgs) != 1 {
 		t.Fatalf("no extra message expected, got %d", len(msgs))
+	}
+	// An archived session is frozen: no new participants, and no join notice
+	// written into it (the panel and the API both surface this as a 409).
+	if err := s.SetSessionStatus(ctx, "s1", "archived"); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	if joined, err := s.JoinSession(ctx, "s1", "c"); !errors.Is(err, ErrConflict) || joined {
+		t.Fatalf("joining an archived session should conflict: %v %v", joined, err)
+	}
+	if ok, err := s.IsParticipant(ctx, "s1", "c"); err != nil || ok {
+		t.Fatalf("a refused join must not add a participant: %v %v", ok, err)
+	}
+	msgs, _ = s.MessagesSince(ctx, "", "s1", 0, 10)
+	if len(msgs) != 1 {
+		t.Fatalf("a refused join must not write a notice, got %d messages", len(msgs))
 	}
 	if _, err := s.JoinSession(ctx, "nope", "b"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected not found, got %v", err)

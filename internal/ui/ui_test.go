@@ -1049,6 +1049,9 @@ func TestPanelArchiveAndDeleteSession(t *testing.T) {
 	if _, err := st.CreateAgent(ctx, "role-x", "Fix read marks", "opencode", "h", "/w", "ses_x"); err != nil {
 		t.Fatalf("create role: %v", err)
 	}
+	if _, err := st.CreateAgent(ctx, "role-y", "Spare role", "opencode", "h", "/w2", "ses_y"); err != nil {
+		t.Fatalf("create spare role: %v", err)
+	}
 	if _, err := st.CreateSession(ctx, "s1", "panel lifecycle", "admin", []string{"role-x"}); err != nil {
 		t.Fatalf("create s1: %v", err)
 	}
@@ -1112,6 +1115,22 @@ func TestPanelArchiveAndDeleteSession(t *testing.T) {
 	}
 	if strings.Contains(string(body), `id="compose"`) || strings.Contains(string(body), "Set context</button>") {
 		t.Fatalf("archived session must not offer the composer or context form:\n%s", string(body))
+	}
+	// The add-participant picker is gone too, and the join request the browser
+	// could still make is refused server-side (like the API's join).
+	if strings.Contains(string(body), `action="/panel/sessions/s1/join"`) {
+		t.Fatalf("archived session must not offer the join picker:\n%s", string(body))
+	}
+	resp, err = client.PostForm(srv.URL+"/panel/sessions/s1/join", url.Values{"agent": {"role-y"}})
+	if err != nil {
+		t.Fatalf("join archived: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("joining an archived session should 409: %d", resp.StatusCode)
+	}
+	if ok, err := st.IsParticipant(ctx, "s1", "role-y"); err != nil || ok {
+		t.Fatalf("refused panel join must not add a participant: %v %v", ok, err)
 	}
 	if !strings.Contains(string(body), `name="status" value="active"`) || !strings.Contains(string(body), `action="/panel/sessions/s1/delete"`) {
 		t.Fatalf("archived session should offer reopen + delete:\n%s", string(body))

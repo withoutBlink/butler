@@ -642,6 +642,21 @@ func (s *Store) JoinSession(ctx context.Context, sessionID, agentID string) (boo
 		return false, err
 	}
 	defer tx.Rollback()
+	// Only an active session accepts participants: an archived room is frozen
+	// — its history stays readable, but it gains no members until it is
+	// reopened. Enforced here (not just in the panel) so every path — the API,
+	// the panel picker, sibling registration's auto-join, the CLI, tests —
+	// obeys the same rule.
+	var status string
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM sessions WHERE id = ?`, sessionID).Scan(&status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, fmt.Errorf("%w: session %q", ErrNotFound, sessionID)
+		}
+		return false, err
+	}
+	if status != "active" {
+		return false, fmt.Errorf("%w: session %q is %s", ErrConflict, sessionID, status)
+	}
 	res, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO participants (session_id, agent_id, joined_at) VALUES (?, ?, ?)`, sessionID, agentID, now)
 	if err != nil {
 		if isFKErr(err) {

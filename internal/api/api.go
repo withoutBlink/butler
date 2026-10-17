@@ -240,7 +240,9 @@ func (a *API) writeStoreErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "not found")
 	case errors.Is(err, store.ErrConflict):
-		writeErr(w, http.StatusConflict, "conflict")
+		// Carry the reason ("session … is archived") instead of a bare
+		// "conflict": callers reason about the text.
+		writeErr(w, http.StatusConflict, strings.TrimPrefix(err.Error(), store.ErrConflict.Error()+": "))
 	default:
 		writeErr(w, http.StatusInternalServerError, "store error")
 	}

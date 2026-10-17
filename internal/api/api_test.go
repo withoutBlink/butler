@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -1274,5 +1275,57 @@ func TestDeleteSessionAPI(t *testing.T) {
 		if s.(map[string]any)["id"] == sid {
 			t.Fatalf("deleted session still listed: %v", s)
 		}
+	}
+}
+
+// An archived session is frozen for joins at the API too: the store refuses
+// it, so no participant row and no join notice are written (the panel checks
+// this itself, but joining is the one write that used to skip the guard).
+func TestJoinArchivedSessionAPI(t *testing.T) {
+	srv, _, _, agents := newTestAPI(t)
+	base := srv.URL
+
+	resp, body := req(t, "POST", base+"/api/v1/sessions", agents["alpha"].Token, map[string]any{"title": "frozen"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create session: %d %v", resp.StatusCode, body)
+	}
+	sid := body["id"].(string)
+	resp, body = req(t, "PATCH", base+"/api/v1/sessions/"+sid, agents["alpha"].Token, map[string]any{"status": "archived"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("archive: %d %v", resp.StatusCode, body)
+	}
+
+	resp, body = req(t, "POST", base+"/api/v1/sessions/"+sid+"/join", agents["gamma"].Token, nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("joining an archived session should 409: %d %v", resp.StatusCode, body)
+	}
+	if msg, _ := body["error"].(string); !strings.Contains(msg, "archived") {
+		t.Fatalf("conflict should say why: %v", body)
+	}
+
+	// gamma is not a participant and no notice landed in the frozen session.
+	resp, body = req(t, "GET", base+"/api/v1/sessions/"+sid, agents["alpha"].Token, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("session detail: %d %v", resp.StatusCode, body)
+	}
+	for _, p := range body["participants"].([]any) {
+		if p.(map[string]any)["id"] == agents["gamma"].ID {
+			t.Fatalf("refused join must not add a participant: %v", p)
+		}
+	}
+	resp, body = req(t, "GET", base+"/api/v1/sessions/"+sid+"/messages?after=0", agents["alpha"].Token, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("messages: %d %v", resp.StatusCode, body)
+	}
+	if len(body["messages"].([]any)) != 0 {
+		t.Fatalf("refused join must not write a notice: %v", body)
+	}
+
+	// Reopening restores joining.
+	if resp, body = req(t, "PATCH", base+"/api/v1/sessions/"+sid, agents["alpha"].Token, map[string]any{"status": "active"}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("reopen: %d %v", resp.StatusCode, body)
+	}
+	if resp, body = req(t, "POST", base+"/api/v1/sessions/"+sid+"/join", agents["gamma"].Token, nil); resp.StatusCode != http.StatusOK || body["joined"] != true {
+		t.Fatalf("join after reopen: %d %v", resp.StatusCode, body)
 	}
 }

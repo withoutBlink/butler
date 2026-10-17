@@ -671,8 +671,10 @@ func (s *Store) InsertMessage(ctx context.Context, m *Message) (*Message, error)
 // "agents that should reply", and a message is not addressed to its writer
 // (a role quoting its own title or id, or any "@all" post, would otherwise
 // self-resolve and show up in its own wait output as "(mentioned you)").
-// Tokens that match no participant resolve to nothing — mentioning only
-// reaches agents already in the session.
+// A backslash-escaped "\@" is literal, so a message can quote the syntax
+// ("say \@all to address the room") without addressing anyone. Tokens that
+// match no participant resolve to nothing — mentioning only reaches agents
+// already in the session.
 func (s *Store) resolveMentions(ctx context.Context, sessionID, senderID, content string) []string {
 	tokens := mentionTokens(content)
 	participants, err := s.Participants(ctx, sessionID)
@@ -727,8 +729,9 @@ func mentionedNames(content string, participants []Agent) []string {
 		if lower[i] != '@' {
 			continue
 		}
-		// The "@" must open a token: not mid-word (so a@b is no mention).
-		if i > 0 && isMentionChar(lower[i-1]) {
+		// The "@" must open a token: not mid-word (so a@b is no mention)
+		// and not backslash-escaped ("\@all" is prose about mentions).
+		if i > 0 && (isMentionChar(lower[i-1]) || isEscapedAt(lower, i)) {
 			continue
 		}
 		rest := lower[i+1:]
@@ -756,12 +759,17 @@ func mentionedNames(content string, participants []Agent) []string {
 
 // mentionTokens extracts the distinct @tokens in content: an "@" followed by
 // agent-id characters (letters, digits, ":", "_", "-"). Emails and other @
-// uses only match when they happen to equal a participant id or kind.
+// uses only match when they happen to equal a participant id or kind. A
+// backslash-escaped "\@" is literal — it lets a message discuss the mention
+// syntax itself ("quote \@all in a doc") without addressing the room.
 func mentionTokens(content string) []string {
 	var tokens []string
 	seen := map[string]bool{}
 	for i := 0; i < len(content); i++ {
 		if content[i] != '@' {
+			continue
+		}
+		if isEscapedAt(content, i) {
 			continue
 		}
 		j := i + 1
@@ -783,6 +791,18 @@ func mentionTokens(content string) []string {
 func isMentionChar(c byte) bool {
 	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
 		c == '_' || c == ':' || c == '-'
+}
+
+// isEscapedAt reports whether the "@" at index i is backslash-escaped
+// ("\@"): an even number of preceding backslashes escapes nothing, an odd
+// number escapes the "@" — so "\\@" is a literal backslash followed by a
+// real mention.
+func isEscapedAt(content string, i int) bool {
+	n := 0
+	for j := i - 1; j >= 0 && content[j] == '\\'; j-- {
+		n++
+	}
+	return n%2 == 1
 }
 
 // scanMentions decodes the mentions column; undecodable values (never

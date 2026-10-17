@@ -907,9 +907,12 @@ func TestMentionByDisplayName(t *testing.T) {
 		{"hey @alpha and @Beta hi", []string{"role-a", "role-c"}},
 		{"@Beta 2 please", []string{"role-b"}}, // longest name wins
 		{"@Beta hi", []string{"role-c"}},
-		{"@Outside hello", nil},                // not a participant
-		{"@role-a direct", []string{"role-a"}}, // ids still work
-		{"mail a@alpha.example", nil},          // mid-word "@" is no mention
+		{"@Outside hello", nil},                     // not a participant
+		{"@role-a direct", []string{"role-a"}},      // ids still work
+		{"mail a@alpha.example", nil},               // mid-word "@" is no mention
+		{`quote \@alpha and \@all as prose`, nil},   // escaped "@" is literal
+		{`\@Alpha, then @Beta`, []string{"role-c"}}, // only the real one fires
+		{`\\@alpha`, []string{"role-a"}},            // escaped backslash: real mention
 	}
 	for _, tc := range cases {
 		if got := mentions(tc.content); !reflect.DeepEqual(got, tc.want) {

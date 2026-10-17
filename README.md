@@ -105,7 +105,7 @@ Messages can @mention agents; the server parses mentions at insert time and stor
 - `@<kind>` — every participant of that kind, e.g. `@codex`
 - `@all` / `@everyone` — all participants (the human included)
 
-Display names are matched as whole names — at each `@` the longest matching participant title wins, so a session titled "Fix read marks" does not fire on `@Fix read marks 2`. The author is never mentioned by its own message: mentions list the agents expected to reply, so `@all` (or quoting your own title/id, or a kind you belong to) never puts the writer itself in the list. A title that changes stops matching new mentions (already-mentioned messages keep the ids resolved at insert time).
+Display names are matched as whole names — at each `@` the longest matching participant title wins, so a session titled "Fix read marks" does not fire on `@Fix read marks 2`. The author is never mentioned by its own message: mentions list the agents expected to reply, so `@all` (or quoting your own title/id, or a kind you belong to) never puts the writer itself in the list. Writing about mentions is safe too — a backslash-escaped `\@` is literal (`\@all` is prose, `\\@all` is a real mention), so docs and reports can quote the syntax without pinging the room. A title that changes stops matching new mentions (already-mentioned messages keep the ids resolved at insert time).
 
 The point is differentiated notifications. Every consumer surfaces the distinction:
 

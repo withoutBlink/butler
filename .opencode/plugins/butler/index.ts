@@ -39,6 +39,17 @@
 //     keeps serving sessions without a live role; a per-seq delivery map
 //     dedupes so the active session never sees a message twice.
 //
+// Cursors: a role's wait cursor persists in plugin storage (OpenCode tears
+// plugin contexts — and their loops — down whenever no client work is
+// active, so a revived role must still deliver the dead-window backlog),
+// and is clamped to the server's current seq at loop start and every ~10
+// idle polls: a server-side reset (`butler reset` recreates the DB, the
+// stream restarts at 0) leaves a persisted cursor ahead of every message
+// that will arrive for a long time, which silently starves the role with no
+// error. On a detected reset the role replays the fresh stream from the
+// start; the app-level loop is forward-only and skips to the server's
+// position instead.
+//
 // Options (when loaded via the `plugins` array in opencode.json):
 //   stateFile  — explicit path to the instance.json state file
 //   bridge     — always deliver the app-level relay to the "Butler" session
@@ -79,6 +90,7 @@ interface ButlerMessage {
 
 const WAIT_TIMEOUT_SECS = 25
 const MAX_BACKOFF_MS = 60_000
+const SEQ_RECHECK_POLLS = 10 // idle polls between stream-position checks
 const DELIVERED_TRACK = 300 // seqs kept in the delivery-dedup map
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -287,6 +299,51 @@ export default Plugin.define({
       }
     }
 
+    // fetchLatestSeq reads the server's current message seq, retrying while
+    // the server is unreachable. It returns -1 when the loop must stop
+    // (plugin aborted, or the role was evicted / its token revoked).
+    const fetchLatestSeq = async (entry: SessionAgent): Promise<number> => {
+      let backoff = 0
+      for (;;) {
+        if (aborted()) return -1
+        try {
+          const res = await butlerFetch(entry, "/api/v1/seq")
+          if (res.status === 401) {
+            // Evicted (kicked) or the server DB was recreated: stop this
+            // loop. Only `ensureSessionAgent` (the session's next model
+            // request) brings the role back — re-registering HERE would
+            // defeat kicks.
+            sessionAgents.delete(entry.sid)
+            console.error(`[butler] session agent ${entry.agent} got 401 on seq (evicted?); stopping its loop`)
+            return -1
+          }
+          if (!res.ok) throw new Error(`seq: HTTP ${res.status}`)
+          const body = (await res.json()) as { latest_seq?: number }
+          return body.latest_seq ?? 0
+        } catch (err: any) {
+          if (aborted() || err?.name === "AbortError") return -1
+          backoff = Math.min(backoff ? backoff * 2 : 2_000, MAX_BACKOFF_MS)
+          await sleep(backoff, controller.signal)
+        }
+      }
+    }
+
+    // applyLatest keeps a role cursor inside the server's stream. The cursor
+    // indexes messages in the server DB, so a server-side reset (fresh DB,
+    // seq restarted at 0 — `butler reset`) leaves a persisted cursor far
+    // ahead of every message that will arrive for a long time, silently
+    // starving the loop. A reset therefore replays the fresh stream from the
+    // start: the role's read marks died with the old DB. Returns true when
+    // the cursor was reset.
+    const applyLatest = (entry: SessionAgent, latest: number): boolean => {
+      if (latest >= entry.cursor) return false
+      console.error(
+        `[butler] server stream restarted (seq ${latest} < cursor ${entry.cursor}); replaying ${entry.sid} from the start`,
+      )
+      entry.cursor = 0
+      return true
+    }
+
     const startSessionLoop = (entry: SessionAgent) => {
       void (async () => {
         // The cursor persists in plugin storage: OpenCode tears plugin
@@ -302,27 +359,23 @@ export default Plugin.define({
           const saved = await ctx.storage.get(cursorKey)
           if (typeof saved === "number") savedCursor = saved
         } catch {}
-        let backoff = 0
-        if (savedCursor >= 0) {
-          entry.cursor = savedCursor
+        const latest = await fetchLatestSeq(entry)
+        if (latest < 0) return // aborted or evicted
+        if (savedCursor < 0) {
+          entry.cursor = latest
         } else {
-          for (;;) {
-            if (aborted()) return
+          entry.cursor = savedCursor
+          if (applyLatest(entry, latest)) {
+            // Persist the reset right away: the stream replay must not be
+            // lost to a teardown before the first batch is relayed.
+            savedCursor = entry.cursor
             try {
-              const res = await butlerFetch(entry, "/api/v1/seq")
-              if (res.status === 401) throw new Error("401")
-              if (!res.ok) throw new Error(`seq: HTTP ${res.status}`)
-              const body = (await res.json()) as { latest_seq?: number }
-              entry.cursor = body.latest_seq ?? 0
-              break
-            } catch (err: any) {
-              if (aborted() || err?.name === "AbortError") return
-              backoff = Math.min(backoff ? backoff * 2 : 2_000, MAX_BACKOFF_MS)
-              await sleep(backoff, controller.signal)
-            }
+              await ctx.storage.set(cursorKey, entry.cursor)
+            } catch {}
           }
         }
-        backoff = 0
+        let backoff = 0
+        let idle = 0
         for (;;) {
           if (aborted()) return
           try {
@@ -361,6 +414,22 @@ export default Plugin.define({
               try {
                 await ctx.storage.set(cursorKey, entry.cursor)
               } catch {}
+            }
+            // An empty batch carries no stream position, so ask for the
+            // server's seq occasionally: a reset while this loop is alive
+            // would otherwise leave it waiting on a seq that never arrives.
+            if ((body.messages ?? []).length > 0) {
+              idle = 0
+            } else if (++idle >= SEQ_RECHECK_POLLS) {
+              idle = 0
+              const current = await fetchLatestSeq(entry)
+              if (current < 0) return // aborted or evicted
+              if (applyLatest(entry, current)) {
+                savedCursor = entry.cursor
+                try {
+                  await ctx.storage.set(cursorKey, entry.cursor)
+                } catch {}
+              }
             }
           } catch (err: any) {
             if (aborted() || err?.name === "AbortError") return
@@ -500,11 +569,17 @@ export default Plugin.define({
         try {
           const res = await butlerFetch(getApp()!, "/api/v1/agents/roles")
           if (res.status === 401) {
+            // A rotated/revoked client token: adopt a *different* state
+            // file and retry once. Re-reading the same dead token must not
+            // `continue` (that spins at request speed — it once hit the
+            // server ~1750 times a second): fall through to the quiet
+            // retry below until butler-mcp writes a fresh one.
             const fresh = readInstance()
-            if (fresh) {
+            if (fresh && fresh.token !== app?.token) {
               app = fresh
               continue
             }
+            throw new Error("roles: HTTP 401")
           }
           if (!res.ok) throw new Error(`roles: HTTP ${res.status}`)
           const body = (await res.json()) as {
@@ -583,6 +658,7 @@ export default Plugin.define({
       // Long-poll forever. Messages a session-agent loop already delivered
       // to the resolved target are skipped (per-seq dedup).
       backoff = 0
+      let idle = 0
       for (;;) {
         if (aborted()) return
         try {
@@ -625,6 +701,27 @@ export default Plugin.define({
             }
           }
           cursor = Math.max(cursor, latest)
+          // Stream-position recheck: an empty batch carries no seq, so this
+          // forward-only loop would otherwise starve on a cursor left ahead
+          // by a server DB reset. Unlike the role loops it never replays
+          // history — it just skips to the server's current position (roles
+          // own the backlog).
+          if ((body.messages ?? []).length > 0) {
+            idle = 0
+          } else if (++idle >= SEQ_RECHECK_POLLS) {
+            idle = 0
+            const seqRes = await butlerFetch(getApp()!, "/api/v1/seq")
+            if (seqRes.ok) {
+              const seqBody = (await seqRes.json()) as { latest_seq?: number }
+              const now = seqBody.latest_seq ?? 0
+              if (now < cursor) {
+                console.error(
+                  `[butler] server stream restarted (seq ${now} < cursor ${cursor}); client loop skipping to ${now}`,
+                )
+                cursor = now
+              }
+            }
+          }
         } catch (err: any) {
           if (aborted() || err?.name === "AbortError") return
           backoff = Math.min(backoff ? backoff * 2 : 2_000, MAX_BACKOFF_MS)

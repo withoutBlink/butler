@@ -1329,3 +1329,82 @@ func TestJoinArchivedSessionAPI(t *testing.T) {
 		t.Fatalf("join after reopen: %d %v", resp.StatusCode, body)
 	}
 }
+
+// Removing a participant: the creator (or admin) may take anyone out, an agent
+// may take itself out, and nobody else may touch the membership. The removed
+// agent stays registered — it just stops being in that session.
+func TestRemoveParticipantAPI(t *testing.T) {
+	srv, adminTok, _, agents := newTestAPI(t)
+	base := srv.URL
+
+	resp, body := req(t, "POST", base+"/api/v1/sessions", agents["alpha"].Token, map[string]any{
+		"title":        "curate me",
+		"participants": []string{agents["beta"].ID, agents["gamma"].ID},
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create session: %d %v", resp.StatusCode, body)
+	}
+	sid := body["id"].(string)
+	removeURL := base + "/api/v1/sessions/" + sid + "/participants/"
+
+	// A plain participant may not remove someone else.
+	if resp, body = req(t, "DELETE", removeURL+agents["alpha"].ID, agents["gamma"].Token, nil); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("non-creator removal should 403: %d %v", resp.StatusCode, body)
+	}
+	// Unknown membership and unknown sessions are 404s.
+	if resp, _ = req(t, "DELETE", removeURL+"11111111-2222-3333-4444-555555555555", agents["alpha"].Token, nil); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown participant should 404: %d", resp.StatusCode)
+	}
+	if resp, _ = req(t, "DELETE", base+"/api/v1/sessions/nope/participants/"+agents["beta"].ID, adminTok, nil); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown session should 404: %d", resp.StatusCode)
+	}
+	// The creator removes beta.
+	if resp, body = req(t, "DELETE", removeURL+agents["beta"].ID, agents["alpha"].Token, nil); resp.StatusCode != http.StatusOK || body["removed"] != true {
+		t.Fatalf("remove beta: %d %v", resp.StatusCode, body)
+	}
+	if resp, body = req(t, "GET", base+"/api/v1/sessions/"+sid, agents["alpha"].Token, nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("session detail: %d %v", resp.StatusCode, body)
+	}
+	for _, p := range body["participants"].([]any) {
+		if p.(map[string]any)["id"] == agents["beta"].ID {
+			t.Fatalf("beta should be out of the session: %v", p)
+		}
+	}
+	// The removal notice is in the session (by display id here: untitled test
+	// agents), and the removed agent no longer receives the session's traffic.
+	resp, body = req(t, "GET", base+"/api/v1/sessions/"+sid+"/messages?after=0", agents["alpha"].Token, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("messages: %d %v", resp.StatusCode, body)
+	}
+	msgs := body["messages"].([]any)
+	last := msgs[len(msgs)-1].(map[string]any)
+	if last["kind"] != "system" || !strings.Contains(last["content"].(string), "was removed from the session by") {
+		t.Fatalf("removal notice missing: %v", last)
+	}
+	if resp, body = req(t, "POST", base+"/api/v1/sessions/"+sid+"/messages", agents["alpha"].Token, map[string]any{"content": "after the removal"}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("post: %d %v", resp.StatusCode, body)
+	}
+	resp, body = req(t, "GET", base+"/api/v1/wait?after=0&timeout=1", agents["beta"].Token, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("wait: %d %v", resp.StatusCode, body)
+	}
+	if got := body["messages"]; got != nil && len(got.([]any)) != 0 {
+		t.Fatalf("a removed agent should receive nothing from that session: %v", got)
+	}
+
+	// An agent may remove itself ("leave").
+	if resp, body = req(t, "DELETE", removeURL+agents["gamma"].ID, agents["gamma"].Token, nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("self-removal: %d %v", resp.StatusCode, body)
+	}
+	// Admin may remove anyone.
+	if resp, body = req(t, "DELETE", removeURL+agents["alpha"].ID, adminTok, nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("admin removal: %d %v", resp.StatusCode, body)
+	}
+	// Archived sessions are frozen.
+	if resp, body = req(t, "PATCH", base+"/api/v1/sessions/"+sid, adminTok, map[string]any{"status": "archived"}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("archive: %d %v", resp.StatusCode, body)
+	}
+	if resp, body = req(t, "DELETE", removeURL+agents["gamma"].ID, adminTok, nil); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("removal from an archived session should 409: %d %v", resp.StatusCode, body)
+	}
+}

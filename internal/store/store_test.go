@@ -402,6 +402,106 @@ func TestDeleteSession(t *testing.T) {
 	}
 }
 
+// Removing a participant is the mirror of joining: the row goes, the agent's
+// read cursor for that session goes, a notice names the actor, and nothing
+// else about the agent changes. Membership changes only happen on active
+// sessions, and the global session is only protected from archive/delete.
+func TestRemoveParticipant(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+	for _, id := range []string{"admin", "a", "b", "c"} {
+		mustAgent(t, s, id)
+	}
+	if _, err := s.CreateSession(ctx, "s1", "one", "a", []string{"b", "c"}); err != nil {
+		t.Fatalf("create s1: %v", err)
+	}
+	if _, err := s.CreateSession(ctx, "s2", "two", "a", []string{"b"}); err != nil {
+		t.Fatalf("create s2: %v", err)
+	}
+	msg, err := s.InsertMessage(ctx, &Message{SessionID: "s1", SenderID: "a", Kind: "chat", Content: "hello"})
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := s.MarkRead(ctx, "s1", "b", msg.Seq); err != nil {
+		t.Fatalf("mark read: %v", err)
+	}
+	if err := s.MarkRead(ctx, "s2", "b", msg.Seq); err != nil {
+		t.Fatalf("mark read s2: %v", err)
+	}
+
+	if err := s.RemoveParticipant(ctx, "s1", "b", "admin"); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if ok, err := s.IsParticipant(ctx, "s1", "b"); err != nil || ok {
+		t.Fatalf("b should be out of s1: %v %v", ok, err)
+	}
+	if ok, err := s.IsParticipant(ctx, "s2", "b"); err != nil || !ok {
+		t.Fatalf("b must keep its other sessions: %v %v", ok, err)
+	}
+	if marks, err := s.ReadMarks(ctx, "s1"); err != nil || len(marks) != 0 {
+		t.Fatalf("the removed agent's cursor for s1 should be gone: %v %v", marks, err)
+	}
+	if marks, err := s.ReadMarks(ctx, "s2"); err != nil || marks["b"] != msg.Seq {
+		t.Fatalf("other sessions' cursors must survive: %v %v", marks, err)
+	}
+	// The notice names the subject and the actor by display title (here both
+	// are their ids: the test agents are untitled).
+	msgs, err := s.MessagesSince(ctx, "", "s1", 0, 20)
+	if err != nil {
+		t.Fatalf("messages: %v", err)
+	}
+	last := msgs[len(msgs)-1]
+	if last.Kind != "system" || last.Content != "b was removed from the session by admin" || last.SenderID != "b" {
+		t.Fatalf("removal notice: %+v", last)
+	}
+
+	// A self-removal reads as leaving.
+	if err := s.RemoveParticipant(ctx, "s1", "c", "c"); err != nil {
+		t.Fatalf("leave: %v", err)
+	}
+	msgs, _ = s.MessagesSince(ctx, "", "s1", 0, 20)
+	if last := msgs[len(msgs)-1]; last.Content != "c left the session" {
+		t.Fatalf("leave notice: %+v", last)
+	}
+
+	// Unknown membership, unknown session.
+	if err := s.RemoveParticipant(ctx, "s1", "admin", "admin"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("non-participant should be not found: %v", err)
+	}
+	if err := s.RemoveParticipant(ctx, "nope", "a", "admin"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown session should be not found: %v", err)
+	}
+
+	// Archived sessions are frozen: no membership change either way.
+	if err := s.SetSessionStatus(ctx, "s2", "archived"); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	if err := s.RemoveParticipant(ctx, "s2", "b", "admin"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("removing from an archived session should conflict: %v", err)
+	}
+	if ok, err := s.IsParticipant(ctx, "s2", "b"); err != nil || !ok {
+		t.Fatalf("the refused removal must not drop the participant: %v %v", ok, err)
+	}
+	if _, err := s.JoinSession(ctx, "s2", "c"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("joining an archived session should still conflict: %v", err)
+	}
+
+	// Only archive/delete are refused for the fixed global session — leaving
+	// it is a membership change like any other (registration re-joins).
+	if _, err := s.EnsureGlobalSession(ctx, "admin"); err != nil {
+		t.Fatalf("global: %v", err)
+	}
+	if ok, err := s.JoinSession(ctx, GlobalSessionID, "c"); err != nil || !ok {
+		t.Fatalf("join global: %v %v", ok, err)
+	}
+	if err := s.RemoveParticipant(ctx, GlobalSessionID, "c", "c"); err != nil {
+		t.Fatalf("leaving the global session should work: %v", err)
+	}
+	if ok, err := s.IsParticipant(ctx, GlobalSessionID, "c"); err != nil || ok {
+		t.Fatalf("c should be out of global: %v %v", ok, err)
+	}
+}
+
 func TestMessagesSince(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)

@@ -179,6 +179,7 @@ func (p *Panel) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /panel/sessions", p.createSession)
 	mux.HandleFunc("GET /panel/sessions/{id}", p.sessionView)
 	mux.HandleFunc("POST /panel/sessions/{id}/join", p.joinParticipant)
+	mux.HandleFunc("POST /panel/sessions/{id}/participants/{agent}/remove", p.removeParticipant)
 	mux.HandleFunc("POST /panel/sessions/{id}/status", p.setSessionStatus)
 	mux.HandleFunc("POST /panel/sessions/{id}/delete", p.deleteSession)
 	mux.HandleFunc("POST /panel/sessions/{id}/messages", p.postMessage)
@@ -457,8 +458,10 @@ func (p *Panel) announceEviction(ctx context.Context, agent *store.Agent) {
 }
 
 type sessionViewData struct {
-	Session      store.Session
-	Participants []store.Agent
+	Session store.Session
+	// Participants feeds the shared "participants" fragment (the sidebar):
+	// the agents plus the session id and whether rows get a remove control.
+	Participants participantsView
 	Messages     []uiMsg
 	ContextItems []store.ContextItem
 	LatestSeq    int64
@@ -479,6 +482,17 @@ type sessionViewData struct {
 	// composer, add-participant picker and context form are hidden and the
 	// banner points at the dashboard, where archive/reopen/delete live.
 	Archived bool
+}
+
+// participantsView feeds the shared "participants" fragment — the session
+// sidebar and its periodic SSE "presence" re-sends. Besides the agents it
+// carries the session id and whether membership can change: each row gets a
+// remove control on an active session (archived means frozen both ways, so
+// the control is hidden and the store/panel refuse the request).
+type participantsView struct {
+	SessionID string
+	CanRemove bool
+	Agents    []store.Agent
 }
 
 // agentOption is one entry of the session view's add-participant picker.
@@ -671,11 +685,43 @@ func (p *Panel) sessionView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.render(w, http.StatusOK, "session.tmpl", sessionViewData{
-		Session: *sess, Participants: parts, Messages: p.attachReadState(ctx, rs, msgs), ContextItems: items, LatestSeq: latest,
+		Session:      *sess,
+		Participants: participantsView{SessionID: sid, CanRemove: sess.Status == "active", Agents: parts},
+		Messages:     p.attachReadState(ctx, rs, msgs), ContextItems: items, LatestSeq: latest,
 		Mentionables: string(mentionables), Agents: string(agentsJSON), Reads: string(readsJSON),
 		Addable:  p.addableAgents(ctx, parts),
 		Archived: sess.Status != "active",
 	})
+}
+
+// removeParticipant is the participants sidebar's per-row control: the agent
+// leaves the session (or is taken out of it) without being evicted — it stays
+// registered, keeps its other sessions and the add-participant picker can put
+// it back. The store writes the "left"/"was removed by admin" notice and drops
+// the agent's read cursor for the session; archived sessions are frozen, so the
+// control is hidden then and the store would refuse anyway (409).
+func (p *Panel) removeParticipant(w http.ResponseWriter, r *http.Request) {
+	if !p.requirePanel(w, r) {
+		return
+	}
+	if !sameOrigin(r) {
+		http.Error(w, "cross-origin rejected", http.StatusForbidden)
+		return
+	}
+	sid := r.PathValue("id")
+	agentID := r.PathValue("agent")
+	ctx := r.Context()
+	if agentID == "" {
+		p.httpError(w, "participant required", http.StatusBadRequest)
+		return
+	}
+	if err := p.Store.RemoveParticipant(ctx, sid, agentID, AdminAgentID); err != nil {
+		p.storeErr(w, err)
+		return
+	}
+	p.Log.Info("panel removed participant", "session", sid, "agent", agentID)
+	p.fanout(ctx, sid)
+	http.Redirect(w, r, "/panel/sessions/"+sid, http.StatusSeeOther)
 }
 
 // joinParticipant is the participants-area "add" form on the session view:
@@ -998,8 +1044,17 @@ func (p *Panel) stream(w http.ResponseWriter, r *http.Request) {
 			emitReads()
 		case <-ticker.C:
 			cancel()
+			// The presence re-send also refreshes the participants list, so a
+			// join/removal lands in every open panel within one heartbeat. A
+			// session deleted under an open tab just goes on heartbeating (the
+			// table is gone, so no remove controls): closing the stream would
+			// make the browser's EventSource retry 404s in a loop.
 			if parts, err := p.Store.Participants(ctx, sid); err == nil {
-				writeSSE(w, flusher, "presence", p.fragment("participants", parts))
+				canRemove := false
+				if sess, err := p.Store.GetSession(ctx, sid); err == nil {
+					canRemove = sess.Status == "active"
+				}
+				writeSSE(w, flusher, "presence", p.fragment("participants", participantsView{SessionID: sid, CanRemove: canRemove, Agents: parts}))
 			} else {
 				writeSSEPing(w, flusher)
 			}

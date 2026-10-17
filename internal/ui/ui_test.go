@@ -1225,3 +1225,135 @@ func TestPanelArchiveAndDeleteSession(t *testing.T) {
 		t.Fatalf("deleting an unknown session should 404: %d", resp.StatusCode)
 	}
 }
+
+// The participants sidebar's remove control: one ✕ per row on an active
+// session (the notice names the actor), hidden and refused once the session is
+// archived, and the removed role keeps everything else — it stays registered
+// and keeps its other sessions.
+func TestPanelRemoveParticipant(t *testing.T) {
+	srv, st, _, adminTok := newPanel(t)
+	ctx := context.Background()
+	if _, err := st.CreateAgent(ctx, "admin", "Admin", "human", "", "", ""); err != nil {
+		t.Fatalf("create admin: %v", err)
+	}
+	if _, err := st.CreateAgent(ctx, "role-x", "Fix read marks", "opencode", "h", "/w", "ses_x"); err != nil {
+		t.Fatalf("create role-x: %v", err)
+	}
+	if _, err := st.CreateAgent(ctx, "role-y", "Develop butler", "opencode", "h", "/w2", "ses_y"); err != nil {
+		t.Fatalf("create role-y: %v", err)
+	}
+	if _, err := st.CreateSession(ctx, "s1", "the meeting", "admin", []string{"role-x", "role-y"}); err != nil {
+		t.Fatalf("create s1: %v", err)
+	}
+	if _, err := st.CreateSession(ctx, "s2", "other work", "admin", []string{"role-x"}); err != nil {
+		t.Fatalf("create s2: %v", err)
+	}
+
+	client := newBrowser(t)
+	login(t, client, srv.URL, adminTok)
+
+	resp, err := client.Get(srv.URL + "/panel/sessions/s1")
+	if err != nil {
+		t.Fatalf("session view: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	for _, want := range []string{
+		`action="/panel/sessions/s1/participants/role-x/remove"`,
+		`action="/panel/sessions/s1/participants/role-y/remove"`,
+		`action="/panel/sessions/s1/participants/admin/remove"`,
+		`aria-label="Remove Fix read marks from this session"`,
+		`class="rowbtn"`,
+		`onclick="return confirm('Remove Fix read marks from this session?`,
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("participants sidebar missing %q in:\n%s", want, string(body))
+		}
+	}
+
+	// Remove role-x: back to the session, gone from the participants, notice
+	// written, other sessions untouched.
+	resp, err = client.PostForm(srv.URL+"/panel/sessions/s1/participants/role-x/remove", nil)
+	if err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/panel/sessions/s1" {
+		t.Fatalf("remove redirect: %d %s", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	if ok, err := st.IsParticipant(ctx, "s1", "role-x"); err != nil || ok {
+		t.Fatalf("role-x should be out of s1: %v %v", ok, err)
+	}
+	if ok, err := st.IsParticipant(ctx, "s1", "role-y"); err != nil || !ok {
+		t.Fatalf("role-y must stay in s1: %v %v", ok, err)
+	}
+	if ok, err := st.IsParticipant(ctx, "s2", "role-x"); err != nil || !ok {
+		t.Fatalf("role-x must keep its other session: %v %v", ok, err)
+	}
+	msgs, err := st.MessagesSince(ctx, "", "s1", 0, 20)
+	if err != nil {
+		t.Fatalf("messages: %v", err)
+	}
+	if last := msgs[len(msgs)-1]; last.Kind != "system" || last.Content != "Fix read marks was removed from the session by Admin" {
+		t.Fatalf("removal notice: %+v", last)
+	}
+	// The page now lists role-y (still removable) without role-x, notice
+	// rendered as a system message.
+	resp, err = client.Get(srv.URL + "/panel/sessions/s1")
+	if err != nil {
+		t.Fatalf("session view: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if strings.Contains(string(body), `participants/role-x/remove`) {
+		t.Fatalf("role-x should no longer have a remove control:\n%s", string(body))
+	}
+	if !strings.Contains(string(body), `participants/role-y/remove`) || !strings.Contains(string(body), "Fix read marks was removed from the session by Admin") {
+		t.Fatalf("role-y's control or the notice is missing:\n%s", string(body))
+	}
+
+	// A non-participant (or unknown session) is a 404, never a silent success.
+	resp, err = client.PostForm(srv.URL+"/panel/sessions/s1/participants/role-x/remove", nil)
+	if err != nil {
+		t.Fatalf("remove twice: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("removing a non-participant should 404: %d", resp.StatusCode)
+	}
+	resp, err = client.PostForm(srv.URL+"/panel/sessions/nope/participants/role-y/remove", nil)
+	if err != nil {
+		t.Fatalf("remove unknown session: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("removing from an unknown session should 404: %d", resp.StatusCode)
+	}
+
+	// Archived: the control disappears and the request is refused.
+	resp, err = client.PostForm(srv.URL+"/panel/sessions/s1/status", url.Values{"status": {"archived"}})
+	if err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	resp.Body.Close()
+	resp, err = client.Get(srv.URL + "/panel/sessions/s1")
+	if err != nil {
+		t.Fatalf("session view: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if strings.Contains(string(body), `participants/role-y/remove`) {
+		t.Fatalf("an archived session must not offer remove controls:\n%s", string(body))
+	}
+	resp, err = client.PostForm(srv.URL+"/panel/sessions/s1/participants/role-y/remove", nil)
+	if err != nil {
+		t.Fatalf("remove archived: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("removing from an archived session should 409: %d", resp.StatusCode)
+	}
+	if ok, err := st.IsParticipant(ctx, "s1", "role-y"); err != nil || !ok {
+		t.Fatalf("the refused removal must not drop role-y: %v %v", ok, err)
+	}
+}

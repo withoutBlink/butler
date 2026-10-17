@@ -53,6 +53,11 @@ const (
 	identityKey
 )
 
+// adminAgentID is the panel human's identity, the one row the admin token
+// posts as (and the creator of panel-made sessions). Admin-token removals are
+// attributed to it in the session notice.
+const adminAgentID = "admin"
+
 type Identity struct {
 	Agent *store.Agent
 	Kind  *store.Kind // kind token: only authorizes registration
@@ -93,6 +98,7 @@ func (a *API) Routes() http.Handler {
 	route("PATCH /api/v1/sessions/{id}", a.patchSession)
 	route("DELETE /api/v1/sessions/{id}", a.deleteSession)
 	route("POST /api/v1/sessions/{id}/join", a.joinSession)
+	route("DELETE /api/v1/sessions/{id}/participants/{agent}", a.removeParticipant)
 	route("GET /api/v1/sessions/{id}/messages", a.sessionMessages)
 	route("POST /api/v1/sessions/{id}/messages", a.postMessage)
 	route("GET /api/v1/sessions/{id}/context", a.listContext)
@@ -918,6 +924,42 @@ func (a *API) joinSession(w http.ResponseWriter, r *http.Request) {
 		a.notifySession(r.Context(), sid)
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"joined": joined})
+}
+
+// removeParticipant drops one agent from a session (the panel's participants
+// list, or an agent taking itself out). Allowed for admin, the session creator
+// and the agent itself — the same trust shape as join: membership is not a
+// destructive act, so the creator keeps control of their session and anyone
+// can leave. The store refuses archived sessions (409) and unknown
+// session/membership (404), and writes the "left"/"was removed by" notice.
+func (a *API) removeParticipant(w http.ResponseWriter, r *http.Request) {
+	ident, ok := a.requireAuth(w, r)
+	if !ok {
+		return
+	}
+	sid := r.PathValue("id")
+	target := r.PathValue("agent")
+	sess, err := a.Store.GetSession(r.Context(), sid)
+	if err != nil {
+		a.writeStoreErr(w, err)
+		return
+	}
+	actor := adminAgentID
+	self := ident.Agent != nil && ident.Agent.ID == target
+	if ident.Agent != nil {
+		actor = ident.Agent.ID
+	}
+	if !ident.Admin && (ident.Agent == nil || (ident.Agent.ID != sess.CreatedBy && !self)) {
+		writeErr(w, http.StatusForbidden, "only admin, the session creator or the agent itself may remove a participant")
+		return
+	}
+	if err := a.Store.RemoveParticipant(r.Context(), sid, target, actor); err != nil {
+		a.writeStoreErr(w, err)
+		return
+	}
+	a.notifySession(r.Context(), sid)
+	a.Log.Info("removed participant", "session", sid, "agent", target, "actor", actor)
+	writeJSON(w, http.StatusOK, map[string]any{"session": sid, "agent": target, "removed": true})
 }
 
 func (a *API) sessionMessages(w http.ResponseWriter, r *http.Request) {

@@ -100,9 +100,15 @@ tr.archived td { opacity: 0.6; }
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--border); }
 .dot.on { background: var(--ok); }
 #participants ul { margin: 0; padding: 0; }
-#participants li { padding: 4px 0 4px 16px; }
+#participants li { padding: 4px 0 4px 16px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+/* The remove control sits at the end of the name line; the workdir keeps its
+   own line below. */
+#participants li form { margin-left: auto; }
+.rowbtn { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; padding: 0; background: transparent; color: var(--muted); border: none; border-radius: 4px; cursor: pointer; opacity: 0.55; }
+.rowbtn svg { width: 13px; height: 13px; }
+.rowbtn:hover { opacity: 1; color: var(--err); background: var(--row); }
 #participants .id { font-size: 12px; }
-#participants small { display: block; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#participants small { display: block; flex-basis: 100%; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .context dl { margin: 0; }
 .context dt { font-weight: 600; margin-top: 8px; }
 .context dd { margin: 2px 0 0 0; white-space: pre-wrap; word-break: break-word; }

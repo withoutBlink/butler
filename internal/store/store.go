@@ -675,16 +675,77 @@ func (s *Store) JoinSession(ctx context.Context, sessionID, agentID string) (boo
 	// untitled identities (app-level ones are labeled with their own id by
 	// design) fall back to the id. Resolved at insert time, exactly like
 	// mentions: a later rename does not rewrite a stored notice.
-	label := agentID
-	var display string
-	if err := tx.QueryRowContext(ctx, `SELECT display_name FROM agents WHERE id = ?`, agentID).Scan(&display); err == nil && display != "" {
-		label = display
-	}
+	label := noticeLabelTx(ctx, tx, agentID)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO messages (id, session_id, sender_id, kind, content, created_at) VALUES (?, ?, ?, 'system', ?, ?)`,
 		ids.New(), sessionID, agentID, label+" joined the session", now); err != nil {
 		return false, err
 	}
 	return true, tx.Commit()
+}
+
+// RemoveParticipant drops one agent from a session: the panel's participants
+// list, or an agent leaving by itself. It is the mirror of JoinSession,
+// including its rule — an archived session is frozen and refuses membership
+// changes either way (ErrConflict; reopen first). The participant row, its
+// read cursor (a non-participant has none, so a re-join starts unread) and a
+// system notice naming the actor ("X left the session" / "X was removed from
+// the session by admin") change in one transaction. The agent itself is
+// untouched: still registered, still in its other sessions, re-addable with
+// the picker. ErrNotFound means the session or the membership is not there.
+func (s *Store) RemoveParticipant(ctx context.Context, sessionID, agentID, actorID string) error {
+	now := time.Now().UnixMilli()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var status string
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM sessions WHERE id = ?`, sessionID).Scan(&status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: session %q", ErrNotFound, sessionID)
+		}
+		return err
+	}
+	if status != "active" {
+		return fmt.Errorf("%w: session %q is %s", ErrConflict, sessionID, status)
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM participants WHERE session_id = ? AND agent_id = ?`, sessionID, agentID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("%w: %q is not a participant of %q", ErrNotFound, agentID, sessionID)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM read_marks WHERE session_id = ? AND agent_id = ?`, sessionID, agentID); err != nil {
+		return err
+	}
+	who := noticeLabelTx(ctx, tx, agentID)
+	content := who + " left the session"
+	if actorID != "" && actorID != agentID {
+		content = who + " was removed from the session by " + noticeLabelTx(ctx, tx, actorID)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO messages (id, session_id, sender_id, kind, content, created_at) VALUES (?, ?, ?, 'system', ?, ?)`,
+		ids.New(), sessionID, agentID, content, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// noticeLabelTx resolves how a server-generated notice names an agent inside a
+// write transaction: its display title, or the id for an untitled identity
+// (app-level identities are labeled with their own id by design, so for them
+// both forms are the same string).
+func noticeLabelTx(ctx context.Context, tx *sql.Tx, agentID string) string {
+	label := agentID
+	var display string
+	if err := tx.QueryRowContext(ctx, `SELECT display_name FROM agents WHERE id = ?`, agentID).Scan(&display); err == nil && display != "" {
+		label = display
+	}
+	return label
 }
 
 // NoticeLabel is how server-generated notices (join, eviction, replacement)

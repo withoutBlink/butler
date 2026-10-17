@@ -430,25 +430,41 @@ func TestMessageMentions(t *testing.T) {
 	// Exact id, kind, and @all all resolve to participants.
 	wantMentions(post("@codex:alpha:proj please review"), "codex:alpha:proj")
 	wantMentions(post("@codex stand up"), "codex:alpha:proj", "codex:beta:proj")
-	// @all includes every participant (id order), the human ("admin") included.
-	wantMentions(post("@all heads up"), "admin", "codex:alpha:proj", "codex:beta:proj", "opencode:host:repo")
+	// @all includes every participant except the author (mentions address
+	// who should reply, and the human "admin" is the one posting here).
+	wantMentions(post("@all heads up"), "codex:alpha:proj", "codex:beta:proj", "opencode:host:repo")
 	// A kind only matches participants of that kind.
 	wantMentions(post("@opencode ping"), "opencode:host:repo")
 	// Non-participants and unknown tokens resolve to nothing.
 	wantMentions(post("@ghost hello"))
 	// Mixed, deduped in order of first appearance.
 	wantMentions(post("@all @codex @opencode:host:repo check @codex again"),
-		"admin", "codex:alpha:proj", "codex:beta:proj", "opencode:host:repo")
+		"codex:alpha:proj", "codex:beta:proj", "opencode:host:repo")
 	// No @ at all.
 	wantMentions(post("plain message"))
+
+	// The author never mentions itself: an agent quoting its own id (or
+	// title, or a kind it belongs to) is not addressing itself — otherwise
+	// its own wait output would flag "(mentioned you)" on its own words.
+	if _, err := s.InsertMessage(ctx, &Message{SessionID: "s1", SenderID: "codex:alpha:proj", Kind: "chat",
+		Content: "@codex:alpha:proj @codex self note"}); err != nil {
+		t.Fatalf("insert self mention: %v", err)
+	}
+	self, err := s.SessionLatestMessages(ctx, "s1", 1)
+	if err != nil || len(self) != 1 {
+		t.Fatalf("latest: %v %d", err, len(self))
+	}
+	if !reflect.DeepEqual(self[0].Mentions, []string{"codex:beta:proj"}) {
+		t.Fatalf("self mention resolved to %v, want [codex:beta:proj]", self[0].Mentions)
+	}
 
 	// Mentions persist and come back on read.
 	msgs, err := s.MessagesSince(ctx, "", "s1", 0, 100)
 	if err != nil {
 		t.Fatalf("messages since: %v", err)
 	}
-	if len(msgs) != 7 {
-		t.Fatalf("expected 7 messages, got %d", len(msgs))
+	if len(msgs) != 8 {
+		t.Fatalf("expected 8 messages, got %d", len(msgs))
 	}
 	// msgs[0] is the exact-id mention; msgs[1] the kind mention.
 	if !msgs[0].MentionsAgent("codex:alpha:proj") || msgs[0].MentionsAgent("codex:beta:proj") {

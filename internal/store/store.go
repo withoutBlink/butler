@@ -640,7 +640,7 @@ func (s *Store) InsertMessage(ctx context.Context, m *Message) (*Message, error)
 		m.CreatedAt = time.Now().UnixMilli()
 	}
 	if m.Mentions == nil {
-		m.Mentions = s.resolveMentions(ctx, m.SessionID, m.Content)
+		m.Mentions = s.resolveMentions(ctx, m.SessionID, m.SenderID, m.Content)
 	}
 	mentionsJSON := "[]"
 	if len(m.Mentions) > 0 {
@@ -667,9 +667,13 @@ func (s *Store) InsertMessage(ctx context.Context, m *Message) (*Message, error)
 // form the panel's autocomplete inserts) and "@all"/"@everyone"/"@here" (all
 // participants). Names match case-insensitively and may contain spaces; at an
 // "@" the longest matching name wins, so "Beta 2" does not also trigger
-// "Beta". Tokens that match no participant resolve to nothing — mentioning
-// only reaches agents already in the session.
-func (s *Store) resolveMentions(ctx context.Context, sessionID, content string) []string {
+// "Beta". The author is never mentioned by its own message — mentions mean
+// "agents that should reply", and a message is not addressed to its writer
+// (a role quoting its own title or id, or any "@all" post, would otherwise
+// self-resolve and show up in its own wait output as "(mentioned you)").
+// Tokens that match no participant resolve to nothing — mentioning only
+// reaches agents already in the session.
+func (s *Store) resolveMentions(ctx context.Context, sessionID, senderID, content string) []string {
 	tokens := mentionTokens(content)
 	participants, err := s.Participants(ctx, sessionID)
 	if err != nil {
@@ -680,7 +684,7 @@ func (s *Store) resolveMentions(ctx context.Context, sessionID, content string) 
 	var mentions []string
 	seen := map[string]bool{}
 	add := func(id string) {
-		if id != "" && !seen[id] {
+		if id != "" && id != senderID && !seen[id] {
 			seen[id] = true
 			mentions = append(mentions, id)
 		}

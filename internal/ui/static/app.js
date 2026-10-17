@@ -48,16 +48,28 @@
   });
   markClamp();
 
-  // Read marks: data-agents lists the session's agent participants and
-  // data-reads maps agent id -> highest seq that agent has received (the
-  // server records a read whenever it delivers messages to an agent).
-  // SSE "reads" events advance the map so marks update live.
+  // Read marks: data-audience lists the session's participants as the marks
+  // need them ({id,name,since,human}) and data-reads maps participant id ->
+  // highest seq that participant has received (the server records a read
+  // whenever it delivers messages to an agent). The human (human:true) is
+  // always a reader: a mark is only ever visible to the human, so seeing it
+  // means having seen the message, and nothing delivers messages to a human to
+  // record a cursor for. A member whose membership starts after a message was
+  // sent (its join notice's seq is past it) is not part of that message's
+  // audience. SSE "reads"/"audience" events keep both current.
   var readBy = {};
-  var readAgents = [];
+  var audience = [];
   try {
     readBy = JSON.parse(box.getAttribute('data-reads') || '{}') || {};
-    readAgents = JSON.parse(box.getAttribute('data-agents') || '[]') || [];
+    audience = JSON.parse(box.getAttribute('data-audience') || '[]') || [];
   } catch (err) { /* fall back to server-rendered marks */ }
+
+  function readTip(readers, unread) {
+    if (readers.length && unread.length) return 'read by ' + readers.join(', ') + ' \u00b7 not yet: ' + unread.join(', ');
+    if (readers.length) return 'read by ' + readers.join(', ');
+    if (unread.length) return 'not read yet: ' + unread.join(', ');
+    return '';
+  }
 
   function updateReadMarks() {
     var rows = box.querySelectorAll('.msg.chat');
@@ -66,12 +78,16 @@
       var seq = parseInt(row.getAttribute('data-seq'), 10) || 0;
       var sender = row.getAttribute('data-sender');
       var readers = [];
+      var unread = [];
       var total = 0;
-      for (var j = 0; j < readAgents.length; j++) {
-        var a = readAgents[j];
-        if (a === sender) continue;
+      for (var j = 0; j < audience.length; j++) {
+        var m = audience[j];
+        if (!m || m.id === sender) continue;
+        if ((m.since || 0) > seq) continue;
         total++;
-        if ((readBy[a] || 0) >= seq) readers.push(a);
+        var name = m.name || m.id;
+        if (m.human || (readBy[m.id] || 0) >= seq) readers.push(name);
+        else unread.push(name);
       }
       if (!total) continue;
       var span = row.querySelector('.m-read');
@@ -82,7 +98,7 @@
         if (meta) meta.insertAdjacentElement('afterend', span);
       }
       span.textContent = '✓' + readers.length + '/' + total;
-      span.title = readers.length ? 'read by ' + readers.join(', ') : 'not read yet';
+      span.title = readTip(readers, unread);
       span.classList.toggle('all', readers.length === total);
     }
   }
@@ -107,6 +123,15 @@
       try {
         var d = JSON.parse(e.data);
         if (d && d.agent) readBy[d.agent] = d.seq;
+      } catch (err) { /* ignore malformed events */ }
+      updateReadMarks();
+    });
+    es.addEventListener('audience', function (e) {
+      // Membership changed (join/removal): the denominator and the tooltips
+      // follow within the same heartbeat as the presence re-render.
+      try {
+        var d = JSON.parse(e.data);
+        if (Array.isArray(d)) audience = d;
       } catch (err) { /* ignore malformed events */ }
       updateReadMarks();
     });

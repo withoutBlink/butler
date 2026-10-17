@@ -444,6 +444,10 @@ const GlobalSessionID = "global"
 // GlobalSessionTitle is the display title of the global session.
 const GlobalSessionTitle = "Global"
 
+// joinedNoticeSuffix ends every join notice JoinSession writes. Membership is
+// pinned to that notice's seq (SessionAudience), so the two must stay in sync.
+const joinedNoticeSuffix = " joined the session"
+
 // EnsureGlobalSession creates the global session (the default room shared by
 // every agent) if it does not exist yet and adds creatorID — normally the
 // panel's "admin" agent — as its first participant. Idempotent: safe to call at
@@ -679,7 +683,7 @@ func (s *Store) JoinSession(ctx context.Context, sessionID, agentID string) (boo
 	// mentions: a later rename does not rewrite a stored notice.
 	label := noticeLabelTx(ctx, tx, agentID)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO messages (id, session_id, sender_id, kind, content, created_at) VALUES (?, ?, ?, 'system', ?, ?)`,
-		ids.New(), sessionID, agentID, label+" joined the session", now); err != nil {
+		ids.New(), sessionID, agentID, label+joinedNoticeSuffix, now); err != nil {
 		return false, err
 	}
 	return true, tx.Commit()
@@ -784,6 +788,52 @@ func (s *Store) Participants(ctx context.Context, sessionID string) ([]Agent, er
 		WHERE p.session_id = ? AND a.removed_at IS NULL
 		  AND NOT (`+clientHidden("a")+`)
 		ORDER BY a.display_name COLLATE NOCASE, a.id`, sessionID)
+}
+
+// AudienceMember is a session participant as the read marks need it: the
+// identity, its display name, its kind (the panel's human is always a reader —
+// whoever can see a mark has by definition seen the message) and the message
+// seq its membership starts at, so a member who joined after a message was
+// sent does not widen that message's audience (it was not in the room to read
+// it, and without this an ever-growing session would show old messages below
+// N/N forever).
+type AudienceMember struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"name"`
+	Kind        string `json:"kind"`
+	// JoinedSeq is the seq of the member's most recent join notice, or 0 when
+	// it never had one (the session's creator and creation-time participants).
+	// There is no notice-based membership for those, and they were in the room
+	// from the start, so 0 means "present for everything". Using the notice's
+	// seq rather than a clock keeps it exact on re-join too: the watermark is
+	// the latest join, so history before it is not that member's audience.
+	JoinedSeq int64 `json:"since"`
+}
+
+// SessionAudience lists a session's visible participants with their membership
+// watermark, in the same order as Participants (display name, case-insensitive).
+func (s *Store) SessionAudience(ctx context.Context, sessionID string) ([]AudienceMember, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT a.id, a.display_name, a.kind,
+			COALESCE((SELECT MAX(m.global_seq) FROM messages m
+				WHERE m.session_id = p.session_id AND m.sender_id = p.agent_id
+				  AND m.kind = 'system' AND m.content LIKE '%' || ?), 0)
+		FROM agents a JOIN participants p ON p.agent_id = a.id
+		WHERE p.session_id = ? AND a.removed_at IS NULL
+		  AND NOT (`+clientHidden("a")+`)
+		ORDER BY a.display_name COLLATE NOCASE, a.id`, joinedNoticeSuffix, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]AudienceMember, 0)
+	for rows.Next() {
+		var m AudienceMember
+		if err := rows.Scan(&m.ID, &m.DisplayName, &m.Kind, &m.JoinedSeq); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
 }
 
 // AgentsForIdentity returns every agent row of one agent client's identity

@@ -822,6 +822,111 @@ func TestMarkRead(t *testing.T) {
 	}
 }
 
+// TestSessionAudience: the read-mark audience carries display names, kinds and
+// the message seq each member's membership starts at. Creation-time members
+// (the creator, participants passed to CreateSession) have no join notice, so
+// they are present from the start (0); a member added later is pinned to its
+// join notice's seq, and an evicted member drops out entirely.
+func TestSessionAudience(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if _, err := s.CreateAgent(ctx, "admin", "admin", "human", "", "", ""); err != nil {
+		t.Fatalf("create human: %v", err)
+	}
+	mustAgent(t, s, "a1")
+	mustAgent(t, s, "a2")
+	if _, err := s.CreateSession(ctx, "s1", "audience", "admin", []string{"a1"}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	// A chat and a late join: the late member's watermark is the join notice.
+	if _, err := s.InsertMessage(ctx, &Message{SessionID: "s1", SenderID: "admin", Kind: "chat", Content: "hello"}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if _, err := s.JoinSession(ctx, "s1", "a2"); err != nil {
+		t.Fatalf("join a2: %v", err)
+	}
+	notice, err := s.SessionLatestMessages(ctx, "s1", 1)
+	if err != nil || len(notice) != 1 {
+		t.Fatalf("latest message: %v %v", err, notice)
+	}
+	joinedAt := notice[0].Seq
+
+	aud, err := s.SessionAudience(ctx, "s1")
+	if err != nil {
+		t.Fatalf("audience: %v", err)
+	}
+	byID := map[string]AudienceMember{}
+	for _, m := range aud {
+		byID[m.ID] = m
+	}
+	if len(aud) != 3 {
+		t.Fatalf("expected 3 members, got %v", aud)
+	}
+	if m := byID["admin"]; m.Kind != "human" || m.JoinedSeq != 0 {
+		t.Fatalf("human should be present from the start, got %+v", m)
+	}
+	if m := byID["a1"]; m.JoinedSeq != 0 {
+		t.Fatalf("creation-time participant should have watermark 0, got %+v", m)
+	}
+	if m := byID["a2"]; m.JoinedSeq != joinedAt || joinedAt < 2 {
+		t.Fatalf("late joiner should be pinned to its join notice seq %d, got %+v", joinedAt, m)
+	}
+	// Display names, not ids, when the member is titled; order follows them
+	// (a2, admin, Alpha bot — case-insensitive).
+	if err := s.UpdateAgentDisplayName(ctx, "a1", "Alpha bot"); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	aud, err = s.SessionAudience(ctx, "s1")
+	if err != nil {
+		t.Fatalf("audience: %v", err)
+	}
+	if len(aud) != 3 || aud[2].ID != "a1" || aud[2].DisplayName != "Alpha bot" {
+		t.Fatalf("audience should carry titles and order by them, got %v", aud)
+	}
+
+	// An evicted member is not part of the audience anymore.
+	if err := s.RemoveAgent(ctx, "a2"); err != nil {
+		t.Fatalf("evict: %v", err)
+	}
+	aud, err = s.SessionAudience(ctx, "s1")
+	if err != nil {
+		t.Fatalf("audience: %v", err)
+	}
+	if len(aud) != 2 {
+		t.Fatalf("evicted member should drop out, got %v", aud)
+	}
+
+	// An agent client with a live role is hidden everywhere the panel looks —
+	// the audience included: the role stands for it, and the client itself has
+	// no delivery of its own to report.
+	if _, err := s.CreateAgent(ctx, "opencode:host:butler", "opencode:host:butler", "opencode", "host", "/w", ""); err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	if _, err := s.CreateAgent(ctx, "role-1", "Fix read marks", "opencode", "host", "/w", "ses_1"); err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+	for _, id := range []string{"opencode:host:butler", "role-1"} {
+		if _, err := s.JoinSession(ctx, "s1", id); err != nil {
+			t.Fatalf("join %s: %v", id, err)
+		}
+	}
+	aud, err = s.SessionAudience(ctx, "s1")
+	if err != nil {
+		t.Fatalf("audience: %v", err)
+	}
+	has := func(id string) bool {
+		for _, m := range aud {
+			if m.ID == id {
+				return true
+			}
+		}
+		return false
+	}
+	if len(aud) != 3 || has("opencode:host:butler") || !has("role-1") {
+		t.Fatalf("a hidden client must not be in the audience, got %v", aud)
+	}
+}
+
 // TestClientSessionIdentity: FindInstance discriminates the app-level agent
 // (client_session "") from its per-session siblings, and sibling identity is
 // stable across re-registration.

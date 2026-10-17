@@ -47,7 +47,7 @@
 </section>
 </aside>
 <section class="chat-pane">
-<div id="messages" data-stream="/panel/sessions/{{.Session.ID}}/stream?after={{.LatestSeq}}" data-agents="{{.Agents}}" data-reads="{{.Reads}}">
+<div id="messages" data-stream="/panel/sessions/{{.Session.ID}}/stream?after={{.LatestSeq}}" data-audience="{{.Audience}}" data-reads="{{.Reads}}">
 {{range .Messages}}{{template "message" .}}{{end}}
 </div>
 {{if .Archived}}<p class="hint compose-hint">Archived — reopen it from the sessions list to post again.</p>{{else}}<form id="compose" method="post" action="/panel/sessions/{{.Session.ID}}/messages">

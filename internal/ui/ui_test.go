@@ -255,8 +255,11 @@ func TestMessageSenderShowsDisplayName(t *testing.T) {
 		`<b title="` + tester + `">Butler tester</b>`, // join notice
 		`<b title="` + kicked + `">Kicked Role</b>`,   // left the session: row survives
 		`<b title="` + plain + `">` + plain + `</b>`,  // untitled: the id is the label
-		`title="Butler tester"`,                       // read-mark tooltip names the reader
-		`✓1/1`,
+		// The read-mark tooltip names readers by display title. The human is
+		// part of the audience and is always a reader, so a room of the human
+		// plus two agents that the tester alone has read shows 2/2.
+		`title="read by Admin, Butler tester"`,
+		`✓2/2`,
 	} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("session view missing %q in:\n%s", want, string(body))
@@ -937,9 +940,13 @@ func TestSessionViewReadMarks(t *testing.T) {
 	if !strings.Contains(string(body), `✓0/2`) {
 		t.Fatalf("session view missing unread mark 0/2 in:\n%s", string(body))
 	}
-	// The read state is embedded for app.js (agent ids + agent->seq map).
-	if !strings.Contains(string(body), `data-agents="[&#34;codex:alpha:proj&#34;,&#34;opencode:beta:proj&#34;]"`) {
-		t.Fatalf("session view missing data-agents in:\n%s", string(body))
+	// Audience includes the human. Each member's "since" is the seq its
+	// membership starts at: admin created the session (0 = present from the
+	// start), the two agents were added with it.
+	if !strings.Contains(string(body), `data-audience="[`) ||
+		!strings.Contains(string(body), `&#34;id&#34;:&#34;admin&#34;,&#34;name&#34;:&#34;Admin&#34;,&#34;kind&#34;:&#34;human&#34;,&#34;since&#34;:0,&#34;human&#34;:true`) ||
+		!strings.Contains(string(body), `&#34;id&#34;:&#34;opencode:beta:proj&#34;,&#34;name&#34;:&#34;opencode:beta:proj&#34;,&#34;kind&#34;:&#34;opencode&#34;,&#34;since&#34;:0`) {
+		t.Fatalf("session view missing audience in:\n%s", string(body))
 	}
 	if !strings.Contains(string(body), `data-reads="{}"`) {
 		t.Fatalf("session view missing empty data-reads in:\n%s", string(body))
@@ -971,6 +978,157 @@ func TestSessionViewReadMarks(t *testing.T) {
 	resp.Body.Close()
 	if !strings.Contains(string(body), `✓2/2`) || !strings.Contains(string(body), "m-read all") {
 		t.Fatalf("session view missing 2/2 all mark in:\n%s", string(body))
+	}
+
+	// An agent's message counts the human as an audience member, and the human
+	// is always a reader (a mark is only visible to the human, so seeing it
+	// means having seen the message). The *other* agent is the only one who
+	// can still be outstanding — and the tooltip must say who has not read it.
+	if _, err := st.InsertMessage(ctx, &store.Message{SessionID: "s1", SenderID: "codex:alpha:proj", Kind: "chat", Content: "did you get this"}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	// A member added *after* that message is not part of its audience: an old
+	// message must not sit below N/N forever because somebody joined later.
+	late, err := st.CreateAgent(ctx, "codex:late:proj", "codex:late:proj", "codex", "h", "/w", "")
+	if err != nil {
+		t.Fatalf("create late agent: %v", err)
+	}
+	if _, err := st.JoinSession(ctx, "s1", late.ID); err != nil {
+		t.Fatalf("join late agent: %v", err)
+	}
+	resp, err = client.Get(srv.URL + "/panel/sessions/s1")
+	if err != nil {
+		t.Fatalf("session view: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `✓1/2`) {
+		t.Fatalf("agent message should be 1/2 (human read, other agent not) in:\n%s", string(body))
+	}
+	if !strings.Contains(string(body), `title="read by Admin · not yet: opencode:beta:proj"`) {
+		t.Fatalf("mark tooltip should name readers and non-readers in:\n%s", string(body))
+	}
+	if strings.Contains(string(body), `✓1/3`) || strings.Contains(string(body), `✓2/3`) {
+		t.Fatalf("late joiner must not widen an older message's audience in:\n%s", string(body))
+	}
+	// The late member's membership starts at its join notice's seq (3: the two
+	// chats above), which is what excludes it from the older messages.
+	if !strings.Contains(string(body), `&#34;id&#34;:&#34;codex:late:proj&#34;,&#34;name&#34;:&#34;codex:late:proj&#34;,&#34;kind&#34;:&#34;codex&#34;,&#34;since&#34;:3`) {
+		t.Fatalf("audience should pin the late joiner to its join seq in:\n%s", string(body))
+	}
+	if !strings.Contains(string(body), `data-reads="{&#34;codex:alpha:proj&#34;:1,&#34;opencode:beta:proj&#34;:1}"`) {
+		t.Fatalf("data-reads should carry both agent cursors in:\n%s", string(body))
+	}
+
+	// A removal shrinks N retroactively: the removed member has no read state
+	// to report, so it neither pads N nor holds the marks back. That asymmetry
+	// is deliberate — a join can never enlarge an older message's audience (the
+	// joiner's seq excludes it), a leave can shrink it.
+	if err := st.RemoveParticipant(ctx, "s1", "opencode:beta:proj", "admin"); err != nil {
+		t.Fatalf("remove participant: %v", err)
+	}
+	resp, err = client.Get(srv.URL + "/panel/sessions/s1")
+	if err != nil {
+		t.Fatalf("session view: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `✓1/1`) || !strings.Contains(string(body), `title="read by Admin"`) {
+		t.Fatalf("removal should shrink N to the human alone in:\n%s", string(body))
+	}
+	if strings.Contains(string(body), `&#34;id&#34;:&#34;opencode:beta:proj&#34;`) {
+		t.Fatalf("removed member must drop out of the audience in:\n%s", string(body))
+	}
+}
+
+// TestReadMarksHumanOutsideAudience: the human is part of a message's audience
+// only while admin is a participant of that session — the audience is the
+// sidebar's participant list. A session an agent created through the API has
+// no admin participant until admin posts (the panel's post auto-joins), so its
+// marks count the other agents alone: 0/1, not 1/2.
+func TestReadMarksHumanOutsideAudience(t *testing.T) {
+	srv, st, _, adminTok := newPanel(t)
+	ctx := context.Background()
+	for _, id := range []string{"codex:alpha:proj", "opencode:beta:proj"} {
+		if _, err := st.CreateAgent(ctx, id, id, "codex", "h", "/w", ""); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+	}
+	if _, err := st.CreateSession(ctx, "s1", "agent room", "codex:alpha:proj", []string{"opencode:beta:proj"}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := st.InsertMessage(ctx, &store.Message{SessionID: "s1", SenderID: "codex:alpha:proj", Kind: "chat", Content: "no human here"}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	client := newBrowser(t)
+	login(t, client, srv.URL, adminTok)
+	resp, err := client.Get(srv.URL + "/panel/sessions/s1")
+	if err != nil {
+		t.Fatalf("session view: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `✓0/1`) || !strings.Contains(string(body), `title="not read yet: opencode:beta:proj"`) {
+		t.Fatalf("audience should be the other agent only in:\n%s", string(body))
+	}
+	if strings.Contains(string(body), `&#34;id&#34;:&#34;admin&#34;`) {
+		t.Fatalf("a non-participant human must not be in the audience in:\n%s", string(body))
+	}
+}
+
+// TestReadMarksLateJoinerHuman: the later-joiner rule applies to the human too.
+// Admin added to a session after messages have flowed is not part of those
+// messages' audience — no special case — while messages sent after the join
+// count it (and count it read, since a mark is only visible to the human).
+func TestReadMarksLateJoinerHuman(t *testing.T) {
+	srv, st, _, adminTok := newPanel(t)
+	ctx := context.Background()
+	if _, err := st.CreateAgent(ctx, "admin", "Admin", "human", "", "", ""); err != nil {
+		t.Fatalf("create you: %v", err)
+	}
+	for _, id := range []string{"codex:alpha:proj", "opencode:beta:proj"} {
+		if _, err := st.CreateAgent(ctx, id, id, "codex", "h", "/w", ""); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+	}
+	if _, err := st.CreateSession(ctx, "s1", "agent room", "codex:alpha:proj", []string{"opencode:beta:proj"}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := st.InsertMessage(ctx, &store.Message{SessionID: "s1", SenderID: "codex:alpha:proj", Kind: "chat", Content: "before you were here"}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	// Admin joins (its join notice lands at seq 2) and then posts.
+	if _, err := st.JoinSession(ctx, "s1", "admin"); err != nil {
+		t.Fatalf("join admin: %v", err)
+	}
+	if _, err := st.InsertMessage(ctx, &store.Message{SessionID: "s1", SenderID: "codex:alpha:proj", Kind: "chat", Content: "after you joined"}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	client := newBrowser(t)
+	login(t, client, srv.URL, adminTok)
+	resp, err := client.Get(srv.URL + "/panel/sessions/s1")
+	if err != nil {
+		t.Fatalf("session view: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	// The pre-join message is the other agent's alone (0/1); the post-join one
+	// is the human (read) plus that agent (1/2).
+	if !strings.Contains(string(body), `✓0/1`) {
+		t.Fatalf("pre-join message should not count the late human in:\n%s", string(body))
+	}
+	if !strings.Contains(string(body), `✓1/2`) || !strings.Contains(string(body), `title="read by Admin · not yet: opencode:beta:proj"`) {
+		t.Fatalf("post-join message should count the human as read in:\n%s", string(body))
+	}
+	if strings.Contains(string(body), `✓1/1`) || strings.Contains(string(body), `✓0/2`) {
+		t.Fatalf("late human must not widen an older message's audience in:\n%s", string(body))
+	}
+	// The human's watermark is its join notice's seq (2: the one message sent
+	// before it), which is exactly what excludes it from that message.
+	if !strings.Contains(string(body), `&#34;id&#34;:&#34;admin&#34;,&#34;name&#34;:&#34;Admin&#34;,&#34;kind&#34;:&#34;human&#34;,&#34;since&#34;:2,&#34;human&#34;:true`) {
+		t.Fatalf("audience should pin the late human to its join seq in:\n%s", string(body))
 	}
 }
 
@@ -1017,8 +1175,19 @@ func TestSSEStreamReads(t *testing.T) {
 		h.NotifySession("s1")
 	}()
 
+	// A join reaches an open panel through the same SSE stream: the audience
+	// event on the next heartbeat carries the new member pinned to its join
+	// notice's seq (2 — the chat above is 1), so older messages are not part
+	// of its audience.
+	if _, err := st.CreateAgent(ctx, "codex:late:proj", "codex:late:proj", "codex", "h", "/w", ""); err != nil {
+		t.Fatalf("create late agent: %v", err)
+	}
+	if _, err := st.JoinSession(ctx, "s1", "codex:late:proj"); err != nil {
+		t.Fatalf("join late agent: %v", err)
+	}
+
 	events := readSSE(t, resp.Body, 2*time.Second)
-	var gotMessage, gotReads bool
+	var gotMessage, gotReads, gotAudience bool
 	for _, ev := range events {
 		if ev.name == "message" && strings.Contains(ev.data, "did you get this") {
 			gotMessage = true
@@ -1026,12 +1195,22 @@ func TestSSEStreamReads(t *testing.T) {
 		if ev.name == "reads" && strings.Contains(ev.data, "codex:alpha:proj") {
 			gotReads = true
 		}
+		// The audience is raw JSON (no HTML escaping): the human is flagged
+		// and the late joiner carries the seq its membership starts at.
+		if ev.name == "audience" &&
+			strings.Contains(ev.data, `"id":"admin","name":"Admin","kind":"human","since":0,"human":true`) &&
+			strings.Contains(ev.data, `"id":"codex:late:proj","name":"codex:late:proj","kind":"codex","since":2`) {
+			gotAudience = true
+		}
 	}
 	if !gotMessage {
 		t.Fatalf("expected message event, got %v", events)
 	}
 	if !gotReads {
 		t.Fatalf("expected reads event for codex:alpha:proj, got %v", events)
+	}
+	if !gotAudience {
+		t.Fatalf("expected audience event with the human and the late joiner, got %v", events)
 	}
 }
 

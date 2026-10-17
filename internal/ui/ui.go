@@ -469,12 +469,13 @@ type sessionViewData struct {
 	// composer: every other participant's display name plus "all" (the
 	// server resolves @<title> as well as @<id>, @<kind> and @all).
 	Mentionables string
-	// Agents is a JSON array of the session's agent participant ids and
-	// Reads a JSON object of agent id -> highest read seq. app.js uses
-	// these (plus SSE "reads" events) to keep the per-message read marks
-	// current without a page reload.
-	Agents string
-	Reads  string
+	// Audience is a JSON array of the session's participants as the read
+	// marks need them ({id,name,kind,joined}) and Reads a JSON object of
+	// participant id -> highest read seq. app.js uses these (plus SSE
+	// "reads"/"audience" events) to keep the per-message read marks and
+	// their tooltips current without a page reload.
+	Audience string
+	Reads    string
 	// Addable are the visible agents (roles) not yet in the session — the
 	// participants-area "add to meeting" picker.
 	Addable []agentOption
@@ -532,34 +533,57 @@ func (p *Panel) addableAgents(ctx context.Context, parts []store.Agent) []agentO
 // uiMsg is a message plus the panel's read state for it.
 type uiMsg struct {
 	store.Message
-	ReadCount  int    // agent participants (≠ sender) whose read cursor covers the message
-	ReadTotal  int    // agent participants (≠ sender) who could read it
-	Readers    string // comma-joined display names of the readers, for the mark's tooltip
+	ReadCount  int    // audience members (≠ sender) whose read state covers the message
+	ReadTotal  int    // audience members (≠ sender) who could read it
+	Readers    string // comma-joined display names of the readers
+	Unread     string // comma-joined display names of the audience who have not read it
+	ReadTip    string // the mark's hover text: readers and non-readers
 	SenderName string // sender's display name (session title); the id stays in data-sender/title
 }
 
 // readState is a session's read-cursor snapshot plus its display names: the
-// agent participants and their highest read seq, and every participant's id →
-// display name (the message list shows titles, not UUIDs). "admin" has no
-// cursor — the human reads in the panel — but is named like anyone else.
+// participant audience and their highest read seq, and every participant's id →
+// display name (the message list shows titles, not UUIDs).
+//
+// The audience is *every other participant*, the panel's human included: the
+// human has no read cursor (nothing delivers messages to a human), but a mark
+// is only ever visible to that human, so seeing it means having seen the
+// message. That makes the human a reader without inventing a cursor for it.
 type readState struct {
-	agents []string
-	marks  map[string]int64
-	names  map[string]string
+	members []store.AudienceMember
+	marks   map[string]int64
+	names   map[string]string
+}
+
+// audienceMember is a read-mark audience member as app.js consumes it: the
+// store's member plus an explicit human flag. The panel's human is its "admin"
+// identity (AdminAgentID), whatever kind row it has — it needs no read cursor
+// because a mark is only ever visible to it.
+type audienceMember struct {
+	store.AudienceMember
+	Human bool `json:"human"`
+}
+
+// audience returns the members as a slice that is never nil (app.js parses it
+// into a list, and an empty audience must marshal as [] rather than null).
+func (rs readState) audience() []audienceMember {
+	out := make([]audienceMember, 0, len(rs.members))
+	for _, m := range rs.members {
+		out = append(out, audienceMember{AudienceMember: m, Human: m.ID == AdminAgentID})
+	}
+	return out
 }
 
 func (p *Panel) loadReadState(ctx context.Context, sid string) readState {
-	rs := readState{agents: []string{}, marks: map[string]int64{}, names: map[string]string{}}
-	parts, err := p.Store.Participants(ctx, sid)
+	rs := readState{marks: map[string]int64{}, names: map[string]string{}}
+	members, err := p.Store.SessionAudience(ctx, sid)
 	if err != nil {
-		p.Log.Error("participants", "err", err, "session", sid)
+		p.Log.Error("session audience", "err", err, "session", sid)
 		return rs
 	}
-	for _, a := range parts {
-		if a.ID != AdminAgentID {
-			rs.agents = append(rs.agents, a.ID)
-		}
-		rs.names[a.ID] = a.DisplayName
+	rs.members = members
+	for _, m := range members {
+		rs.names[m.ID] = m.DisplayName
 	}
 	marks, err := p.Store.ReadMarks(ctx, sid)
 	if err != nil {
@@ -570,14 +594,34 @@ func (p *Panel) loadReadState(ctx context.Context, sid string) readState {
 	return rs
 }
 
+// readTip is the mark's hover text: who has read the message and who has not.
+// The groups are independent — the human counts as a reader whenever it can
+// see the mark at all, so "not yet" only ever names agents.
+func readTip(readers, unread string) string {
+	switch {
+	case readers != "" && unread != "":
+		return "read by " + readers + " · not yet: " + unread
+	case readers != "":
+		return "read by " + readers
+	case unread != "":
+		return "not read yet: " + unread
+	default:
+		return ""
+	}
+}
+
 // attachReadState computes per-message read marks for rendering: a chat
-// message counts as read for each agent participant other than the sender
-// whose cursor has reached its seq. Non-chat kinds never show marks. Every
-// message also gets the sender's display name — the id stays available as
-// data-sender and the tooltip, and the name is looked up in the agents row
-// when the sender is no longer a participant (a kicked agent's history still
-// renders as a name, not a UUID). Only an identity whose display name *is*
-// its id (an untitled app-level identity) shows a UUID in the list.
+// message counts as read for each of the sender's audience — every other
+// participant, human included — whose read state covers its seq. The human is
+// always a reader (the panel is the human); a member who joined after the
+// message was sent is not part of its audience at all (nobody can read history
+// they were not present for, and such a message would otherwise stay below
+// N/N forever). Non-chat kinds never show marks. Every message also gets the
+// sender's display name — the id stays available as data-sender and the
+// tooltip, and the name is looked up in the agents row when the sender is no
+// longer a participant (a kicked agent's history still renders as a name, not
+// a UUID). Only an identity whose display name *is* its id (an untitled
+// app-level identity) shows a UUID in the list.
 func (p *Panel) attachReadState(ctx context.Context, rs readState, msgs []store.Message) []uiMsg {
 	out := make([]uiMsg, len(msgs))
 	nameOf := func(id string) string {
@@ -601,18 +645,26 @@ func (p *Panel) attachReadState(ctx context.Context, rs readState, msgs []store.
 			out[i] = vm
 			continue
 		}
-		var readers []string
-		for _, a := range rs.agents {
-			if a == m.SenderID {
+		var readers, unread []string
+		for _, a := range rs.members {
+			if a.ID == m.SenderID {
+				continue
+			}
+			// Joined after the message was sent: not in that audience.
+			if a.JoinedSeq > m.Seq {
 				continue
 			}
 			vm.ReadTotal++
-			if rs.marks[a] >= m.Seq {
-				readers = append(readers, nameOf(a))
+			if a.ID == AdminAgentID || rs.marks[a.ID] >= m.Seq {
+				readers = append(readers, nameOf(a.ID))
+			} else {
+				unread = append(unread, nameOf(a.ID))
 			}
 		}
 		vm.ReadCount = len(readers)
 		vm.Readers = strings.Join(readers, ", ")
+		vm.Unread = strings.Join(unread, ", ")
+		vm.ReadTip = readTip(vm.Readers, vm.Unread)
 		out[i] = vm
 	}
 	return out
@@ -679,7 +731,7 @@ func (p *Panel) sessionView(w http.ResponseWriter, r *http.Request) {
 		p.httpError(w, "store error", 500)
 		return
 	}
-	agentsJSON, err := json.Marshal(rs.agents)
+	audienceJSON, err := json.Marshal(rs.audience())
 	if err != nil {
 		p.httpError(w, "store error", 500)
 		return
@@ -688,7 +740,7 @@ func (p *Panel) sessionView(w http.ResponseWriter, r *http.Request) {
 		Session:      *sess,
 		Participants: participantsView{SessionID: sid, CanRemove: sess.Status == "active", Agents: parts},
 		Messages:     p.attachReadState(ctx, rs, msgs), ContextItems: items, LatestSeq: latest,
-		Mentionables: string(mentionables), Agents: string(agentsJSON), Reads: string(readsJSON),
+		Mentionables: string(mentionables), Audience: string(audienceJSON), Reads: string(readsJSON),
 		Addable:  p.addableAgents(ctx, parts),
 		Archived: sess.Status != "active",
 	})
@@ -1055,6 +1107,13 @@ func (p *Panel) stream(w http.ResponseWriter, r *http.Request) {
 					canRemove = sess.Status == "active"
 				}
 				writeSSE(w, flusher, "presence", p.fragment("participants", participantsView{SessionID: sid, CanRemove: canRemove, Agents: parts}))
+				// The read-mark audience (members, names and join times)
+				// travels with the same heartbeat: a join or removal has to
+				// move the marks' denominator and tooltips, not only the
+				// sidebar.
+				if data, err := json.Marshal(p.loadReadState(ctx, sid).audience()); err == nil {
+					writeSSE(w, flusher, "audience", string(data))
+				}
 			} else {
 				writeSSEPing(w, flusher)
 			}

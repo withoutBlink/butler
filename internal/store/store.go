@@ -475,8 +475,10 @@ func (s *Store) EnsureGlobalSession(ctx context.Context, creatorID string) (bool
 		return false, err
 	}
 	if created {
+		// Messages carry millisecond timestamps (the panel formats them with
+		// UnixMilli); sessions/participants above keep second granularity.
 		if _, err := tx.ExecContext(ctx, `INSERT INTO messages (id, session_id, sender_id, kind, content, created_at) VALUES (?, ?, ?, 'system', ?, ?)`,
-			ids.New(), GlobalSessionID, creatorID, creatorID+" created the global session — every agent joins it automatically", now); err != nil {
+			ids.New(), GlobalSessionID, creatorID, creatorID+" created the global session — every agent joins it automatically", time.Now().UnixMilli()); err != nil {
 			return false, err
 		}
 	}

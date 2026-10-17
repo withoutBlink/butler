@@ -720,6 +720,14 @@ func TestGlobalSession(t *testing.T) {
 	if err != nil || sess.Title != GlobalSessionTitle || sess.CreatedBy != "admin" {
 		t.Fatalf("global session: %v %+v", err, sess)
 	}
+	// The creation notice carries a millisecond timestamp like every other
+	// message (the panel formats timestamps with UnixMilli; seconds would
+	// render as a 1970 clock time).
+	if msgs, err := s.SessionLatestMessages(ctx, GlobalSessionID, 1); err != nil || len(msgs) != 1 {
+		t.Fatalf("global creation notice: %v %v", err, msgs)
+	} else if msgs[0].CreatedAt < 1_000_000_000_000 {
+		t.Fatalf("creation notice created_at %d is not milliseconds", msgs[0].CreatedAt)
+	}
 	// Idempotent: second call changes nothing (no duplicate, no new message).
 	created, err = s.EnsureGlobalSession(ctx, "admin")
 	if err != nil || created {

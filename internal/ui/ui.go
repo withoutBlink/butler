@@ -509,20 +509,24 @@ func (p *Panel) addableAgents(ctx context.Context, parts []store.Agent) []agentO
 // uiMsg is a message plus the panel's read state for it.
 type uiMsg struct {
 	store.Message
-	ReadCount int    // agent participants (≠ sender) whose read cursor covers the message
-	ReadTotal int    // agent participants (≠ sender) who could read it
-	Readers   string // comma-joined ids of the readers, for the mark's tooltip
+	ReadCount  int    // agent participants (≠ sender) whose read cursor covers the message
+	ReadTotal  int    // agent participants (≠ sender) who could read it
+	Readers    string // comma-joined display names of the readers, for the mark's tooltip
+	SenderName string // sender's display name (session title); the id stays in data-sender/title
 }
 
-// readState is a session's read-cursor snapshot: the agent participants and
-// their highest read seq. "admin" has no cursor — the human reads in the panel.
+// readState is a session's read-cursor snapshot plus its display names: the
+// agent participants and their highest read seq, and every participant's id →
+// display name (the message list shows titles, not UUIDs). "admin" has no
+// cursor — the human reads in the panel — but is named like anyone else.
 type readState struct {
 	agents []string
 	marks  map[string]int64
+	names  map[string]string
 }
 
 func (p *Panel) loadReadState(ctx context.Context, sid string) readState {
-	rs := readState{agents: []string{}, marks: map[string]int64{}}
+	rs := readState{agents: []string{}, marks: map[string]int64{}, names: map[string]string{}}
 	parts, err := p.Store.Participants(ctx, sid)
 	if err != nil {
 		p.Log.Error("participants", "err", err, "session", sid)
@@ -532,6 +536,7 @@ func (p *Panel) loadReadState(ctx context.Context, sid string) readState {
 		if a.ID != AdminAgentID {
 			rs.agents = append(rs.agents, a.ID)
 		}
+		rs.names[a.ID] = a.DisplayName
 	}
 	marks, err := p.Store.ReadMarks(ctx, sid)
 	if err != nil {
@@ -544,11 +549,21 @@ func (p *Panel) loadReadState(ctx context.Context, sid string) readState {
 
 // attachReadState computes per-message read marks for rendering: a chat
 // message counts as read for each agent participant other than the sender
-// whose cursor has reached its seq. Non-chat kinds never show marks.
+// whose cursor has reached its seq. Non-chat kinds never show marks. Every
+// message also gets the sender's display name (the participants' titles are
+// what the panel shows; the id stays available as data-sender and the
+// tooltip) — senders no longer in the session (a kicked agent's history) fall
+// back to their id.
 func attachReadState(rs readState, msgs []store.Message) []uiMsg {
 	out := make([]uiMsg, len(msgs))
+	nameOf := func(id string) string {
+		if n, ok := rs.names[id]; ok && n != "" {
+			return n
+		}
+		return id
+	}
 	for i, m := range msgs {
-		vm := uiMsg{Message: m}
+		vm := uiMsg{Message: m, SenderName: nameOf(m.SenderID)}
 		if m.Kind != "chat" {
 			out[i] = vm
 			continue
@@ -560,7 +575,7 @@ func attachReadState(rs readState, msgs []store.Message) []uiMsg {
 			}
 			vm.ReadTotal++
 			if rs.marks[a] >= m.Seq {
-				readers = append(readers, a)
+				readers = append(readers, nameOf(a))
 			}
 		}
 		vm.ReadCount = len(readers)

@@ -185,6 +185,74 @@ func TestSessionViewAndPost(t *testing.T) {
 	_ = h
 }
 
+// The panel's message list shows the sender's display name (the session
+// title), not the UUID: the id stays only as the identity tooltip and in
+// data-sender for the read-mark math. Read-mark tooltips name the readers
+// too, and a sender who is no longer a participant (a kicked agent's
+// history) has no title left to show, so it keeps its id.
+func TestMessageSenderShowsDisplayName(t *testing.T) {
+	srv, st, _, adminTok := newPanel(t)
+	ctx := context.Background()
+	const (
+		dev    = "2ad4443c-a473-4af8-a781-4b483d84d8d3"
+		tester = "fb3b3d41-fc49-4492-bb2a-5586e537c071"
+		ghost  = "bbbbbbbb-0000-0000-0000-000000000000"
+	)
+	for _, a := range []struct{ id, display string }{
+		{"admin", "Admin"},
+		{dev, "Develop butler"},
+		{tester, "Butler tester"},
+		{ghost, "Gone away"},
+	} {
+		if _, err := st.CreateAgent(ctx, a.id, a.display, "opencode", "h", "/w", "ses_"+a.id); err != nil {
+			t.Fatalf("create %s: %v", a.id, err)
+		}
+	}
+	if _, err := st.CreateSession(ctx, "s1", "meeting", "admin", nil); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	// JoinSession writes the join notice — a system message whose sender must
+	// show its title too (join notices used to read as UUIDs).
+	for _, id := range []string{dev, tester} {
+		if _, err := st.JoinSession(ctx, "s1", id); err != nil {
+			t.Fatalf("join %s: %v", id, err)
+		}
+	}
+	msg, err := st.InsertMessage(ctx, &store.Message{SessionID: "s1", SenderID: dev, Kind: "chat", Content: "did you get this"})
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := st.MarkRead(ctx, "s1", tester, msg.Seq); err != nil {
+		t.Fatalf("mark read: %v", err)
+	}
+	if _, err := st.InsertMessage(ctx, &store.Message{SessionID: "s1", SenderID: ghost, Kind: "chat", Content: "old news"}); err != nil {
+		t.Fatalf("insert ghost: %v", err)
+	}
+
+	client := newBrowser(t)
+	login(t, client, srv.URL, adminTok)
+	resp, err := client.Get(srv.URL + "/panel/sessions/s1")
+	if err != nil {
+		t.Fatalf("session view: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("session view: %d", resp.StatusCode)
+	}
+	for _, want := range []string{
+		`<b title="` + dev + `">Develop butler</b>`,
+		`<b title="` + tester + `">Butler tester</b>`, // join notice
+		`<b title="` + ghost + `">` + ghost + `</b>`,  // not a participant: no title
+		`title="Butler tester"`,                       // read-mark tooltip names the reader
+		`✓1/1`,
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("session view missing %q in:\n%s", want, string(body))
+		}
+	}
+}
+
 func TestDashboardShowsRegistrationInfo(t *testing.T) {
 	srv, st, _, adminTok := newPanel(t)
 	ctx := context.Background()

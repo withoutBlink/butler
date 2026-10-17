@@ -10,17 +10,19 @@
 <header>
 <span class="brand">Butler</span>
 <nav>
-<a href="/panel/">&larr; Sessions</a>
-<span class="session-title">{{.Session.Title}} <small>[{{.Session.Status}}]</small></span>
+<form method="post" action="/panel/logout" class="inline"><button type="submit" class="link">Sign out</button></form>
 </nav>
-{{if not .Global}}<span class="session-actions"><form method="post" action="/panel/sessions/{{.Session.ID}}/status" class="inline"><input type="hidden" name="from" value="session"><input type="hidden" name="status" value="{{if .Archived}}active{{else}}archived{{end}}"><button type="submit" class="link" title="{{if .Archived}}Reopen this session (posting and joining work again){{else}}Archive this session: it stays readable but frozen — no posts, context writes or joins until reopened{{end}}">{{if .Archived}}reopen{{else}}archive{{end}}</button></form><form method="post" action="/panel/sessions/{{.Session.ID}}/delete" class="inline"><button type="submit" class="link danger" title="Delete this session permanently — its messages, participants and context go with it" onclick="return confirm('Delete session “{{.Session.Title}}” permanently? Its messages, participants and context are gone for good.')">delete</button></form></span>{{end}}
 </header>
-{{if .Archived}}<p class="archived-banner">Archived — this session is frozen: no posts, context writes or new participants until you reopen it.</p>{{end}}
+<div class="session-bar">
+<a class="back" href="/panel/" title="Back to all sessions">&larr; Sessions</a>
+<h1 class="session-title">{{.Session.Title}} <small class="badge{{if .Archived}} archived{{end}}">{{.Session.Status}}</small></h1>
+</div>
+{{if .Archived}}<p class="archived-banner">Archived — this session is frozen: no posts, context writes or new participants. Reopen it from the sessions list.</p>{{end}}
 <main class="session-layout">
 <aside class="sidebar">
 {{template "participants" .Participants}}
 {{if .Archived}}
-<p class="hint">Archived — reopen the session to add participants or set context.</p>
+<p class="hint">Archived — reopen it from the sessions list to add participants or set context.</p>
 {{else if .Addable}}
 <form method="post" action="/panel/sessions/{{.Session.ID}}/join" class="context-form join-form">
 <h3>Add to meeting</h3>
@@ -48,7 +50,7 @@
 <div id="messages" data-stream="/panel/sessions/{{.Session.ID}}/stream?after={{.LatestSeq}}" data-agents="{{.Agents}}" data-reads="{{.Reads}}">
 {{range .Messages}}{{template "message" .}}{{end}}
 </div>
-{{if .Archived}}<p class="hint compose-hint">Archived — reopen the session to post again.</p>{{else}}<form id="compose" method="post" action="/panel/sessions/{{.Session.ID}}/messages">
+{{if .Archived}}<p class="hint compose-hint">Archived — reopen it from the sessions list to post again.</p>{{else}}<form id="compose" method="post" action="/panel/sessions/{{.Session.ID}}/messages">
 <textarea name="content" placeholder="Send a message as admin… (type @ to mention agents)" required data-mentionables="{{.Mentionables}}"></textarea>
 <button type="submit">Send</button>
 </form>{{end}}

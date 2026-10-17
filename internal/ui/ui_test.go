@@ -1080,7 +1080,11 @@ func TestPanelArchiveAndDeleteSession(t *testing.T) {
 		`name="status" value="archived"`,
 		`action="/panel/sessions/s1/delete"`,
 		`action="/panel/sessions/s2/delete"`,
+		`class="iconbtn"`,
+		`aria-label="Archive session"`,
+		`aria-label="Delete session"`,
 		`title="The global session is fixed`,
+		`class="fixed-ico"`,
 	} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("dashboard missing %q in:\n%s", want, string(body))
@@ -1088,6 +1092,10 @@ func TestPanelArchiveAndDeleteSession(t *testing.T) {
 	}
 	if strings.Contains(string(body), `action="/panel/sessions/global/status"`) || strings.Contains(string(body), `action="/panel/sessions/global/delete"`) {
 		t.Fatalf("global session must offer no lifecycle controls:\n%s", string(body))
+	}
+	// The actions are icons only; the words live in title/aria-label.
+	if strings.Contains(string(body), ">archive<") || strings.Contains(string(body), ">reopen<") || strings.Contains(string(body), ">delete<") {
+		t.Fatalf("session actions should be icon buttons:\n%s", string(body))
 	}
 
 	// Archive from the dashboard: back to the dashboard, session frozen.
@@ -1103,7 +1111,8 @@ func TestPanelArchiveAndDeleteSession(t *testing.T) {
 		t.Fatalf("status should be archived: %v %+v", err, sess)
 	}
 
-	// The session page is read-only now, and offers reopen + delete.
+	// The session page is read-only now, carries no lifecycle controls (those
+	// live on the dashboard) and keeps the back link next to the title.
 	resp, err = client.Get(srv.URL + "/panel/sessions/s1")
 	if err != nil {
 		t.Fatalf("session view: %v", err)
@@ -1112,6 +1121,12 @@ func TestPanelArchiveAndDeleteSession(t *testing.T) {
 	resp.Body.Close()
 	if !strings.Contains(string(body), "Archived — this session is frozen") {
 		t.Fatalf("archived banner missing:\n%s", string(body))
+	}
+	if !strings.Contains(string(body), `class="back" href="/panel/"`) || !strings.Contains(string(body), `class="badge archived"`) {
+		t.Fatalf("session page should carry the back link and an archived badge:\n%s", string(body))
+	}
+	if strings.Contains(string(body), "session-actions") || strings.Contains(string(body), `action="/panel/sessions/s1/delete"`) || strings.Contains(string(body), `name="status"`) {
+		t.Fatalf("session page must not carry lifecycle controls:\n%s", string(body))
 	}
 	if strings.Contains(string(body), `id="compose"`) || strings.Contains(string(body), "Set context</button>") {
 		t.Fatalf("archived session must not offer the composer or context form:\n%s", string(body))
@@ -1132,17 +1147,14 @@ func TestPanelArchiveAndDeleteSession(t *testing.T) {
 	if ok, err := st.IsParticipant(ctx, "s1", "role-y"); err != nil || ok {
 		t.Fatalf("refused panel join must not add a participant: %v %v", ok, err)
 	}
-	if !strings.Contains(string(body), `name="status" value="active"`) || !strings.Contains(string(body), `action="/panel/sessions/s1/delete"`) {
-		t.Fatalf("archived session should offer reopen + delete:\n%s", string(body))
-	}
 
-	// Reopen from the session page: back to the session, writable again.
-	resp, err = client.PostForm(srv.URL+"/panel/sessions/s1/status", url.Values{"status": {"active"}, "from": {"session"}})
+	// Reopen (dashboard-side control): back to the dashboard, writable again.
+	resp, err = client.PostForm(srv.URL+"/panel/sessions/s1/status", url.Values{"status": {"active"}})
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/panel/sessions/s1" {
+	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/panel/" {
 		t.Fatalf("reopen redirect: %d %s", resp.StatusCode, resp.Header.Get("Location"))
 	}
 	if sess, err := st.GetSession(ctx, "s1"); err != nil || sess.Status != "active" {

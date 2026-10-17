@@ -477,10 +477,8 @@ type sessionViewData struct {
 	Addable []agentOption
 	// Archived reports a frozen session (status != active): readable, but the
 	// composer, add-participant picker and context form are hidden and the
-	// header offers Reopen instead of Archive. Global marks the fixed global
-	// session, which offers neither archive nor delete.
+	// banner points at the dashboard, where archive/reopen/delete live.
 	Archived bool
-	Global   bool
 }
 
 // agentOption is one entry of the session view's add-participant picker.
@@ -677,7 +675,6 @@ func (p *Panel) sessionView(w http.ResponseWriter, r *http.Request) {
 		Mentionables: string(mentionables), Agents: string(agentsJSON), Reads: string(readsJSON),
 		Addable:  p.addableAgents(ctx, parts),
 		Archived: sess.Status != "active",
-		Global:   sid == store.GlobalSessionID,
 	})
 }
 
@@ -740,13 +737,12 @@ func (p *Panel) joinParticipant(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/panel/sessions/"+sid, http.StatusSeeOther)
 }
 
-// setSessionStatus is the panel's Archive / Reopen control. Archiving freezes
-// a session: the API and the panel already refuse posting, context writes and
-// joins on a non-active session, so an archived room stays readable but
-// silent until it is reopened. The fixed global session is refused by the
-// store. The form's "from" field (whitelisted, never a free-form URL) decides
-// where the browser lands: the session page when the control was there, the
-// dashboard otherwise.
+// setSessionStatus is the dashboard's Archive / Reopen icon button. Archiving
+// freezes a session: the API and the panel already refuse posting, context
+// writes and joins on a non-active session, so an archived room stays readable
+// but silent until it is reopened. The fixed global session is refused by the
+// store. Both directions land back on the dashboard, the only place the
+// control lives.
 func (p *Panel) setSessionStatus(w http.ResponseWriter, r *http.Request) {
 	if !p.requirePanel(w, r) {
 		return
@@ -773,10 +769,6 @@ func (p *Panel) setSessionStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	p.Log.Info("panel set session status", "id", sid, "status", status)
 	p.fanout(ctx, sid)
-	if r.PostFormValue("from") == "session" {
-		http.Redirect(w, r, "/panel/sessions/"+sid, http.StatusSeeOther)
-		return
-	}
 	http.Redirect(w, r, "/panel/", http.StatusSeeOther)
 }
 

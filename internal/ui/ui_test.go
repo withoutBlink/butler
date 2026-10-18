@@ -1286,6 +1286,27 @@ func TestPanelArchiveAndDeleteSession(t *testing.T) {
 	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/panel/" {
 		t.Fatalf("archive redirect: %d %s", resp.StatusCode, resp.Header.Get("Location"))
 	}
+	// The dashboard the browser lands on states the outcome, naming the
+	// session — "I can't tell whether it archived or deleted" is the bug this
+	// guards. It is one-shot: the next render drops it.
+	resp, err = client.Get(srv.URL + "/panel/")
+	if err != nil {
+		t.Fatalf("dashboard after archive: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), "Session “panel lifecycle” archived.") || !strings.Contains(string(body), `class="notice"`) {
+		t.Fatalf("dashboard should carry the archive notice:\n%s", string(body))
+	}
+	resp, err = client.Get(srv.URL + "/panel/")
+	if err != nil {
+		t.Fatalf("dashboard refresh: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if strings.Contains(string(body), `class="notice"`) {
+		t.Fatalf("the notice must be one-shot:\n%s", string(body))
+	}
 	if sess, err := st.GetSession(ctx, "s1"); err != nil || sess.Status != "archived" {
 		t.Fatalf("status should be archived: %v %+v", err, sess)
 	}
@@ -1380,7 +1401,8 @@ func TestPanelArchiveAndDeleteSession(t *testing.T) {
 		t.Fatalf("global session must survive untouched: %v %+v", err, sess)
 	}
 
-	// Delete s2: gone with its messages, dashboard redirect, unknown is a 404.
+	// Delete s2: gone with its messages, dashboard redirect, and the outcome
+	// notice names it.
 	resp, err = client.PostForm(srv.URL+"/panel/sessions/s2/delete", nil)
 	if err != nil {
 		t.Fatalf("delete: %v", err)
@@ -1389,19 +1411,69 @@ func TestPanelArchiveAndDeleteSession(t *testing.T) {
 	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/panel/" {
 		t.Fatalf("delete redirect: %d %s", resp.StatusCode, resp.Header.Get("Location"))
 	}
+	resp, err = client.Get(srv.URL + "/panel/")
+	if err != nil {
+		t.Fatalf("dashboard after delete: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), "Session “doomed” deleted.") {
+		t.Fatalf("dashboard should carry the delete notice:\n%s", string(body))
+	}
 	if _, err := st.GetSession(ctx, "s2"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("session should be gone: %v", err)
 	}
 	if msgs, err := st.SessionLatestMessages(ctx, "s2", 10); err != nil || len(msgs) != 0 {
 		t.Fatalf("messages should be gone with it: %v %v", msgs, err)
 	}
+
+	// A session that is already gone — a stale dashboard row (deleted in
+	// another tab) or a repeat submit — must not dump the user on a bare
+	// "not found" page with no idea what happened: the intent is already
+	// satisfied, so it redirects to the dashboard and says so.
 	resp, err = client.PostForm(srv.URL+"/panel/sessions/nope/delete", nil)
 	if err != nil {
 		t.Fatalf("delete unknown: %v", err)
 	}
 	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/panel/" {
+		t.Fatalf("deleting a vanished session should land on the dashboard: %d %s", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	resp, err = client.Get(srv.URL + "/panel/")
+	if err != nil {
+		t.Fatalf("dashboard after vanished delete: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), "no longer exists") {
+		t.Fatalf("dashboard should explain the vanished session:\n%s", string(body))
+	}
+	// Same for a repeat archive of the now-deleted s2 — and it stayed deleted.
+	resp, err = client.PostForm(srv.URL+"/panel/sessions/s2/status", url.Values{"status": {"archived"}})
+	if err != nil {
+		t.Fatalf("archive deleted: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("archiving a vanished session should land on the dashboard: %d", resp.StatusCode)
+	}
+	if _, err := st.GetSession(ctx, "s2"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("session should still be gone: %v", err)
+	}
+
+	// The session page of a session that is gone is a real page too: 404, an
+	// explanation and a way back — never a bare "not found" text blob.
+	resp, err = client.Get(srv.URL + "/panel/sessions/s2")
+	if err != nil {
+		t.Fatalf("gone session page: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("deleting an unknown session should 404: %d", resp.StatusCode)
+		t.Fatalf("a gone session page should be 404: %d", resp.StatusCode)
+	}
+	if !strings.Contains(string(body), "no longer exists") || !strings.Contains(string(body), `href="/panel/"`) {
+		t.Fatalf("a gone session page should explain itself and link back:\n%s", string(body))
 	}
 }
 

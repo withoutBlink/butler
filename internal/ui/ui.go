@@ -57,27 +57,37 @@ type Panel struct {
 
 type sessionStore struct {
 	mu sync.Mutex
-	m  map[string]time.Time
+	m  map[string]sessionEntry
+}
+
+// sessionEntry is one panel login: its expiry plus the one-shot notice the
+// dashboard shows on the render that follows a lifecycle action's 303 (see
+// panelNotice). Per-login, not per-process, so two tabs never eat or mix up
+// each other's feedback.
+type sessionEntry struct {
+	expires time.Time
+	notice  string
 }
 
 func newSessionStore() *sessionStore {
-	return &sessionStore{m: make(map[string]time.Time)}
+	return &sessionStore{m: make(map[string]sessionEntry)}
 }
 
 func (s *sessionStore) issue() string {
 	id := ids.New()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.m[id] = time.Now().Add(sessionTTL)
+	s.m[id] = sessionEntry{expires: time.Now().Add(sessionTTL)}
 	return id
 }
 
 func (s *sessionStore) valid(id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	exp, ok := s.m[id]
-	if ok && time.Now().Before(exp) {
-		s.m[id] = time.Now().Add(sessionTTL)
+	e, ok := s.m[id]
+	if ok && time.Now().Before(e.expires) {
+		e.expires = time.Now().Add(sessionTTL)
+		s.m[id] = e
 		return true
 	}
 	delete(s.m, id)
@@ -88,6 +98,30 @@ func (s *sessionStore) revoke(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.m, id)
+}
+
+// setNotice leaves a message for the login's next dashboard render; takeNotice
+// returns and clears it, so a refresh does not repeat stale feedback.
+func (s *sessionStore) setNotice(id, msg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e, ok := s.m[id]; ok {
+		e.notice = msg
+		s.m[id] = e
+	}
+}
+
+func (s *sessionStore) takeNotice(id string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.m[id]
+	if !ok {
+		return ""
+	}
+	msg := e.notice
+	e.notice = ""
+	s.m[id] = e
+	return msg
 }
 
 func New(st *store.Store, h *hub.Hub, adminToken string, log *slog.Logger) (*Panel, error) {
@@ -188,9 +222,22 @@ func (p *Panel) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /panel/agents/{id}/revoke", p.revokeAgent)
 }
 
-func (p *Panel) requirePanel(w http.ResponseWriter, r *http.Request) bool {
+// panelToken returns the login token of a valid panel session, or "" when the
+// cookie is missing/expired. requirePanel gates on it; handlers that leave a
+// notice (panelNotice) need the token itself.
+func (p *Panel) panelToken(r *http.Request) string {
 	c, err := r.Cookie(cookieName)
-	if err == nil && p.sessions.valid(c.Value) {
+	if err != nil {
+		return ""
+	}
+	if !p.sessions.valid(c.Value) {
+		return ""
+	}
+	return c.Value
+}
+
+func (p *Panel) requirePanel(w http.ResponseWriter, r *http.Request) bool {
+	if p.panelToken(r) != "" {
 		return true
 	}
 	http.Redirect(w, r, "/panel/login", http.StatusSeeOther)
@@ -278,6 +325,16 @@ type dashData struct {
 	// Pickable reports whether any agent other than "admin" exists (i.e.
 	// the new-session form has someone to pick).
 	Pickable bool
+	// Notice is the one-shot feedback of the lifecycle action that redirected
+	// here (archived / reopened / deleted / already gone), so the user can
+	// read the outcome without guessing.
+	Notice string
+}
+
+// errorData backs error.tmpl: the HTTP status's text plus a plain sentence.
+type errorData struct {
+	Title   string
+	Message string
 }
 
 type agentRow struct {
@@ -337,7 +394,7 @@ func (p *Panel) dashboard(w http.ResponseWriter, r *http.Request) {
 		}
 		agentRows = append(agentRows, row)
 	}
-	p.render(w, http.StatusOK, "dashboard.tmpl", dashData{Sessions: rows, Agents: agentRows, Pickable: pickable})
+	p.render(w, http.StatusOK, "dashboard.tmpl", dashData{Sessions: rows, Agents: agentRows, Pickable: pickable, Notice: p.sessions.takeNotice(p.panelToken(r))})
 }
 
 // createSession handles the dashboard "New session" form: a title plus a
@@ -680,7 +737,7 @@ func (p *Panel) sessionView(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	sess, err := p.Store.GetSession(ctx, sid)
 	if err != nil {
-		p.httpError(w, "session not found", 404)
+		p.httpError(w, "This session no longer exists — it may have been deleted. The sessions list shows what is still around.", 404)
 		return
 	}
 	msgs, err := p.Store.SessionLatestMessages(ctx, sid, 200)
@@ -863,13 +920,35 @@ func (p *Panel) setSessionStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "status must be active or archived", http.StatusBadRequest)
 		return
 	}
+	// Read the session first: its title names the session in the outcome
+	// notice, and a missing row is a stale dashboard (deleted in another tab,
+	// or a second submit) rather than a store failure — the intent "archive
+	// it" is already satisfied, so treat it as such instead of showing an
+	// unexplained error page.
+	sess, err := p.Store.GetSession(ctx, sid)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			p.panelNotice(w, r, sessionGoneNotice)
+			return
+		}
+		p.storeErr(w, err)
+		return
+	}
 	if err := p.Store.SetSessionStatus(ctx, sid, status); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			p.panelNotice(w, r, sessionGoneNotice)
+			return
+		}
 		p.storeErr(w, err)
 		return
 	}
 	p.Log.Info("panel set session status", "id", sid, "status", status)
 	p.fanout(ctx, sid)
-	http.Redirect(w, r, "/panel/", http.StatusSeeOther)
+	verb := "archived"
+	if status == "active" {
+		verb = "reopened"
+	}
+	p.panelNotice(w, r, fmt.Sprintf("Session “%s” %s.", sess.Title, verb))
 }
 
 // deleteSession is the panel's Delete control: the session and everything
@@ -887,14 +966,42 @@ func (p *Panel) deleteSession(w http.ResponseWriter, r *http.Request) {
 	}
 	sid := r.PathValue("id")
 	ctx := r.Context()
+	// Title first (the notice names the session) and a vanished session is the
+	// already-done case, not an error page — see setSessionStatus.
+	sess, err := p.Store.GetSession(ctx, sid)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			p.panelNotice(w, r, sessionGoneNotice)
+			return
+		}
+		p.storeErr(w, err)
+		return
+	}
 	participants, err := p.Store.DeleteSession(ctx, sid)
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			p.panelNotice(w, r, sessionGoneNotice)
+			return
+		}
 		p.storeErr(w, err)
 		return
 	}
 	p.Log.Info("panel deleted session", "id", sid, "participants", len(participants))
 	p.Hub.NotifySession(sid)
 	p.Hub.Notify(participants)
+	p.panelNotice(w, r, fmt.Sprintf("Session “%s” deleted.", sess.Title))
+}
+
+// sessionGoneNotice is what a lifecycle action on a session that no longer
+// exists reports: a stale dashboard row (deleted in another tab) or a repeat
+// submit must leave the user informed, not on a bare "not found" page.
+const sessionGoneNotice = "That session no longer exists — it may have been deleted from another tab."
+
+// panelNotice stores msg for this login's next dashboard render and sends the
+// browser back to the dashboard, so every lifecycle action ends on a page that
+// states its outcome.
+func (p *Panel) panelNotice(w http.ResponseWriter, r *http.Request, msg string) {
+	p.sessions.setNotice(p.panelToken(r), msg)
 	http.Redirect(w, r, "/panel/", http.StatusSeeOther)
 }
 
@@ -1172,8 +1279,16 @@ func (p *Panel) fragment(name string, data any) string {
 	return strings.TrimSpace(sb.String())
 }
 
+// httpError renders the panel's error page: the status code, one plain
+// sentence and a way back to the sessions list. A browser reaches these paths
+// through a stale tab, a bookmark, a back button or a link to a session that
+// has since been deleted, so a bare text body ("not found") reads as a dead
+// end with no hint of what happened.
 func (p *Panel) httpError(w http.ResponseWriter, msg string, status int) {
-	http.Error(w, msg, status)
+	p.render(w, status, "error.tmpl", errorData{
+		Title:   http.StatusText(status),
+		Message: msg,
+	})
 }
 
 func writeSSE(w io.Writer, flusher http.Flusher, event, data string) {

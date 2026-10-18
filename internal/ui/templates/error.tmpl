@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} · Butler</title>
+<link rel="stylesheet" href="{{asset "style.css"}}">
+</head>
+<body>
+<header>
+<span class="brand">Butler</span>
+</header>
+<main class="dashboard">
+<section class="new-session">
+<h2>{{.Title}}</h2>
+<p class="error">{{.Message}}</p>
+<p><a href="/panel/">← Back to the sessions list</a></p>
+</section>
+</main>
+</body>
+</html>

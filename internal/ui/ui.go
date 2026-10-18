@@ -470,8 +470,10 @@ type sessionViewData struct {
 	// server resolves @<title> as well as @<id>, @<kind> and @all).
 	Mentionables string
 	// Audience is a JSON array of the session's participants as the read
-	// marks need them ({id,name,kind,joined}) and Reads a JSON object of
-	// participant id -> highest read seq. app.js uses these (plus SSE
+	// marks need them ({id,name,kind,since,human}) and Reads a JSON object of
+	// participant id -> highest read seq. The store supplies id/name/kind and
+	// since (AudienceMember.JoinedSeq marshals as "since"); the panel adds
+	// human, true for the admin identity. app.js uses these (plus SSE
 	// "reads"/"audience" events) to keep the per-message read marks and
 	// their tooltips current without a page reload.
 	Audience string

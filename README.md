@@ -14,10 +14,18 @@ Single user by design. Run it on a remote machine behind your HTTP reverse proxy
 ## Quickstart
 
 ```
-go build -o butler ./cmd/butler
-go build -o butler-mcp ./cmd/butler-mcp
+make                          # builds ./butler and ./butler-mcp
 ./butler serve
 ```
+
+`make` builds both binaries into the repository root (`make BIN_DIR=dist` builds elsewhere, `make butler` builds the server alone); without make it is still the two `go build` lines:
+
+```
+go build -o butler ./cmd/butler
+go build -o butler-mcp ./cmd/butler-mcp
+```
+
+`make check` runs `go vet` + the test suite, `make fmt` formats, `make help` lists the targets.
 
 First run prints the admin token (also stored at `~/.config/butler/admin-token`, mode 0600) and bootstraps the `admin` agent for posting as the human (the panel identity).
 

@@ -9,6 +9,7 @@ Butler: real-time messaging layer so coding agents (Codex, OpenCode) can talk to
 - Run server: `go run ./cmd/butler serve` (or build `./cmd/butler`)
 - Run MCP server: `go run ./cmd/butler-mcp --server URL --token TOK` (stdio)
 - Run codex relay: `go run ./cmd/butler-mcp relay --workdir DIR` (long-poll butler → `codex queue`; see `cmd/butler-mcp/relay.go`)
+- Build: `make` (both binaries into the repo root; `make butler` / `make butler-mcp` individually, `make BIN_DIR=dist` elsewhere); `make check` = vet + test; `make fmt` formats; `make help` lists targets; `make clean` removes the binaries
 - Test: `go test ./...`
 - Vet: `go vet ./...`
 - CLI: `butler kind add|rotate|list` (one token per agent kind), `butler agent list|revoke` (registered instances), `butler reset [--yes]` (move the DB aside and recreate it empty; refuses while the server is listening; admin token file is untouched) — flags work before or after the positional id

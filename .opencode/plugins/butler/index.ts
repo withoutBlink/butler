@@ -29,6 +29,20 @@
 //     OWN OpenCode session only — @mentioning a specific role wakes
 //     exactly that session. Read marks advance per role (wait batches mark
 //     what reached the session's context).
+//   - The relay does not paste message content: it ENQUEUES a short
+//     notification naming the butler session that has new messages, and the
+//     agent reads them with the butler MCP tools (read_session /
+//     check_messages). Pasting content queued unbounded turns of stale text
+//     that those tools can fetch on demand.
+//   - Notifications are deduped per (OpenCode session, butler session):
+//     before enqueuing, the target's inbox is listed (GET
+//     /api/session/{id}/inbox returns the items still waiting to run, and an
+//     item leaves the list the moment its turn starts) and the new
+//     notification is DROPPED when one for that butler session is still
+//     queued — the queued one already points at the session, and reading it
+//     picks up everything that arrived since. The check fails OPEN: no inbox
+//     API, or a failed read, enqueues — one notification too many never
+//     loses a message.
 //   - The plugin also shadows the butler MCP tools (send_message,
 //     read_session, …) under their same effective names. Their executors
 //     see the calling session's id, so replies and history reads act as
@@ -475,7 +489,63 @@ export default Plugin.define({
       return sid
     }
 
+    // ---- target inbox: notification dedupe ----
+    //
+    // GET /api/session/{id}/inbox lists the items still waiting to run
+    // (delivery "queue"); an item leaves the list the moment its turn
+    // starts. A butler notification for butler session S is therefore
+    // "still queued" exactly when some pending item's text carries S's
+    // tag. The plugin context exposes that endpoint under one of two
+    // shapes depending on the OpenCode build, so probe once and cache. If
+    // neither is present the check answers "not queued" and the caller
+    // enqueues — fail OPEN, because one notification too many never loses
+    // a message while a wrong "queued" would.
+    const NOTIFY_TAG = "butler-notify:"
+    let inboxList: ((input: { sessionID: string }) => Promise<unknown>) | null | undefined
+    const inboxItems = async (sessionID: string): Promise<unknown[] | undefined> => {
+      if (inboxList === undefined) {
+        const c = ctx as any
+        if (typeof c?.inbox?.list === "function") {
+          inboxList = c.inbox.list.bind(c.inbox)
+          console.error("[butler] notification dedupe enabled via ctx.inbox.list")
+        } else if (typeof c?.session?.inbox?.list === "function") {
+          inboxList = c.session.inbox.list.bind(c.session.inbox)
+          console.error("[butler] notification dedupe enabled via ctx.session.inbox.list")
+        } else {
+          inboxList = null
+          console.error("[butler] session inbox API not found on the plugin context — notification dedupe disabled")
+        }
+      }
+      if (!inboxList) return undefined
+      try {
+        const res: any = await inboxList({ sessionID })
+        const items = Array.isArray(res) ? res : res?.data
+        return Array.isArray(items) ? items : undefined
+      } catch (err) {
+        console.error("[butler] session inbox read failed:", err)
+        return undefined
+      }
+    }
+
+    // True while the target still holds a queued butler notification for
+    // this butler session; the new notification is then dropped.
+    const notifyQueued = async (target: string, sid: string): Promise<boolean> => {
+      const items = await inboxItems(target)
+      if (!items) return false
+      const tag = NOTIFY_TAG + sid
+      return items.some(it => {
+        const text = (it as any)?.payload?.text
+        return typeof text === "string" && text.includes(tag)
+      })
+    }
+
     // ---- relay into an OpenCode session ----
+    //
+    // The relay enqueues a POINTER, not the messages: content piled up as
+    // an unbounded queue of stale turns, and it is fetchable on demand
+    // with the butler MCP tools anyway. One notification per butler
+    // session per batch, dropped when one for that session is still
+    // queued in the target.
 
     const relayInto = async (
       target: string,
@@ -483,34 +553,16 @@ export default Plugin.define({
       ident: { server: string, token: string },
       msgs: ButlerMessage[],
     ): Promise<boolean> => {
-      const isMentioned = (m: ButlerMessage) => (m.mentions ?? []).includes(myAgent)
-      const bySession = new Map<string, ButlerMessage[]>()
-      for (const m of msgs) {
-        const list = bySession.get(m.session_id) ?? []
-        list.push(m)
-        bySession.set(m.session_id, list)
-      }
-      for (const [sid, list] of bySession) {
+      const sids = new Set(msgs.map(m => m.session_id))
+      for (const sid of sids) {
+        if (await notifyQueued(target, sid)) continue
         const title = await sessionTitle(ident, sid)
-        const lines = list.map(m =>
-          m.kind === "context"
-            ? `${isMentioned(m) ? "ADDRESSED TO YOU (reply expected): " : "FYI: "}[${m.seq}] ${m.sender_id} set context: ${m.content}`
-            : `${isMentioned(m) ? "ADDRESSED TO YOU (reply expected): " : "FYI: "}[${m.seq}] ${m.sender_id}: ${m.content}`,
-        )
-        const mentioned = list.filter(isMentioned).length
-        const urgency =
-          mentioned > 0
-            ? `${mentioned} of these message(s) @-mention you — respond to those with the butler send_message tool. The rest are FYI. If you decide to act on any of them, ack briefly first (send_message "on it"), then do the work and report back — don't stay silent until finished.`
-            : "None of these messages @-mention you — FYI only; reply with the butler send_message tool if a response is needed. If you do decide to act on one, ack briefly first, then do the work and report back — don't stay silent until finished."
         const isSessionAgent = sessionAgents.get(target)?.agent === myAgent
         const text = [
-          `[butler relay] ${list.length} new message${list.length === 1 ? "" : "s"} in "${title}" (${sid}):`,
-          "",
-          ...lines,
-          "",
-          `You are ${myAgent} in butler${isSessionAgent ? " (one agent per OpenCode session)" : " — the shared app-level identity; this OpenCode session also has its own agent"}.`,
-          "Relayed automatically by the butler plugin — no human typed this.",
-          urgency,
+          `[butler] new messages in "${title}" (${sid}).`,
+          `Read them with the butler MCP tools — read_session({ session: "${sid}" }), or check_messages for every session. Messages that @-mention you expect a reply.`,
+          `Relayed automatically by the butler plugin — no human typed this. You are ${myAgent}${isSessionAgent ? " (this OpenCode session's role)" : " (the shared app-level identity)"}; if you act, ack briefly first, then report back.`,
+          `${NOTIFY_TAG}${sid}`,
         ].join("\n")
         try {
           await ctx.session.prompt({ sessionID: target, text, delivery: opts.delivery ?? "queue" })

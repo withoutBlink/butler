@@ -118,7 +118,7 @@ Display names are matched as whole names — at each `@` the longest matching pa
 The point is differentiated notifications. Every consumer surfaces the distinction:
 
 - `wait_for_messages` / `check_messages` output starts with a count split — "N @-mention you (reply expected), M are FYI" — and marks each mentioning line with `(mentioned you)`. Messages are grouped per session (with titles), so the agent knows where to reply.
-- The OpenCode relay plugin and the codex relay daemon frame injected prompts differently: `ADDRESSED TO YOU (reply expected): …` for mentions, `FYI: …` for the rest, with a closing line telling the agent to answer the mentions and ignore the FYI unless relevant.
+- The codex relay daemon frames injected prompts as `ADDRESSED TO YOU (reply expected): …` for mentions, `FYI: …` for the rest, with a closing line telling the agent to answer the mentions and ignore the FYI unless relevant. The OpenCode relay plugin enqueues a **pointer instead of the content** — `[butler] new messages in "<title>" (<sid>)` plus the instruction to read them with the butler MCP tools — so a busy session never accumulates a queue of stale message text; the same mention split comes from `read_session`/`check_messages` when the agent reads.
 - So: mention an agent when it should reply; post unmentioned for broadcast/FYI. Mentions only reach agents already in the session (mention `@kind` or add them from the panel otherwise).
 
 **Agent etiquette — ack, then work, then report.** When an agent decides to act on a message (mentioned or not), it should send a brief ack right away ("on it"), do the work, then report the result. Going silent until finished leaves everyone waiting on an answer that may be minutes away. `wait_for_messages`/`check_messages` spell this out in every batch.
@@ -149,11 +149,13 @@ panel / codex / another agent
         │ message (seq N), mentions @Fix read marks (seq-resolved to its role id)
         ▼
    butler server ──► per-session wait loop of that session's agent
-                               │ ctx.session.prompt(text, delivery:"queue")
+                               │ ctx.session.prompt(pointer, delivery:"queue")
                                ▼
                      that OpenCode session — agent wakes with:
-                     "[butler relay] 1 new message in "m4 planning": …
-                      ADDRESSED TO YOU (reply expected): …"
+                     "[butler] new messages in "m4 planning" (…).
+                      Read them with the butler MCP tools —
+                      read_session({ session: "…" })."
+                     (one pending pointer per session at a time)
 ```
 
 Per-session roles:
@@ -170,7 +172,7 @@ Delivery rules (both loops):
 - **Target session** = the one that most recently ran a model request (tracked with a no-op `context` hook), so messages land in the conversation the agent is actually using. Before any session is seen — or with `bridge: true` — a dedicated "Butler" session is created and reused instead.
 - **`delivery: "queue"`** (default) never interrupts an in-flight generation; the message is processed at the next step boundary. `delivery: "steer"` is available as an option.
 - **Filtered**: messages sent by the identity itself (its own `send_message` output — prevents echo loops) and `system` notices (join/leave/reconnect) are not relayed; `chat` and `context` messages are.
-- **Mention-aware framing**: injected messages carry `ADDRESSED TO YOU (reply expected):` when they @-mention the agent and `FYI:` otherwise, so the agent knows which to answer and which it can ignore.
+- **Pointer, not content**: the relay enqueues one short notification per butler session — `[butler] new messages in "<title>" (<sid>)` plus how to read them with the MCP tools — instead of the messages themselves, and **dedupes** it: if a notification for that session is still queued in the target's inbox (`GET /api/session/{id}/inbox`, i.e. it has not started running yet), the new one is dropped, because the queued pointer already means "read this session" and picks up everything that arrived since. The agent then reads the messages — and the `@-mention you` split — with `read_session`/`check_messages`.
 - **Cursor**: the agent-client loop starts at the server's latest seq (history is never replayed — agents use `read_session`). Each role loop's cursor **persists in plugin storage**, so messages that arrived while the plugin context was down (OpenCode tears plugins down when no client work is active) are delivered when the role re-activates — at-least-once: a teardown right after a relay can re-deliver that batch. Persisted cursors are **clamped to the server's current seq** (checked at activation and periodically while polling): a server-side reset (`butler reset` recreates the DB, so the stream restarts at 0) would otherwise leave a role's cursor ahead of everything that will arrive for a long time and starve it silently. After a reset the role replays the fresh stream from the start; the agent-client loop (forward-only) skips to the server's position instead.
 
 Recovery:

@@ -34,15 +34,18 @@
 //     agent reads them with the butler MCP tools (read_session /
 //     check_messages). Pasting content queued unbounded turns of stale text
 //     that those tools can fetch on demand.
-//   - Notifications are deduped per (OpenCode session, butler session):
-//     before enqueuing, the target's inbox is listed (GET
-//     /api/session/{id}/inbox returns the items still waiting to run, and an
-//     item leaves the list the moment its turn starts) and the new
-//     notification is DROPPED when one for that butler session is still
-//     queued — the queued one already points at the session, and reading it
-//     picks up everything that arrived since. The check fails OPEN: no inbox
-//     API, or a failed read, enqueues — one notification too many never
-//     loses a message.
+//   - Notifications are deduped per (OpenCode session, butler session) from
+//     the event stream, not by polling the inbox (the plugin context does not
+//     expose the inbox HTTP API): every enqueue arrives as
+//     "session.inbox.enqueued" (with the item's text) and the moment an
+//     item's turn starts as "session.inbox.delivered" (inboxID), or taken
+//     out of the queue as "session.inbox.cancelled" (inboxID). A pointer
+//     we enqueued is therefore "still queued" until its own delivery event,
+//     and the new notification is DROPPED while one for that session is
+//     still queued — the queued one already points at the session, and
+//     reading it picks up everything that arrived since. The check fails
+//     OPEN: anything the plugin never observed counts as not queued, because
+//     one notification too many never loses a message.
 //   - The plugin also shadows the butler MCP tools (send_message,
 //     read_session, …) under their same effective names. Their executors
 //     see the calling session's id, so replies and history reads act as
@@ -489,54 +492,58 @@ export default Plugin.define({
       return sid
     }
 
-    // ---- target inbox: notification dedupe ----
+    // ---- queued-notification registry (dedupe) ----
     //
-    // GET /api/session/{id}/inbox lists the items still waiting to run
-    // (delivery "queue"); an item leaves the list the moment its turn
-    // starts. A butler notification for butler session S is therefore
-    // "still queued" exactly when some pending item's text carries S's
-    // tag. The plugin context exposes that endpoint under one of two
-    // shapes depending on the OpenCode build, so probe once and cache. If
-    // neither is present the check answers "not queued" and the caller
-    // enqueues — fail OPEN, because one notification too many never loses
-    // a message while a wrong "queued" would.
+    // The plugin context does NOT expose the session inbox HTTP API, but the
+    // event stream below carries its whole lifecycle: every enqueue arrives
+    // as "session.inbox.enqueued" (with the item's payload text) and the
+    // moment an item's turn starts as "session.inbox.delivered" (inboxID
+    // only) and its cancellation as "session.inbox.cancelled". A butler
+    // notification is therefore "still queued" exactly while its inboxID has
+    // been seen enqueued and not yet settled — the registry is filled by the
+    // enqueued handler and emptied by the settled one, both fed by the one
+    // event loop. Anything this plugin
+    // never observed counts as NOT queued: fail OPEN, because a duplicate
+    // notification only costs a turn while a suppressed one loses a message.
+    // The TTL bounds the damage of a delivery event we somehow missed.
     const NOTIFY_TAG = "butler-notify:"
-    let inboxList: ((input: { sessionID: string }) => Promise<unknown>) | null | undefined
-    const inboxItems = async (sessionID: string): Promise<unknown[] | undefined> => {
-      if (inboxList === undefined) {
-        const c = ctx as any
-        if (typeof c?.inbox?.list === "function") {
-          inboxList = c.inbox.list.bind(c.inbox)
-          console.error("[butler] notification dedupe enabled via ctx.inbox.list")
-        } else if (typeof c?.session?.inbox?.list === "function") {
-          inboxList = c.session.inbox.list.bind(c.session.inbox)
-          console.error("[butler] notification dedupe enabled via ctx.session.inbox.list")
-        } else {
-          inboxList = null
-          console.error("[butler] session inbox API not found on the plugin context — notification dedupe disabled")
-        }
-      }
-      if (!inboxList) return undefined
-      try {
-        const res: any = await inboxList({ sessionID })
-        const items = Array.isArray(res) ? res : res?.data
-        return Array.isArray(items) ? items : undefined
-      } catch (err) {
-        console.error("[butler] session inbox read failed:", err)
-        return undefined
-      }
+    const NOTIFY_TTL_MS = 5 * 60 * 1000
+    const pointerTag = (text: unknown): string | undefined => {
+      if (typeof text !== "string") return undefined
+      const at = text.lastIndexOf(NOTIFY_TAG)
+      if (at < 0) return undefined
+      const sid = text.slice(at + NOTIFY_TAG.length).split(/\s/)[0]
+      return sid.length > 0 ? sid : undefined
+    }
+    const pendingPointers = new Map<string, { target: string; sid: string; at: number }>()
+
+    const onInboxEnqueued = (d: any) => {
+      const sid = pointerTag(d?.item?.payload?.text)
+      if (!sid || typeof d?.inboxID !== "string" || typeof d?.sessionID !== "string") return
+      pendingPointers.set(d.inboxID, { target: d.sessionID, sid, at: Date.now() })
+    }
+
+    // An item stops being "still queued" when its turn starts
+    // (session.inbox.delivered) or when it is taken out of the queue
+    // (session.inbox.cancelled — the user's interrupt cancels pending items,
+    // and leaving that entry behind would suppress that session's
+    // notifications until the TTL).
+    const onInboxSettled = (d: any) => {
+      if (typeof d?.inboxID === "string") pendingPointers.delete(d.inboxID)
     }
 
     // True while the target still holds a queued butler notification for
     // this butler session; the new notification is then dropped.
-    const notifyQueued = async (target: string, sid: string): Promise<boolean> => {
-      const items = await inboxItems(target)
-      if (!items) return false
-      const tag = NOTIFY_TAG + sid
-      return items.some(it => {
-        const text = (it as any)?.payload?.text
-        return typeof text === "string" && text.includes(tag)
-      })
+    const notifyQueued = (target: string, sid: string): boolean => {
+      const now = Date.now()
+      for (const [id, p] of pendingPointers) {
+        if (now - p.at > NOTIFY_TTL_MS) {
+          pendingPointers.delete(id)
+          continue
+        }
+        if (p.target === target && p.sid === sid) return true
+      }
+      return false
     }
 
     // ---- relay into an OpenCode session ----
@@ -555,7 +562,7 @@ export default Plugin.define({
     ): Promise<boolean> => {
       const sids = new Set(msgs.map(m => m.session_id))
       for (const sid of sids) {
-        if (await notifyQueued(target, sid)) continue
+        if (notifyQueued(target, sid)) continue
         const title = await sessionTitle(ident, sid)
         const isSessionAgent = sessionAgents.get(target)?.agent === myAgent
         const text = [
@@ -654,16 +661,23 @@ export default Plugin.define({
       }
     })()
 
-    // Roles also activate on ANY session touch, not just model requests: a
-    // session the user opens (session.viewed) or messages
-    // (session.inbox.enqueued) gets its role registered even if the model
-    // never runs. ensureSessionAgent skips sessions belonging to other
-    // locations — those are other agent clients' sessions.
+    // The event stream does two jobs:
+    //   - the notification registry (onInboxEnqueued / onInboxDelivered);
+    //   - role activation on ANY session touch, not just model requests: a
+    //     session the user opens (session.viewed) or messages
+    //     (session.inbox.enqueued) gets its role registered even if the model
+    //     never runs. ensureSessionAgent skips sessions belonging to other
+    //     locations — those are other agent clients' sessions.
     void (async () => {
       try {
         const stream = (ctx.event as any).subscribe({ signal: controller.signal }) as AsyncIterable<any>
         for await (const ev of stream) {
           const type = ev?.type
+          if (type === "session.inbox.enqueued") onInboxEnqueued(ev?.data)
+          if (type === "session.inbox.delivered" || type === "session.inbox.cancelled") {
+            onInboxSettled(ev?.data)
+            continue
+          }
           if (type !== "session.viewed" && type !== "session.inbox.enqueued") continue
           const sid = ev?.data?.sessionID
           if (typeof sid !== "string") continue

@@ -27,7 +27,7 @@ LDFLAG_ARG = $(if $(strip $(LDFLAGS)),-ldflags "$(LDFLAGS)")
 # The target names double as file names at the root, so keep them phony:
 # a real file target with no prerequisites would look up to date and skip the
 # build. Go's own build cache already makes repeated builds cheap.
-.PHONY: all build butler butler-mcp test vet check fmt fmt-check run relay install clean help
+.PHONY: all build butler butler-mcp test race vet check fmt fmt-check run relay install clean help
 .DEFAULT_GOAL := build
 
 all: build
@@ -42,6 +42,13 @@ butler-mcp:
 
 test:
 	$(GO) test ./...
+
+# The hub's subscribe/cancel/notify paths are concurrent (every long-poll wait
+# and SSE stream subscribes and cancels from its own request goroutine), and a
+# miss there is a fatal "concurrent map writes" that kills the server. -race is
+# the guard, and TestConcurrentSubscribeCancelNotify reproduces it.
+race:
+	$(GO) test -race ./...
 
 vet:
 	$(GO) vet ./...
@@ -76,6 +83,7 @@ help:
 	@echo "  butler      build the server only"
 	@echo "  butler-mcp  build the MCP server only"
 	@echo "  check       vet + test"
+	@echo "  race        the test suite under -race"
 	@echo "  test        the test suite"
 	@echo "  fmt         gofmt -w cmd internal"
 	@echo "  fmt-check   fail if anything needs gofmt"

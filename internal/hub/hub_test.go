@@ -1,9 +1,48 @@
 package hub
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
+
+// TestConcurrentSubscribeCancelNotify hammers the three paths that touch the
+// hub's subscriber maps at once: every long-poll wait and every SSE stream
+// subscribes and then cancels from its own request goroutine while Notify
+// broadcasts from others. The cancel used to delete from those maps without
+// the hub lock, which the runtime answers with "concurrent map writes" — a
+// fatal error, not a panic, so it cannot be recovered per request: the whole
+// server dies (agents then see connection refused until someone restarts it).
+// Cancel is also called twice here: it must stay a no-op once the key is gone.
+func TestConcurrentSubscribeCancelNotify(t *testing.T) {
+	h := New()
+	defer h.Close()
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_, cancel := h.Subscribe("a")
+				_, cancelSession := h.SubscribeSession("s")
+				h.Notify([]string{"a", "b"})
+				h.NotifySession("s")
+				cancelSession()
+				cancel()
+				cancel()
+			}
+		}()
+	}
+	time.Sleep(200 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
 
 func TestNotifyWakesSubscriber(t *testing.T) {
 	h := New()

@@ -6,15 +6,23 @@ type Hub struct {
 	mu          sync.Mutex
 	agentSubs   map[string]map[chan struct{}]struct{}
 	sessionSubs map[string]map[chan struct{}]struct{}
-	closed      bool
+	// boardSubs wakes the panel's task-board SSE streams. One key ("board"):
+	// the board is a single page, not per session.
+	boardSubs map[string]map[chan struct{}]struct{}
+	closed    bool
 }
 
 func New() *Hub {
 	return &Hub{
 		agentSubs:   make(map[string]map[chan struct{}]struct{}),
 		sessionSubs: make(map[string]map[chan struct{}]struct{}),
+		boardSubs:   make(map[string]map[chan struct{}]struct{}),
 	}
 }
+
+// boardKey is the single subscriber bucket for the task board. The board is
+// one page, so it does not need per-session keys.
+const boardKey = "board"
 
 // addSub registers a subscriber and returns its wake channel plus a cancel
 // that removes it. The caller must hold h.mu: the maps are shared by every
@@ -85,6 +93,24 @@ func (h *Hub) NotifySession(sessionID string) {
 	notifySubs(h.sessionSubs, []string{sessionID})
 }
 
+// SubscribeBoard registers a task-board SSE stream. NotifyBoard wakes every
+// open board. The cancel takes the hub lock itself, same as the other
+// subscriber maps — an unlocked delete races Notify and kills the process.
+func (h *Hub) SubscribeBoard() (<-chan struct{}, func()) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.addSub(h.boardSubs, boardKey)
+}
+
+func (h *Hub) NotifyBoard() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return
+	}
+	notifySubs(h.boardSubs, []string{boardKey})
+}
+
 func (h *Hub) Close() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -103,6 +129,12 @@ func (h *Hub) Close() {
 			close(ch)
 		}
 		delete(h.sessionSubs, key)
+	}
+	for key, subs := range h.boardSubs {
+		for ch := range subs {
+			close(ch)
+		}
+		delete(h.boardSubs, key)
 	}
 }
 

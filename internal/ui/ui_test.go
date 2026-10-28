@@ -1608,3 +1608,188 @@ func TestPanelRemoveParticipant(t *testing.T) {
 		t.Fatalf("the refused removal must not drop role-y: %v %v", ok, err)
 	}
 }
+
+func TestBoardPage(t *testing.T) {
+	srv, st, _, adminTok := newPanel(t)
+	ctx := context.Background()
+	if _, err := st.CreateAgent(ctx, "admin", "Admin", "human", "", "", ""); err != nil {
+		t.Fatalf("admin: %v", err)
+	}
+	if _, err := st.EnsureGlobalSession(ctx, "admin"); err != nil {
+		t.Fatalf("global: %v", err)
+	}
+	if _, err := st.CreateAgent(ctx, "alpha", "Alpha", "codex", "alpha-host", "/tmp/proj", ""); err != nil {
+		t.Fatalf("alpha: %v", err)
+	}
+
+	anon := newBrowser(t)
+	resp, err := anon.Get(srv.URL + "/panel/board")
+	if err != nil {
+		t.Fatalf("anon get: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther || !strings.Contains(resp.Header.Get("Location"), "/panel/login") {
+		t.Fatalf("anon board: %d %s", resp.StatusCode, resp.Header.Get("Location"))
+	}
+
+	client := newBrowser(t)
+	login(t, client, srv.URL, adminTok)
+	resp, err = client.Get(srv.URL + "/panel/")
+	if err != nil {
+		t.Fatalf("dashboard: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `href="/panel/board"`) {
+		t.Fatal("dashboard should link to the board")
+	}
+
+	resp, err = client.Get(srv.URL + "/panel/board")
+	if err != nil {
+		t.Fatalf("board: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("board status: %d %s", resp.StatusCode, body)
+	}
+	for _, want := range []string{"To do", "In progress", "Blocked", "Review", "Done", "Alpha", "New task", `data-stream="/panel/board/stream"`} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("board missing %q:\n%s", want, body)
+		}
+	}
+
+	resp, err = client.PostForm(srv.URL+"/panel/tasks", url.Values{"title": {""}})
+	if err != nil {
+		t.Fatalf("empty title: %v", err)
+	}
+	bad, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(bad), "title is required") {
+		t.Fatalf("empty title: %d %s", resp.StatusCode, bad)
+	}
+
+	resp, err = client.PostForm(srv.URL+"/panel/tasks", url.Values{
+		"title": {"Ship the board"}, "description": {"kanban"}, "assignee": {"alpha"},
+		"status": {"todo"}, "priority": {"high"},
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/panel/board" {
+		t.Fatalf("create redirect: %d %s", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	resp, err = client.Get(srv.URL + "/panel/board")
+	if err != nil {
+		t.Fatalf("board after create: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	page := string(body)
+	for _, want := range []string{"Ship the board", "kanban", "Alpha", "high", "Task “Ship the board” created."} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("board missing %q:\n%s", want, page)
+		}
+	}
+	tasks, err := st.ListTasks(ctx, store.TaskFilter{})
+	if err != nil || len(tasks) != 1 || tasks[0].AssigneeID != "alpha" || tasks[0].Priority != "high" {
+		t.Fatalf("stored task: %+v %v", tasks, err)
+	}
+	msgs, err := st.MessagesSince(ctx, "alpha", store.GlobalSessionID, 0, 50)
+	if err != nil {
+		t.Fatalf("messages: %v", err)
+	}
+	var noticed bool
+	for _, m := range msgs {
+		if m.Kind == "chat" && m.MentionsAgent("alpha") && strings.Contains(m.Content, "Ship the board") {
+			noticed = true
+		}
+	}
+	if !noticed {
+		t.Fatalf("assignment did not mention alpha: %+v", msgs)
+	}
+
+	resp, err = client.PostForm(srv.URL+"/panel/tasks/"+tasks[0].ID, url.Values{"status": {"in_progress"}})
+	if err != nil {
+		t.Fatalf("move: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("move status: %d", resp.StatusCode)
+	}
+	resp, err = client.PostForm(srv.URL+"/panel/tasks/"+tasks[0].ID+"/comment", url.Values{"body": {"columns are up"}})
+	if err != nil {
+		t.Fatalf("comment: %v", err)
+	}
+	resp.Body.Close()
+	resp, err = client.Get(srv.URL + "/panel/board")
+	if err != nil {
+		t.Fatalf("board after move: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	page = string(body)
+	if !strings.Contains(page, "columns are up") {
+		t.Fatalf("comment not on the board:\n%s", page)
+	}
+	prog := strings.Index(page, `data-status="in_progress"`)
+	next := strings.Index(page, `data-status="blocked"`)
+	if prog < 0 || next < prog || !strings.Contains(page[prog:next], "Ship the board") {
+		t.Fatalf("task should sit in the in-progress column:\n%s", page)
+	}
+	got, err := st.GetTask(ctx, tasks[0].ID)
+	if err != nil || got.Status != store.TaskInProgress {
+		t.Fatalf("status: %+v %v", got, err)
+	}
+}
+
+func TestBoardStream(t *testing.T) {
+	srv, st, _, adminTok := newPanel(t)
+	ctx := context.Background()
+	if _, err := st.CreateAgent(ctx, "admin", "Admin", "human", "", "", ""); err != nil {
+		t.Fatalf("admin: %v", err)
+	}
+
+	client := newBrowser(t)
+	login(t, client, srv.URL, adminTok)
+
+	streamCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(streamCtx, "GET", srv.URL+"/panel/board/stream", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("stream: %d %s", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		post, err := client.PostForm(srv.URL+"/panel/tasks", url.Values{"title": {"Live card"}, "priority": {"urgent"}})
+		if err != nil {
+			t.Errorf("create: %v", err)
+			return
+		}
+		post.Body.Close()
+		if post.StatusCode != http.StatusSeeOther {
+			t.Errorf("create status: %d", post.StatusCode)
+		}
+	}()
+
+	events := readSSE(t, resp.Body, 2*time.Second)
+	var saw bool
+	for _, ev := range events {
+		if ev.name == "board" && strings.Contains(ev.data, "Live card") && strings.Contains(ev.data, "urgent") {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Fatalf("expected a board event with the new task, got %v", events)
+	}
+}

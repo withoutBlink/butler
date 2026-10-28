@@ -254,3 +254,90 @@ func (c *Client) PutContext(ctx context.Context, sid, key, value string) (*store
 	}
 	return &resp.ContextItem, resp.NotifySeq, nil
 }
+
+// TaskView is a task as the API returns it from a write or a get: the task
+// itself, its comment log (GET), and the seq of the mention that announced
+// the write (so the caller's wait cursor can skip its own notice).
+type TaskView struct {
+	store.Task
+	Comments  []store.TaskComment `json:"comments"`
+	NotifySeq int64               `json:"notify_seq,omitempty"`
+}
+
+func (c *Client) ListTasks(ctx context.Context, assignee, status, session string) ([]store.Task, error) {
+	q := url.Values{}
+	if assignee != "" {
+		q.Set("assignee", assignee)
+	}
+	if status != "" {
+		q.Set("status", status)
+	}
+	if session != "" {
+		q.Set("session", session)
+	}
+	path := "/api/v1/tasks"
+	if enc := q.Encode(); enc != "" {
+		path += "?" + enc
+	}
+	var resp struct {
+		Tasks []store.Task `json:"tasks"`
+	}
+	if err := c.do(ctx, "GET", path, nil, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Tasks == nil {
+		resp.Tasks = []store.Task{}
+	}
+	return resp.Tasks, nil
+}
+
+func (c *Client) GetTask(ctx context.Context, id string) (*TaskView, error) {
+	var out TaskView
+	if err := c.do(ctx, "GET", "/api/v1/tasks/"+url.PathEscape(id), nil, &out); err != nil {
+		return nil, err
+	}
+	if out.Comments == nil {
+		out.Comments = []store.TaskComment{}
+	}
+	return &out, nil
+}
+
+func (c *Client) CreateTask(ctx context.Context, title, description, assignee, status, priority, session string) (*TaskView, error) {
+	body := map[string]string{
+		"title": title, "description": description, "assignee": assignee,
+		"status": status, "priority": priority, "session_id": session,
+	}
+	var out TaskView
+	if err := c.do(ctx, "POST", "/api/v1/tasks", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) UpdateTaskStatus(ctx context.Context, id, status string) (*TaskView, error) {
+	var out TaskView
+	body := map[string]string{"status": status}
+	if err := c.do(ctx, "PATCH", "/api/v1/tasks/"+url.PathEscape(id), body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) CommentTask(ctx context.Context, id, body string) (*store.TaskComment, int64, error) {
+	var out struct {
+		store.TaskComment
+		NotifySeq int64 `json:"notify_seq"`
+	}
+	if err := c.do(ctx, "POST", "/api/v1/tasks/"+url.PathEscape(id)+"/comments", map[string]string{"body": body}, &out); err != nil {
+		return nil, 0, err
+	}
+	return &out.TaskComment, out.NotifySeq, nil
+}
+
+func (c *Client) ClaimTask(ctx context.Context, id string) (*TaskView, error) {
+	var out TaskView
+	if err := c.do(ctx, "POST", "/api/v1/tasks/"+url.PathEscape(id)+"/claim", map[string]any{}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}

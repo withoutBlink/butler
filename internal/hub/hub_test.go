@@ -31,8 +31,11 @@ func TestConcurrentSubscribeCancelNotify(t *testing.T) {
 				}
 				_, cancel := h.Subscribe("a")
 				_, cancelSession := h.SubscribeSession("s")
+				_, cancelBoard := h.SubscribeBoard()
 				h.Notify([]string{"a", "b"})
 				h.NotifySession("s")
+				h.NotifyBoard()
+				cancelBoard()
 				cancelSession()
 				cancel()
 				cancel()
@@ -146,5 +149,24 @@ func TestSessionSubscriberWokenByClose(t *testing.T) {
 	_, ok := <-ch
 	if ok {
 		t.Fatal("expected closed channel")
+	}
+}
+
+func TestBoardSubscriber(t *testing.T) {
+	h := New()
+	ch, cancel := h.SubscribeBoard()
+	defer cancel()
+	h.NotifySession("s1")
+	h.Notify([]string{"a"})
+	select {
+	case <-ch:
+		t.Fatal("session and agent wakes must not wake the board")
+	case <-time.After(50 * time.Millisecond):
+	}
+	h.NotifyBoard()
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("expected board wakeup")
 	}
 }

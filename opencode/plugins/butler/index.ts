@@ -121,7 +121,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 // effective registry ids, e.g. "butler_send_message"). wait_for_messages and
 // check_messages stay MCP: the relay already delivers per session, and the
 // blocking-poll tools carry no session context worth binding.
-const SHADOWED = /^(send_message|read_session|list_sessions|set_context|get_context|create_session|join_session)$/
+const SHADOWED = /^(send_message|read_session|list_sessions|set_context|get_context|create_session|join_session|list_tasks|get_task|create_task|update_task_status|comment_task|claim_task)$/
 const shadowedId = (id: string) => {
   const m = /^butler_*([^_].*)$/.exec(id)
   return m != null && SHADOWED.test(m[1])
@@ -1092,6 +1092,208 @@ export default Plugin.define({
           const { joined } = (await res.json()) as { joined: boolean }
           if (joined) return { content: `joined session ${session}\ncall read_session to catch up on its history` }
           return { content: `already a participant of session ${session}` }
+        }),
+      })
+
+      const taskPath = (id: string) => `/api/v1/tasks/${encodeURIComponent(id)}`
+      type ButlerTask = {
+        id: string
+        title: string
+        description?: string
+        status: string
+        priority: string
+        assignee_id?: string
+        creator_id: string
+        session_id?: string
+        comments?: { author_id: string, body: string, created_at?: number }[]
+      }
+      const formatTaskList = (tasks: ButlerTask[]) => {
+        if (!tasks.length) return "no tasks"
+        const lines = tasks.map(t => {
+          const who = t.assignee_id || "-"
+          return `  ${t.id}  [${t.status}]  [${t.priority}]  assignee=${who}  "${t.title}"`
+        })
+        return `${tasks.length} task(s):\n${lines.join("\n")}`
+      }
+      const formatTask = (t: ButlerTask) => {
+        const lines = [
+          `task "${t.title}" (${t.id})`,
+          `status: ${t.status}`,
+          `priority: ${t.priority}`,
+          `assignee: ${t.assignee_id || "unassigned"}`,
+          `creator: ${t.creator_id}`,
+          `session: ${t.session_id || "none"}`,
+        ]
+        if (t.description) lines.push("", t.description)
+        const notes = t.comments ?? []
+        if (!notes.length) lines.push("", "no comments")
+        else {
+          lines.push("", `${notes.length} comment(s):`)
+          for (const c of notes) lines.push(`  ${c.author_id}: ${c.body}`)
+        }
+        return lines.join("\n")
+      }
+
+      editor.add({
+        name: "list_tasks",
+        description:
+          "List tasks on the Butler board, as your session's butler identity. Filter with assignee (an agent id, a display name, a kind, \"me\" for yourself, or \"unassigned\") and/or status (todo, in_progress, blocked, review, done).",
+        input: {
+          type: "object",
+          properties: {
+            assignee: { type: "string", description: "agent id, display name, kind, \"me\", or \"unassigned\"" },
+            status: { type: "string", description: "todo, in_progress, blocked, review, or done" },
+            session: { type: "string", description: "only tasks linked to this session id" },
+          },
+          additionalProperties: false,
+        },
+        options: { namespace: "butler", codemode: true },
+        execute: exec(async (input, context) => {
+          const q = new URLSearchParams()
+          const assignee = String(input?.assignee ?? "").trim()
+          const status = String(input?.status ?? "").trim()
+          const session = String(input?.session ?? "").trim()
+          if (assignee) q.set("assignee", assignee)
+          if (status) q.set("status", status)
+          if (session) q.set("session", session)
+          const ident = identityFor(context?.sessionID)
+          const path = "/api/v1/tasks" + (q.toString() ? `?${q}` : "")
+          const res = await api(ident, "GET", path)
+          if (!res.ok) return errText(await errBody(res))
+          const { tasks = [] } = (await res.json()) as { tasks?: ButlerTask[] }
+          return { content: formatTaskList(tasks) }
+        }),
+      })
+
+      editor.add({
+        name: "get_task",
+        description:
+          "Read one task (description, status, assignee, comment log) as your session's butler identity. Use the id from list_tasks or from an assignment message.",
+        input: {
+          type: "object",
+          properties: { task: { type: "string", description: "task id, required" } },
+          required: ["task"],
+          additionalProperties: false,
+        },
+        options: { namespace: "butler", codemode: true },
+        execute: exec(async (input, context) => {
+          const task = String(input?.task ?? "")
+          if (!task) return errText("task is required")
+          const ident = identityFor(context?.sessionID)
+          const res = await api(ident, "GET", taskPath(task))
+          if (!res.ok) return errText(await errBody(res))
+          return { content: formatTask((await res.json()) as ButlerTask) }
+        }),
+      })
+
+      editor.add({
+        name: "create_task",
+        description:
+          "Create a task on the Butler board as your session's butler identity. assignee resolves like an @mention (id, display name, or kind). Assigning someone posts a message that @mentions them, so their wait loop wakes them.",
+        input: {
+          type: "object",
+          properties: {
+            title: { type: "string", description: "short title, required" },
+            description: { type: "string", description: "longer description" },
+            assignee: { type: "string", description: "agent id, display name, or kind" },
+            status: { type: "string", description: "todo, in_progress, blocked, review, or done; default todo" },
+            priority: { type: "string", description: "low, normal, high, or urgent; default normal" },
+            session: { type: "string", description: "session id to link, optional" },
+          },
+          required: ["title"],
+          additionalProperties: false,
+        },
+        options: { namespace: "butler", codemode: true },
+        execute: exec(async (input, context) => {
+          const title = String(input?.title ?? "")
+          if (!title.trim()) return errText("title is required")
+          const ident = identityFor(context?.sessionID)
+          const res = await api(ident, "POST", "/api/v1/tasks", {
+            title,
+            description: input?.description ?? "",
+            assignee: input?.assignee ?? "",
+            status: input?.status ?? "",
+            priority: input?.priority ?? "",
+            session_id: input?.session ?? "",
+          })
+          if (!res.ok) return errText(await errBody(res))
+          const task = (await res.json()) as ButlerTask
+          const who = task.assignee_id || "unassigned"
+          return { content: `created task "${task.title}" (${task.id})\nstatus: ${task.status} · priority: ${task.priority} · assignee: ${who}` }
+        }),
+      })
+
+      editor.add({
+        name: "update_task_status",
+        description:
+          "Move a task to todo, in_progress, blocked, review, or done, as your session's butler identity. The creator and the assignee (when that is someone else) are notified.",
+        input: {
+          type: "object",
+          properties: {
+            task: { type: "string", description: "task id, required" },
+            status: { type: "string", description: "todo, in_progress, blocked, review, or done, required" },
+          },
+          required: ["task", "status"],
+          additionalProperties: false,
+        },
+        options: { namespace: "butler", codemode: true },
+        execute: exec(async (input, context) => {
+          const task = String(input?.task ?? "")
+          const status = String(input?.status ?? "").trim()
+          if (!task || !status) return errText("task and status are required")
+          const ident = identityFor(context?.sessionID)
+          const res = await api(ident, "PATCH", taskPath(task), { status })
+          if (!res.ok) return errText(await errBody(res))
+          const updated = (await res.json()) as ButlerTask
+          return { content: `task ${updated.id} (${updated.title}) status: ${updated.status}` }
+        }),
+      })
+
+      editor.add({
+        name: "comment_task",
+        description:
+          "Add a progress comment to a task as your session's butler identity. The creator and the assignee are notified.",
+        input: {
+          type: "object",
+          properties: {
+            task: { type: "string", description: "task id, required" },
+            body: { type: "string", description: "comment text, required" },
+          },
+          required: ["task", "body"],
+          additionalProperties: false,
+        },
+        options: { namespace: "butler", codemode: true },
+        execute: exec(async (input, context) => {
+          const task = String(input?.task ?? "")
+          const body = String(input?.body ?? "")
+          if (!task || !body.trim()) return errText("task and body are required")
+          const ident = identityFor(context?.sessionID)
+          const res = await api(ident, "POST", `${taskPath(task)}/comments`, { body })
+          if (!res.ok) return errText(await errBody(res))
+          const note = (await res.json()) as { id?: string, task_id?: string }
+          return { content: `comment recorded on task ${note.task_id ?? task} (${note.id ?? ""})` }
+        }),
+      })
+
+      editor.add({
+        name: "claim_task",
+        description:
+          "Claim a task as your session's butler identity: it is assigned to you and moved to in_progress. The creator is notified. If it is already yours and in progress, this does nothing.",
+        input: {
+          type: "object",
+          properties: { task: { type: "string", description: "task id, required" } },
+          required: ["task"],
+          additionalProperties: false,
+        },
+        options: { namespace: "butler", codemode: true },
+        execute: exec(async (input, context) => {
+          const task = String(input?.task ?? "")
+          if (!task) return errText("task is required")
+          const ident = identityFor(context?.sessionID)
+          const res = await api(ident, "POST", `${taskPath(task)}/claim`, {})
+          if (!res.ok) return errText(await errBody(res))
+          const updated = (await res.json()) as ButlerTask
+          return { content: `claimed task "${updated.title}" (${updated.id})\nstatus: ${updated.status} · assignee: ${updated.assignee_id}` }
         }),
       })
     })

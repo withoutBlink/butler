@@ -147,3 +147,46 @@ tr.archived td { opacity: 0.6; }
 .mention-menu { position: absolute; bottom: 100%; left: 0; margin-bottom: 4px; min-width: 260px; max-width: 420px; max-height: 220px; overflow-y: auto; background: var(--card); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 4px 16px rgba(0,0,0,0.5); z-index: 10; }
 .mention-item { padding: 6px 10px; cursor: pointer; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; overflow-wrap: anywhere; }
 .mention-item.active { background: rgba(68, 147, 248, 0.2); }
+
+/* Task board. Column headings reuse h2; card titles must not — the global
+   h3 rule is uppercase and muted, which is wrong for a task name. */
+main.board-page { max-width: 1440px; }
+.task-form { display: flex; flex-direction: column; gap: 8px; }
+.task-form input, .task-form textarea, .task-form select, .move select {
+  padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
+  font: inherit; background: var(--bg); color: var(--fg); width: 100%;
+}
+.task-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+.task-row label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); flex: 1 1 140px; }
+.task-row button, .task-form button, .move button {
+  padding: 8px 14px; background: var(--accent); color: #fff; border: none; border-radius: 6px; cursor: pointer; font: inherit;
+}
+.task-row button { align-self: flex-end; }
+.board { display: flex; gap: 12px; align-items: flex-start; overflow-x: auto; padding-bottom: 8px; }
+.col { flex: 1 0 230px; background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px; min-height: 40vh; }
+.col h2 { margin: 0 0 10px; }
+.col .count { color: var(--muted); font-weight: 500; }
+.card { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px; margin-bottom: 8px; }
+.card h3 { font-size: 14px; text-transform: none; letter-spacing: 0; color: var(--fg); margin: 4px 0; font-weight: 600; }
+.card-top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.card .desc { margin: 0 0 6px; color: var(--muted); font-size: 13px; white-space: pre-wrap; }
+.card .meta { margin: 0 0 8px; font-size: 12px; color: var(--muted); }
+.card-session { color: var(--accent); text-decoration: none; font-size: 12px; }
+.pri { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+.pri-urgent { color: var(--err); }
+.pri-high { color: var(--context); }
+.pri-normal, .pri-low { color: var(--muted); }
+.move { display: flex; gap: 6px; margin-bottom: 6px; }
+.move select { flex: 1; }
+.move button { width: auto; padding: 6px 10px; }
+.card details { margin-top: 6px; }
+.card summary { cursor: pointer; color: var(--accent); font-size: 13px; }
+.card details form { margin-top: 8px; }
+.card label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.log { list-style: none; margin: 8px 0; padding: 0; }
+.log li { padding: 4px 0; border-top: 1px solid var(--border); font-size: 13px; white-space: pre-wrap; }
+.hint.empty { margin: 0; }
+@media (max-width: 760px) {
+  .board { flex-direction: column; }
+  .col { flex-basis: auto; min-height: 0; width: 100%; }
+}

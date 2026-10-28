@@ -266,3 +266,30 @@
     });
   }
 })();
+
+// Task board: replace the columns when the server pushes a new render.
+// Skip the swap while a control inside the board is focused, and apply the
+// pending HTML once focus leaves, so a live update does not wipe a form
+// mid-edit.
+(function () {
+  var board = document.getElementById('board');
+  if (!board || !window.EventSource) return;
+  var path = board.getAttribute('data-stream');
+  if (!path) return;
+  var pending = null;
+  function apply(html) {
+    if (board.querySelector(':focus')) {
+      pending = html;
+      return;
+    }
+    pending = null;
+    board.innerHTML = html;
+  }
+  board.addEventListener('focusout', function () {
+    setTimeout(function () {
+      if (pending && !board.querySelector(':focus')) apply(pending);
+    }, 0);
+  });
+  var es = new EventSource(path);
+  es.addEventListener('board', function (ev) { apply(ev.data); });
+})();

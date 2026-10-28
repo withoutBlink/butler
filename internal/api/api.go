@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"butler/internal/auth"
+	"butler/internal/board"
 	"butler/internal/hub"
 	"butler/internal/ids"
 	"butler/internal/metrics"
@@ -72,6 +73,9 @@ type API struct {
 	Metrics    *metrics.Metrics
 	Done       <-chan struct{}
 	Panel      *ui.Panel
+	// Board is the task-board service. Routes fills it when nil so tests
+	// can inject one (and wait on its webhook deliveries) before serving.
+	Board *board.Service
 }
 
 type agentJSON struct {
@@ -80,6 +84,9 @@ type agentJSON struct {
 }
 
 func (a *API) Routes() http.Handler {
+	if a.Board == nil {
+		a.Board = board.New(a.Store, a.Hub, a.Log)
+	}
 	mux := http.NewServeMux()
 	route := func(pattern string, h http.HandlerFunc) {
 		mux.HandleFunc(pattern, a.wrap(h))
@@ -107,6 +114,17 @@ func (a *API) Routes() http.Handler {
 	route("GET /api/v1/messages", a.catchupMessages)
 	route("GET /api/v1/seq", a.latestSeq)
 	route("GET /api/v1/wait", a.waitMessages)
+	route("POST /api/v1/tasks", a.createTask)
+	route("GET /api/v1/tasks", a.listTasks)
+	route("GET /api/v1/tasks/{id}", a.getTask)
+	route("PATCH /api/v1/tasks/{id}", a.patchTask)
+	route("POST /api/v1/tasks/{id}/comments", a.commentTask)
+	route("POST /api/v1/tasks/{id}/claim", a.claimTask)
+	route("GET /api/v1/webhooks", a.listWebhooks)
+	route("PUT /api/v1/webhooks/agents/{id}", a.putAgentWebhook)
+	route("DELETE /api/v1/webhooks/agents/{id}", a.deleteAgentWebhook)
+	route("PUT /api/v1/webhooks/kinds/{id}", a.putKindWebhook)
+	route("DELETE /api/v1/webhooks/kinds/{id}", a.deleteKindWebhook)
 	route("GET /metrics", a.getMetrics)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})

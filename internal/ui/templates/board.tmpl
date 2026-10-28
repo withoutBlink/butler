@@ -1,0 +1,142 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Butler — Board</title>
+<link rel="stylesheet" href="{{asset "style.css"}}">
+</head>
+<body>
+<header>
+<span class="brand">Butler</span>
+<nav>
+<a href="/panel/">Sessions</a>
+<form method="post" action="/panel/logout" class="inline"><button type="submit" class="link">Sign out</button></form>
+</nav>
+</header>
+<main class="board-page">
+{{if .Notice}}<p class="notice">{{.Notice}}</p>{{end}}
+<section class="new-session">
+<h2>New task</h2>
+<form method="post" action="/panel/tasks" class="task-form" onsubmit="this.querySelector('button[type=submit]').disabled=true">
+<input type="text" name="title" placeholder="Task title" required maxlength="200">
+<textarea name="description" placeholder="What needs doing (optional)" rows="2"></textarea>
+<div class="task-row">
+<label>Assignee
+<select name="assignee">
+<option value="">Unassigned</option>
+{{range .Agents}}<option value="{{.ID}}">{{.Label}}</option>{{end}}
+</select>
+</label>
+<label>Status
+<select name="status">
+<option value="todo" selected>To do</option>
+<option value="in_progress">In progress</option>
+<option value="blocked">Blocked</option>
+<option value="review">Review</option>
+<option value="done">Done</option>
+</select>
+</label>
+<label>Priority
+<select name="priority">
+<option value="low">Low</option>
+<option value="normal" selected>Normal</option>
+<option value="high">High</option>
+<option value="urgent">Urgent</option>
+</select>
+</label>
+<label>Session
+<select name="session">
+<option value="">No linked session</option>
+{{range .Sessions}}<option value="{{.ID}}">{{.Title}}</option>{{end}}
+</select>
+</label>
+<button type="submit">Create task</button>
+</div>
+</form>
+</section>
+<div id="board" data-stream="/panel/board/stream">
+{{template "board-columns" .}}
+</div>
+</main>
+<script src="{{asset "app.js"}}"></script>
+</body>
+</html>
+
+{{define "board-columns"}}
+<div class="board">
+{{range .Columns}}
+<section class="col" data-status="{{.Status}}">
+<h2>{{.Label}} <span class="count">{{len .Tasks}}</span></h2>
+{{range $card := .Tasks}}
+<article class="card" data-task="{{$card.Task.ID}}">
+<div class="card-top">
+<span class="pri pri-{{$card.Task.Priority}}">{{$card.Task.Priority}}</span>
+{{if $card.SessionTitle}}<a class="card-session" href="/panel/sessions/{{$card.Task.SessionID}}">{{$card.SessionTitle}}</a>{{end}}
+</div>
+<h3>{{$card.Task.Title}}</h3>
+{{if $card.Task.Description}}<p class="desc">{{short $card.Task.Description}}</p>{{end}}
+<p class="meta">{{if $card.Assignee}}{{$card.Assignee}}{{else}}<span class="hint">unassigned</span>{{end}} · {{$card.Creator}}</p>
+<form method="post" action="/panel/tasks/{{$card.Task.ID}}" class="move" onsubmit="this.querySelector('button[type=submit]').disabled=true">
+<select name="status" aria-label="Move {{$card.Task.Title}}">
+<option value="todo"{{if eq $card.Task.Status "todo"}} selected{{end}}>To do</option>
+<option value="in_progress"{{if eq $card.Task.Status "in_progress"}} selected{{end}}>In progress</option>
+<option value="blocked"{{if eq $card.Task.Status "blocked"}} selected{{end}}>Blocked</option>
+<option value="review"{{if eq $card.Task.Status "review"}} selected{{end}}>Review</option>
+<option value="done"{{if eq $card.Task.Status "done"}} selected{{end}}>Done</option>
+</select>
+<button type="submit">Move</button>
+</form>
+<details>
+<summary>Edit</summary>
+<form method="post" action="/panel/tasks/{{$card.Task.ID}}" class="task-form" onsubmit="this.querySelector('button[type=submit]').disabled=true">
+<input type="text" name="title" value="{{$card.Task.Title}}" required maxlength="200" aria-label="Title">
+<textarea name="description" rows="3" aria-label="Description">{{$card.Task.Description}}</textarea>
+<label>Assignee
+<select name="assignee">
+<option value="">Unassigned</option>
+{{range $.Agents}}<option value="{{.ID}}"{{if eq .ID $card.Task.AssigneeID}} selected{{end}}>{{.Label}}</option>{{end}}
+</select>
+</label>
+<label>Priority
+<select name="priority">
+<option value="low"{{if eq $card.Task.Priority "low"}} selected{{end}}>Low</option>
+<option value="normal"{{if eq $card.Task.Priority "normal"}} selected{{end}}>Normal</option>
+<option value="high"{{if eq $card.Task.Priority "high"}} selected{{end}}>High</option>
+<option value="urgent"{{if eq $card.Task.Priority "urgent"}} selected{{end}}>Urgent</option>
+</select>
+</label>
+<label>Status
+<select name="status">
+<option value="todo"{{if eq $card.Task.Status "todo"}} selected{{end}}>To do</option>
+<option value="in_progress"{{if eq $card.Task.Status "in_progress"}} selected{{end}}>In progress</option>
+<option value="blocked"{{if eq $card.Task.Status "blocked"}} selected{{end}}>Blocked</option>
+<option value="review"{{if eq $card.Task.Status "review"}} selected{{end}}>Review</option>
+<option value="done"{{if eq $card.Task.Status "done"}} selected{{end}}>Done</option>
+</select>
+</label>
+<label>Session
+<select name="session">
+<option value="">No linked session</option>
+{{range $.Sessions}}<option value="{{.ID}}"{{if eq .ID $card.Task.SessionID}} selected{{end}}>{{.Title}}</option>{{end}}
+</select>
+</label>
+<button type="submit">Save</button>
+</form>
+</details>
+<details>
+<summary>Log ({{len $card.Comments}})</summary>
+<ul class="log">
+{{range $card.Comments}}<li><b>{{.Author}}</b> <span class="m-meta">{{ts .At}}</span><div>{{.Body}}</div></li>{{else}}<li class="hint">no comments yet</li>{{end}}
+</ul>
+<form method="post" action="/panel/tasks/{{$card.Task.ID}}/comment" class="task-form" onsubmit="this.querySelector('button[type=submit]').disabled=true">
+<textarea name="body" rows="2" required placeholder="Progress note" aria-label="Comment on {{$card.Task.Title}}"></textarea>
+<button type="submit">Comment</button>
+</form>
+</details>
+</article>
+{{else}}<p class="hint empty">nothing here</p>{{end}}
+</section>
+{{end}}
+</div>
+{{end}}

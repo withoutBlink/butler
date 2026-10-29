@@ -51,6 +51,15 @@
 {{range .Sessions}}<option value="{{.ID}}">{{.Title}}</option>{{end}}
 </select>
 </label>
+<label>Chain
+<input type="text" name="chain" placeholder="Researcher, Link">
+</label>
+<label>Reviewer
+<select name="reviewer">
+<option value="">You (creator)</option>
+{{range .Agents}}<option value="{{.ID}}">{{.Label}}</option>{{end}}
+</select>
+</label>
 <button type="submit">Create task</button>
 </div>
 </form>
@@ -67,16 +76,24 @@
 <div class="board">
 {{range .Columns}}
 <section class="col" data-status="{{.Status}}">
-<h2>{{.Label}} <span class="count">{{len .Tasks}}</span></h2>
+<h2><span>{{.Label}} <span class="count">{{len .Tasks}}</span></span>{{if eq .Status "done"}}<button type="button" class="col-toggle" aria-label="Collapse the Done column">Collapse</button>{{end}}</h2>
+<div class="col-body">
 {{range $card := .Tasks}}
 <article class="card" data-task="{{$card.Task.ID}}">
 <div class="card-top">
 <span class="pri pri-{{$card.Task.Priority}}">{{$card.Task.Priority}}</span>
 {{if $card.SessionTitle}}<a class="card-session" href="/panel/sessions/{{$card.Task.SessionID}}">{{$card.SessionTitle}}</a>{{end}}
 </div>
+<p class="owner-badge">{{if $card.Owner}}<span class="av {{$card.OwnerClass}}">{{$card.OwnerInitial}}</span> Owner: {{$card.Owner}}{{else}}<span class="av c0">?</span> Unassigned{{end}}</p>
+{{if $card.Chain}}<p class="chain">{{range $i, $s := $card.Chain}}{{if $i}} <span class="arr">→</span> {{end}}<span class="step{{if $s.Current}} current{{end}}">{{$s.Name}}{{if $s.Review}} (review){{end}}</span>{{end}}</p>{{end}}
 <h3>{{$card.Task.Title}}</h3>
 {{if $card.Task.Description}}<p class="desc">{{short $card.Task.Description}}</p>{{end}}
-<p class="meta">{{if $card.Assignee}}{{$card.Assignee}}{{else}}<span class="hint">unassigned</span>{{end}} · {{$card.Creator}}</p>
+<p class="byline">by {{$card.Creator}}</p>
+<div class="card-actions">
+{{if $card.ShowHandoff}}<form method="post" action="/panel/tasks/{{$card.Task.ID}}/handoff"><input type="text" name="note" placeholder="Handoff note" aria-label="Handoff note for {{$card.Task.Title}}"><button type="submit">Hand off</button></form>{{end}}
+{{if $card.ShowApprove}}<form method="post" action="/panel/tasks/{{$card.Task.ID}}/approve"><button type="submit">Approve</button></form>{{end}}
+{{if $card.ShowReject}}<form method="post" action="/panel/tasks/{{$card.Task.ID}}/reject"><input type="text" name="note" placeholder="Why send it back" aria-label="Send-back note for {{$card.Task.Title}}"><button type="submit" class="ghost">Send back</button></form>{{end}}
+</div>
 <form method="post" action="/panel/tasks/{{$card.Task.ID}}" class="move" onsubmit="this.querySelector('button[type=submit]').disabled=true">
 <select name="status" aria-label="Move {{$card.Task.Title}}">
 <option value="todo"{{if eq $card.Task.Status "todo"}} selected{{end}}>To do</option>
@@ -87,7 +104,7 @@
 </select>
 <button type="submit">Move</button>
 </form>
-<details>
+<details data-panel="edit">
 <summary>Edit</summary>
 <form method="post" action="/panel/tasks/{{$card.Task.ID}}" class="task-form" onsubmit="this.querySelector('button[type=submit]').disabled=true">
 <input type="text" name="title" value="{{$card.Task.Title}}" required maxlength="200" aria-label="Title">
@@ -121,10 +138,19 @@
 {{range $.Sessions}}<option value="{{.ID}}"{{if eq .ID $card.Task.SessionID}} selected{{end}}>{{.Title}}</option>{{end}}
 </select>
 </label>
+<label>Chain
+<input type="text" name="chain" value="{{$card.ChainText}}" placeholder="Researcher, Link" aria-label="Handoff chain">
+</label>
+<label>Reviewer
+<select name="reviewer">
+<option value="">Creator ({{$card.Creator}})</option>
+{{range $.Agents}}<option value="{{.ID}}"{{if eq .ID $card.Task.ReviewerID}} selected{{end}}>{{.Label}}</option>{{end}}
+</select>
+</label>
 <button type="submit">Save</button>
 </form>
 </details>
-<details>
+<details data-panel="log">
 <summary>Log ({{len $card.Comments}})</summary>
 <ul class="log">
 {{range $card.Comments}}<li><b>{{.Author}}</b> <span class="m-meta">{{ts .At}}</span><div>{{.Body}}</div></li>{{else}}<li class="hint">no comments yet</li>{{end}}
@@ -136,6 +162,7 @@
 </details>
 </article>
 {{else}}<p class="hint empty">nothing here</p>{{end}}
+</div>
 </section>
 {{end}}
 </div>

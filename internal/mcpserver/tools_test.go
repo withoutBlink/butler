@@ -223,6 +223,7 @@ func TestToolE2E(t *testing.T) {
 		"check_messages": false, "get_context": false, "set_context": false,
 		"list_tasks": false, "get_task": false, "create_task": false,
 		"update_task_status": false, "comment_task": false, "claim_task": false,
+		"handoff_task": false, "approve_task": false, "reject_task": false,
 	}
 	if len(toolsRes.Tools) != len(want) {
 		t.Fatalf("expected %d tools, got %d", len(want), len(toolsRes.Tools))
@@ -526,5 +527,57 @@ func TestTaskTools(t *testing.T) {
 	}
 	if !strings.Contains(out, alphaID) {
 		t.Fatalf("get should name the creator: %s", out)
+	}
+}
+
+func TestHandoffTools(t *testing.T) {
+	backend, st, _, kinds := newButlerBackendStore(t)
+	ctx := context.Background()
+	if _, err := st.CreateAgent(ctx, "admin", "Admin", "human", "", "", ""); err != nil {
+		t.Fatalf("admin: %v", err)
+	}
+	if _, err := st.EnsureGlobalSession(ctx, "admin"); err != nil {
+		t.Fatalf("global: %v", err)
+	}
+	alpha, alphaID := connectMCPClient(t, backend.URL, kinds["codex"], "alpha", "/tmp/proj")
+	beta, betaID := connectMCPClient(t, backend.URL, kinds["opencode"], "beta", "/tmp/proj")
+	reviewer, reviewerID := connectMCPClient(t, backend.URL, kinds["codex"], "reviewer", "/tmp/review")
+
+	out, isErr := callTool(t, alpha, "create_task", map[string]any{
+		"title": "Pass it along", "assignee": alphaID,
+		"chain": []any{alphaID, betaID}, "reviewer": reviewerID,
+	})
+	if isErr {
+		t.Fatalf("create_task: %s", out)
+	}
+	m := regexp.MustCompile(`\(([0-9a-f-]{36})\)`).FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("no task id in %q", out)
+	}
+	taskID := m[1]
+
+	out, isErr = callTool(t, alpha, "handoff_task", map[string]any{"task": taskID, "note": "your turn"})
+	if isErr || !strings.Contains(out, "todo") || !strings.Contains(out, betaID) {
+		t.Fatalf("handoff: %q isErr=%v", out, isErr)
+	}
+	out, isErr = callTool(t, alpha, "approve_task", map[string]any{"task": taskID})
+	if !isErr || !strings.Contains(out, "reviewer") {
+		t.Fatalf("owner approve should fail: %q isErr=%v", out, isErr)
+	}
+	out, isErr = callTool(t, beta, "handoff_task", map[string]any{"task": taskID})
+	if isErr || !strings.Contains(out, "review") || !strings.Contains(out, reviewerID) {
+		t.Fatalf("handoff to review: %q isErr=%v", out, isErr)
+	}
+	out, isErr = callTool(t, reviewer, "reject_task", map[string]any{"task": taskID, "note": "one more pass"})
+	if isErr || !strings.Contains(out, "todo") || !strings.Contains(out, betaID) {
+		t.Fatalf("reject: %q isErr=%v", out, isErr)
+	}
+	out, isErr = callTool(t, beta, "handoff_task", map[string]any{"task": taskID})
+	if isErr || !strings.Contains(out, "review") {
+		t.Fatalf("handoff to review again: %q isErr=%v", out, isErr)
+	}
+	out, isErr = callTool(t, reviewer, "approve_task", map[string]any{"task": taskID})
+	if isErr || !strings.Contains(out, "done") {
+		t.Fatalf("approve: %q isErr=%v", out, isErr)
 	}
 }

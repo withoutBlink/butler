@@ -29,6 +29,10 @@ func taskCmd(args []string) {
 	title := fs.String("title", "", "task title")
 	description := fs.String("description", "", "task description")
 	priority := fs.String("priority", "", "low, normal, high, or urgent")
+	chain := fs.String("chain", "", "handoff chain, comma-separated agent ids or names")
+	reviewer := fs.String("reviewer", "", "who may mark the task done (default: the creator)")
+	to := fs.String("to", "", "agent to hand the task to, or to send it back to")
+	note := fs.String("note", "", "note recorded in the task log")
 	positional := parseSubFlags(fs, args[1:])
 
 	st, err := openStore(*dataDir)
@@ -153,6 +157,7 @@ func taskCmd(args []string) {
 		res, err := svc.Create(ctx, "admin", board.CreateInput{
 			Title: *title, Description: *description, Status: *status,
 			Priority: *priority, Assignee: *assignee, SessionID: *session,
+			Chain: board.SplitChain(*chain), Reviewer: *reviewer,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -167,6 +172,43 @@ func taskCmd(args []string) {
 		if res.NotifySeq > 0 {
 			fmt.Printf("notified in session via message seq %d\n", res.NotifySeq)
 		}
+	case "handoff", "approve", "reject":
+		if len(positional) == 0 {
+			taskUsage()
+			os.Exit(2)
+		}
+		if err := ensureAdmin(ctx, st); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		if _, err := st.EnsureGlobalSession(ctx, "admin"); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+		svc := board.New(st, nil, log)
+		var (
+			res board.Result
+			err error
+		)
+		switch sub {
+		case "handoff":
+			res, err = svc.Handoff(ctx, "admin", positional[0], *to, *note, true)
+		case "approve":
+			res, err = svc.Approve(ctx, "admin", positional[0], true)
+		default:
+			res, err = svc.Reject(ctx, "admin", positional[0], *to, *note, true)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		svc.Hooks.Wait()
+		fmt.Printf("task %s %s (%s", res.Task.ID, sub, res.Task.Status)
+		if res.Task.AssigneeID != "" {
+			fmt.Printf(", owner %s", res.Task.AssigneeID)
+		}
+		fmt.Printf(")\n")
 	default:
 		taskUsage()
 		os.Exit(2)
@@ -289,7 +331,10 @@ func taskUsage() {
 	fmt.Fprint(os.Stderr, `usage (flags before or after the id):
   butler task list [--status S] [--assignee ID|name|kind|unassigned] [--session S]
   butler task show <id>
-  butler task add --title T [--description D] [--assignee ID|name|kind] [--priority P] [--status S] [--session S]
+  butler task add --title T [--description D] [--assignee ID|name|kind] [--priority P] [--status S] [--session S] [--chain A,B] [--reviewer R]
+  butler task handoff <id> [--to AGENT] [--note TEXT]
+  butler task approve <id>
+  butler task reject <id> [--to AGENT] [--note TEXT]
 `)
 }
 

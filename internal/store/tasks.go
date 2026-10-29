@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -65,9 +66,24 @@ type Task struct {
 	Priority    string `json:"priority"`
 	AssigneeID  string `json:"assignee_id"`
 	CreatorID   string `json:"creator_id"`
-	SessionID   string `json:"session_id"`
-	CreatedAt   int64  `json:"created_at"`
-	UpdatedAt   int64  `json:"updated_at"`
+	// ReviewerID empty means the creator decides when the task is done.
+	ReviewerID string `json:"reviewer_id"`
+	// Chain is the ordered handoff list (agent ids). Empty is a JSON [].
+	Chain []string `json:"chain"`
+	// ReviewFromID is the owner who handed the task into review.
+	ReviewFromID string `json:"review_from_id"`
+	SessionID    string `json:"session_id"`
+	CreatedAt    int64  `json:"created_at"`
+	UpdatedAt    int64  `json:"updated_at"`
+}
+
+// Reviewer is who may mark the task done: the explicit reviewer, or the
+// creator when none was set.
+func (t Task) Reviewer() string {
+	if t.ReviewerID != "" {
+		return t.ReviewerID
+	}
+	return t.CreatorID
 }
 
 // TaskComment is one entry in a task's progress log.
@@ -92,12 +108,15 @@ type TaskFilter struct {
 // TaskPatch applies a partial update. A nil pointer leaves the field alone.
 // A pointer to "" clears assignee_id or session_id.
 type TaskPatch struct {
-	Title       *string
-	Description *string
-	Status      *string
-	Priority    *string
-	AssigneeID  *string
-	SessionID   *string
+	Title        *string
+	Description  *string
+	Status       *string
+	Priority     *string
+	AssigneeID   *string
+	SessionID    *string
+	ReviewerID   *string
+	Chain        *[]string
+	ReviewFromID *string
 }
 
 // Webhook is an outbound URL for one agent or one kind.
@@ -109,18 +128,89 @@ type Webhook struct {
 	CreatedAt int64  `json:"created_at"`
 }
 
-const taskCols = `id, title, description, status, priority, COALESCE(assignee_id, ''), creator_id, COALESCE(session_id, ''), created_at, updated_at`
+const taskCols = `id, title, description, status, priority, COALESCE(assignee_id, ''), creator_id, COALESCE(reviewer_id, ''), COALESCE(handoff_chain, '[]'), COALESCE(review_from_id, ''), COALESCE(session_id, ''), created_at, updated_at`
 
 func scanTask(row interface{ Scan(...any) error }) (*Task, error) {
 	var t Task
-	err := row.Scan(&t.ID, &t.Title, &t.Description, &t.Status, &t.Priority, &t.AssigneeID, &t.CreatorID, &t.SessionID, &t.CreatedAt, &t.UpdatedAt)
+	var chain string
+	err := row.Scan(&t.ID, &t.Title, &t.Description, &t.Status, &t.Priority, &t.AssigneeID, &t.CreatorID, &t.ReviewerID, &chain, &t.ReviewFromID, &t.SessionID, &t.CreatedAt, &t.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
+	t.Chain = decodeChain(chain)
 	return &t, nil
+}
+
+func decodeChain(raw string) []string {
+	if raw == "" || raw == "[]" {
+		return []string{}
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil || out == nil {
+		return []string{}
+	}
+	return out
+}
+
+func encodeChain(ids []string) string {
+	if ids == nil {
+		ids = []string{}
+	}
+	b, err := json.Marshal(ids)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
+}
+
+// migrateTasks adds columns introduced after the first board schema. Each
+// ALTER is skipped when the column is already there, so opening a new
+// database (CREATE TABLE already has them) and opening an old one are both
+// safe to repeat.
+func (s *Store) migrateTasks() error {
+	cols, err := s.tableColumns("tasks")
+	if err != nil {
+		return err
+	}
+	if len(cols) == 0 {
+		return nil
+	}
+	alters := []struct{ name, ddl string }{
+		{"reviewer_id", `ALTER TABLE tasks ADD COLUMN reviewer_id TEXT REFERENCES agents (id)`},
+		{"handoff_chain", `ALTER TABLE tasks ADD COLUMN handoff_chain TEXT NOT NULL DEFAULT '[]'`},
+		{"review_from_id", `ALTER TABLE tasks ADD COLUMN review_from_id TEXT REFERENCES agents (id)`},
+	}
+	for _, a := range alters {
+		if cols[a.name] {
+			continue
+		}
+		if _, err := s.db.Exec(a.ddl); err != nil {
+			return fmt.Errorf("migrate tasks.%s: %w", a.name, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) tableColumns(table string) (map[string]bool, error) {
+	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, typ string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return nil, err
+		}
+		out[name] = true
+	}
+	return out, rows.Err()
 }
 
 // CreateTask inserts a task. An empty ID is filled with a UUID. An empty
@@ -143,8 +233,11 @@ func (s *Store) CreateTask(ctx context.Context, t *Task) (*Task, error) {
 	if t.Priority == "" {
 		t.Priority = PriorityNormal
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO tasks (id, title, description, status, priority, assignee_id, creator_id, session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.Title, t.Description, t.Status, t.Priority, nullStr(t.AssigneeID), t.CreatorID, nullStr(t.SessionID), t.CreatedAt, t.UpdatedAt)
+	if t.Chain == nil {
+		t.Chain = []string{}
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO tasks (id, title, description, status, priority, assignee_id, creator_id, reviewer_id, handoff_chain, review_from_id, session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.Title, t.Description, t.Status, t.Priority, nullStr(t.AssigneeID), t.CreatorID, nullStr(t.ReviewerID), encodeChain(t.Chain), nullStr(t.ReviewFromID), nullStr(t.SessionID), t.CreatedAt, t.UpdatedAt)
 	if err != nil {
 		if isUniqueErr(err) {
 			return nil, fmt.Errorf("%w: task %q", ErrConflict, t.ID)
@@ -229,9 +322,18 @@ func (s *Store) UpdateTask(ctx context.Context, id string, p TaskPatch) (*Task, 
 	if p.SessionID != nil {
 		cur.SessionID = *p.SessionID
 	}
+	if p.ReviewerID != nil {
+		cur.ReviewerID = *p.ReviewerID
+	}
+	if p.Chain != nil {
+		cur.Chain = *p.Chain
+	}
+	if p.ReviewFromID != nil {
+		cur.ReviewFromID = *p.ReviewFromID
+	}
 	cur.UpdatedAt = time.Now().UnixMilli()
-	_, err = s.db.ExecContext(ctx, `UPDATE tasks SET title = ?, description = ?, status = ?, priority = ?, assignee_id = ?, session_id = ?, updated_at = ? WHERE id = ?`,
-		cur.Title, cur.Description, cur.Status, cur.Priority, nullStr(cur.AssigneeID), nullStr(cur.SessionID), cur.UpdatedAt, id)
+	_, err = s.db.ExecContext(ctx, `UPDATE tasks SET title = ?, description = ?, status = ?, priority = ?, assignee_id = ?, reviewer_id = ?, handoff_chain = ?, review_from_id = ?, session_id = ?, updated_at = ? WHERE id = ?`,
+		cur.Title, cur.Description, cur.Status, cur.Priority, nullStr(cur.AssigneeID), nullStr(cur.ReviewerID), encodeChain(cur.Chain), nullStr(cur.ReviewFromID), nullStr(cur.SessionID), cur.UpdatedAt, id)
 	if err != nil {
 		if isFKErr(err) {
 			return nil, fmt.Errorf("%w: task references a missing agent or session", ErrNotFound)

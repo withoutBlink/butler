@@ -77,6 +77,9 @@ type CreateInput struct {
 	Priority    string
 	Assignee    string
 	SessionID   string
+	// Chain is an ordered list of mention-style tokens (id, display name, or kind).
+	Chain    []string
+	Reviewer string
 }
 
 // UpdateInput is a partial edit. Nil leaves the field unchanged. Assignee
@@ -88,6 +91,10 @@ type UpdateInput struct {
 	Priority    *string
 	Assignee    *string
 	SessionID   *string
+	// Chain replaces the handoff list when non-nil. Tokens, not resolved ids.
+	Chain *[]string
+	// Reviewer replaces the reviewer when non-nil. Empty means the creator.
+	Reviewer *string
 }
 
 func (s *Service) Create(ctx context.Context, actorID string, in CreateInput) (Result, error) {
@@ -126,6 +133,17 @@ func (s *Service) Create(ctx context.Context, actorID string, in CreateInput) (R
 	if err != nil {
 		return Result{}, err
 	}
+	chain, err := s.resolveChain(ctx, in.Chain)
+	if err != nil {
+		return Result{}, err
+	}
+	reviewer, err := s.resolve(ctx, in.Reviewer)
+	if err != nil {
+		return Result{}, err
+	}
+	if assignee == "" && len(chain) > 0 {
+		assignee = chain[0]
+	}
 	task, err := s.Store.CreateTask(ctx, &store.Task{
 		ID:          in.ID,
 		Title:       title,
@@ -134,16 +152,18 @@ func (s *Service) Create(ctx context.Context, actorID string, in CreateInput) (R
 		Priority:    priority,
 		AssigneeID:  assignee,
 		CreatorID:   actorID,
+		ReviewerID:  reviewer,
+		Chain:       chain,
 		SessionID:   strings.TrimSpace(in.SessionID),
 	})
 	if err != nil {
 		return Result{}, err
 	}
-	seq := s.announce(ctx, actorID, nil, task, nil)
+	seq := s.announce(ctx, actorID, nil, task, nil, nil)
 	return Result{Task: task, NotifySeq: seq, Created: true}, nil
 }
 
-func (s *Service) Update(ctx context.Context, actorID, taskID string, in UpdateInput) (Result, error) {
+func (s *Service) Update(ctx context.Context, actorID, taskID string, in UpdateInput, admin bool) (Result, error) {
 	var assignee *string
 	if in.Assignee != nil {
 		id, err := s.resolve(ctx, *in.Assignee)
@@ -152,7 +172,7 @@ func (s *Service) Update(ctx context.Context, actorID, taskID string, in UpdateI
 		}
 		assignee = &id
 	}
-	return s.apply(ctx, actorID, taskID, in, assignee)
+	return s.apply(ctx, actorID, taskID, in, assignee, admin)
 }
 
 // Claim assigns the task to actorID and moves it to in_progress. Repeating
@@ -166,7 +186,7 @@ func (s *Service) Claim(ctx context.Context, actorID, taskID string) (Result, er
 		return Result{Task: cur}, nil
 	}
 	status := store.TaskInProgress
-	return s.apply(ctx, actorID, taskID, UpdateInput{Status: &status}, &actorID)
+	return s.apply(ctx, actorID, taskID, UpdateInput{Status: &status}, &actorID, false)
 }
 
 func (s *Service) Comment(ctx context.Context, actorID, taskID, body string) (Result, error) {
@@ -189,16 +209,16 @@ func (s *Service) Comment(ctx context.Context, actorID, taskID, body string) (Re
 	if err != nil {
 		return Result{}, err
 	}
-	seq := s.announce(ctx, actorID, before, after, c)
+	seq := s.announce(ctx, actorID, before, after, c, nil)
 	return Result{Task: after, Comment: c, NotifySeq: seq}, nil
 }
 
-func (s *Service) apply(ctx context.Context, actorID, taskID string, in UpdateInput, assignee *string) (Result, error) {
+func (s *Service) apply(ctx context.Context, actorID, taskID string, in UpdateInput, assignee *string, admin bool) (Result, error) {
 	before, err := s.Store.GetTask(ctx, taskID)
 	if err != nil {
 		return Result{}, err
 	}
-	if in.Title == nil && in.Description == nil && in.Status == nil && in.Priority == nil && in.SessionID == nil && assignee == nil {
+	if in.Title == nil && in.Description == nil && in.Status == nil && in.Priority == nil && in.SessionID == nil && in.Chain == nil && in.Reviewer == nil && assignee == nil {
 		return Result{Task: before}, nil
 	}
 	patch := store.TaskPatch{AssigneeID: assignee}
@@ -243,6 +263,23 @@ func (s *Service) apply(ctx context.Context, actorID, taskID string, in UpdateIn
 		}
 		patch.SessionID = &sid
 	}
+	if in.Chain != nil {
+		chain, err := s.resolveChain(ctx, *in.Chain)
+		if err != nil {
+			return Result{}, err
+		}
+		patch.Chain = &chain
+	}
+	if in.Reviewer != nil {
+		reviewer, err := s.resolve(ctx, *in.Reviewer)
+		if err != nil {
+			return Result{}, err
+		}
+		patch.ReviewerID = &reviewer
+	}
+	if patch.Status != nil && *patch.Status == store.TaskDone && !admin && actorID != before.Reviewer() {
+		return Result{}, bad(403, "only the reviewer can mark this task done; hand it off for review")
+	}
 	after, err := s.Store.UpdateTask(ctx, taskID, patch)
 	if err != nil {
 		return Result{}, err
@@ -251,17 +288,23 @@ func (s *Service) apply(ctx context.Context, actorID, taskID string, in UpdateIn
 		s.wakeBoard()
 		return Result{Task: after}, nil
 	}
-	seq := s.announce(ctx, actorID, before, after, nil)
+	seq := s.announce(ctx, actorID, before, after, nil, nil)
 	return Result{Task: after, NotifySeq: seq}, nil
+}
+
+// xfer marks an ownership move that should wake the new owner with
+// task.assigned and handoff/rejected set, rather than a plain comment.
+type xfer struct {
+	rejected bool
 }
 
 // announce posts the mention, wakes waiters and the board, and queues
 // webhooks. Failures here are logged: the task write already committed,
 // and a missed notice must not turn the request into a 500.
-func (s *Service) announce(ctx context.Context, actorID string, before, after *store.Task, comment *store.TaskComment) int64 {
-	seq := s.postNotice(ctx, actorID, before, after, comment)
+func (s *Service) announce(ctx context.Context, actorID string, before, after *store.Task, comment *store.TaskComment, xfer *xfer) int64 {
+	seq := s.postNotice(ctx, actorID, before, after, comment, xfer)
 	s.wakeBoard()
-	s.deliverHooks(ctx, actorID, before, after, comment)
+	s.deliverHooks(ctx, actorID, before, after, comment, xfer)
 	return seq
 }
 
@@ -271,7 +314,7 @@ func (s *Service) wakeBoard() {
 	}
 }
 
-func (s *Service) postNotice(ctx context.Context, actorID string, before, after *store.Task, comment *store.TaskComment) int64 {
+func (s *Service) postNotice(ctx context.Context, actorID string, before, after *store.Task, comment *store.TaskComment, xfer *xfer) int64 {
 	targets := mentionTargets(actorID, before, after, comment)
 	if len(targets) == 0 {
 		return 0
@@ -295,7 +338,7 @@ func (s *Service) postNotice(ctx context.Context, actorID string, before, after 
 		SessionID: sid,
 		SenderID:  actorID,
 		Kind:      "chat",
-		Content:   noticeText(actor, before, after, comment, targets),
+		Content:   noticeText(actor, before, after, comment, targets, xfer),
 	})
 	if err != nil {
 		s.Log.Error("task notice", "err", err, "task", after.ID)
@@ -361,7 +404,7 @@ func mentionTargets(actorID string, before, after *store.Task, comment *store.Ta
 	return ids
 }
 
-func noticeText(actor *store.Agent, before, after *store.Task, comment *store.TaskComment, mentions []string) string {
+func noticeText(actor *store.Agent, before, after *store.Task, comment *store.TaskComment, mentions []string, xfer *xfer) string {
 	var b strings.Builder
 	for i, id := range mentions {
 		if i > 0 {
@@ -374,6 +417,10 @@ func noticeText(actor *store.Agent, before, after *store.Task, comment *store.Ta
 		b.WriteByte(' ')
 	}
 	switch {
+	case xfer != nil && xfer.rejected:
+		fmt.Fprintf(&b, "sent back task %q (%s)", after.Title, after.ID)
+	case xfer != nil:
+		fmt.Fprintf(&b, "handed off task %q (%s)", after.Title, after.ID)
 	case comment != nil:
 		fmt.Fprintf(&b, "comment on task %q (%s)", after.Title, after.ID)
 	case (before == nil || before.AssigneeID != after.AssigneeID) && after.AssigneeID != "":
@@ -423,23 +470,25 @@ type hookActor struct {
 }
 
 type hookPayload struct {
-	Event   string                `json:"event"`
-	At      int64                 `json:"at"`
-	Actor   hookActor             `json:"actor"`
-	Task    store.Task            `json:"task"`
-	Comment *store.TaskComment    `json:"comment,omitempty"`
-	Changes map[string]hookChange `json:"changes,omitempty"`
+	Event    string                `json:"event"`
+	At       int64                 `json:"at"`
+	Actor    hookActor             `json:"actor"`
+	Task     store.Task            `json:"task"`
+	Comment  *store.TaskComment    `json:"comment,omitempty"`
+	Changes  map[string]hookChange `json:"changes,omitempty"`
+	Handoff  bool                  `json:"handoff,omitempty"`
+	Rejected bool                  `json:"rejected,omitempty"`
 }
 
 // deliverHooks queues one POST per agent who should wake: the new assignee
 // on assignment, the previous assignee when they lose it, and the current
 // assignee plus the creator when status or a comment changes. The actor is
 // skipped so a remote assistant does not get a webhook for its own write.
-func (s *Service) deliverHooks(ctx context.Context, actorID string, before, after *store.Task, comment *store.TaskComment) {
+func (s *Service) deliverHooks(ctx context.Context, actorID string, before, after *store.Task, comment *store.TaskComment, xfer *xfer) {
 	if s.Hooks == nil {
 		return
 	}
-	targets := hookTargets(actorID, before, after, comment)
+	targets := hookTargets(actorID, before, after, comment, xfer)
 	if len(targets) == 0 {
 		return
 	}
@@ -464,6 +513,13 @@ func (s *Service) deliverHooks(ctx context.Context, actorID string, before, afte
 			Task:    *after,
 			Changes: changes,
 		}
+		if xfer != nil {
+			if xfer.rejected {
+				payload.Rejected = true
+			} else {
+				payload.Handoff = true
+			}
+		}
 		if comment != nil {
 			payload.Comment = comment
 		}
@@ -476,7 +532,7 @@ func (s *Service) deliverHooks(ctx context.Context, actorID string, before, afte
 	}
 }
 
-func hookTargets(actorID string, before, after *store.Task, comment *store.TaskComment) []hookEvent {
+func hookTargets(actorID string, before, after *store.Task, comment *store.TaskComment, xfer *xfer) []hookEvent {
 	var out []hookEvent
 	seen := map[string]bool{}
 	add := func(id, event string) {
@@ -485,6 +541,12 @@ func hookTargets(actorID string, before, after *store.Task, comment *store.TaskC
 		}
 		seen[id] = true
 		out = append(out, hookEvent{id, event})
+	}
+	// A handoff or a send-back is an assignment of the new owner, even
+	// though it also writes a log comment. The new owner is the one to wake.
+	if xfer != nil {
+		add(after.AssigneeID, "task.assigned")
+		return out
 	}
 	if comment != nil {
 		add(after.AssigneeID, "task.comment")
@@ -533,7 +595,20 @@ func hookChanges(before, after *store.Task) map[string]hookChange {
 
 func sameTask(a, b *store.Task) bool {
 	return a.Title == b.Title && a.Description == b.Description && a.Status == b.Status &&
-		a.Priority == b.Priority && a.AssigneeID == b.AssigneeID && a.SessionID == b.SessionID
+		a.Priority == b.Priority && a.AssigneeID == b.AssigneeID && a.SessionID == b.SessionID &&
+		a.ReviewerID == b.ReviewerID && a.ReviewFromID == b.ReviewFromID && sameIDs(a.Chain, b.Chain)
+}
+
+func sameIDs(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // resolve maps a mention token to an agent id. An empty token is "no

@@ -267,29 +267,111 @@
   }
 })();
 
-// Task board: replace the columns when the server pushes a new render.
-// Skip the swap while a control inside the board is focused, and apply the
-// pending HTML once focus leaves, so a live update does not wipe a form
-// mid-edit.
+// Task board live updates. The columns are replaced on every SSE push,
+// including while a log is open: gating on :focus used to freeze the board
+// for as long as the summary or a field inside the card stayed focused
+// (opening Log focuses its summary), so new tasks never appeared until a
+// reload. Open panels and any text the user is mid-typing are copied across
+// the swap. The Done column's collapsed state lives in localStorage.
 (function () {
   var board = document.getElementById('board');
-  if (!board || !window.EventSource) return;
-  var path = board.getAttribute('data-stream');
-  if (!path) return;
-  var pending = null;
-  function apply(html) {
-    if (board.querySelector(':focus')) {
-      pending = html;
-      return;
+  if (!board) return;
+  var doneKey = 'butler.board.doneCollapsed';
+
+  function applyDone() {
+    var col = board.querySelector('.col[data-status="done"]');
+    if (!col) return;
+    var collapsed = localStorage.getItem(doneKey) === '1';
+    col.classList.toggle('collapsed', collapsed);
+    var btn = col.querySelector('.col-toggle');
+    if (btn) {
+      btn.textContent = collapsed ? 'Expand' : 'Collapse';
+      btn.setAttribute('aria-label', collapsed ? 'Expand the Done column' : 'Collapse the Done column');
     }
-    pending = null;
-    board.innerHTML = html;
   }
-  board.addEventListener('focusout', function () {
-    setTimeout(function () {
-      if (pending && !board.querySelector(':focus')) apply(pending);
-    }, 0);
+
+  function capture() {
+    var open = [];
+    var nodes = board.querySelectorAll('details[open]');
+    for (var i = 0; i < nodes.length; i++) {
+      var card = nodes[i].closest('[data-task]');
+      var panel = nodes[i].getAttribute('data-panel') || '';
+      if (card && panel) open.push(card.getAttribute('data-task') + '\n' + panel);
+    }
+    var focus = null;
+    var active = document.activeElement;
+    if (active && board.contains(active) && active.name) {
+      var host = active.closest('[data-task]');
+      var box = active.closest('details');
+      focus = {
+        task: host ? host.getAttribute('data-task') : '',
+        panel: box ? (box.getAttribute('data-panel') || '') : '',
+        name: active.name,
+        value: 'value' in active ? active.value : null,
+        start: active.selectionStart,
+        end: active.selectionEnd
+      };
+    }
+    return { open: open, focus: focus };
+  }
+
+  function cardOf(task) {
+    if (!task || !window.CSS || !CSS.escape) {
+      var all = board.querySelectorAll('[data-task]');
+      for (var i = 0; i < all.length; i++) {
+        if (all[i].getAttribute('data-task') === task) return all[i];
+      }
+      return null;
+    }
+    return board.querySelector('[data-task="' + CSS.escape(task) + '"]');
+  }
+
+  function restore(state) {
+    for (var i = 0; i < state.open.length; i++) {
+      var parts = state.open[i].split('\n');
+      var card = cardOf(parts[0]);
+      if (!card) continue;
+      var d = card.querySelector('details[data-panel="' + parts[1] + '"]');
+      if (d) d.open = true;
+    }
+    applyDone();
+    var f = state.focus;
+    if (!f || !f.name) return;
+    var card = cardOf(f.task);
+    if (!card) return;
+    var scope = card;
+    if (f.panel) {
+      var panel = card.querySelector('details[data-panel="' + f.panel + '"]');
+      if (panel) scope = panel;
+    }
+    var el = scope.querySelector('[name="' + f.name + '"]');
+    if (!el) return;
+    if (f.value != null && 'value' in el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) {
+      el.value = f.value;
+    }
+    el.focus();
+    if (el.setSelectionRange && typeof f.start === 'number') {
+      try { el.setSelectionRange(f.start, f.end); } catch (e) {}
+    }
+  }
+
+  function apply(html) {
+    var state = capture();
+    board.innerHTML = html;
+    restore(state);
+  }
+
+  applyDone();
+  board.addEventListener('click', function (ev) {
+    var btn = ev.target.closest('.col-toggle');
+    if (!btn || !board.contains(btn)) return;
+    var collapsed = localStorage.getItem(doneKey) === '1';
+    localStorage.setItem(doneKey, collapsed ? '0' : '1');
+    applyDone();
   });
+
+  var path = board.getAttribute('data-stream');
+  if (!path || !window.EventSource) return;
   var es = new EventSource(path);
   es.addEventListener('board', function (ev) { apply(ev.data); });
 })();

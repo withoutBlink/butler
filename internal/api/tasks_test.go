@@ -282,6 +282,132 @@ func TestTaskClaimAndAuth(t *testing.T) {
 	}
 }
 
+func TestHandoffChainReviewAndReject(t *testing.T) {
+	srv, svc, st, _, agents := newTaskEnv(t)
+	ctx := context.Background()
+	if err := st.UpdateAgentDisplayName(ctx, agents["alpha"].ID, "Researcher"); err != nil {
+		t.Fatalf("rename alpha: %v", err)
+	}
+	if err := st.UpdateAgentDisplayName(ctx, agents["beta"].ID, "Link"); err != nil {
+		t.Fatalf("rename beta: %v", err)
+	}
+	var mu sync.Mutex
+	var bodies []map[string]any
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var m map[string]any
+		if json.Unmarshal(raw, &m) == nil {
+			mu.Lock()
+			bodies = append(bodies, m)
+			mu.Unlock()
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer hook.Close()
+	resp, body := req(t, "PUT", srv.URL+"/api/v1/webhooks/agents/"+agents["beta"].ID, adminTok, map[string]any{"url": hook.URL})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("webhook: %d %v", resp.StatusCode, body)
+	}
+
+	resp, body = req(t, "POST", srv.URL+"/api/v1/tasks", adminTok, map[string]any{
+		"title":    "Walk the chain",
+		"assignee": "Researcher",
+		"chain":    []string{"Researcher", "Link"},
+		"reviewer": "admin",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create: %d %v", resp.StatusCode, body)
+	}
+	id, _ := body["id"].(string)
+	chain, _ := body["chain"].([]any)
+	if body["assignee_id"] != agents["alpha"].ID || len(chain) != 2 || body["reviewer_id"] != "admin" {
+		t.Fatalf("create shape: %v", body)
+	}
+
+	// Someone who does not own it cannot hand it off.
+	resp, body = req(t, "POST", srv.URL+"/api/v1/tasks/"+id+"/handoff", agents["beta"].Token, map[string]any{})
+	if resp.StatusCode != http.StatusForbidden || !strings.Contains(body["error"].(string), "current owner") {
+		t.Fatalf("non-owner handoff: %d %v", resp.StatusCode, body)
+	}
+
+	resp, body = req(t, "POST", srv.URL+"/api/v1/tasks/"+id+"/handoff", agents["alpha"].Token, map[string]any{"note": "sources are in"})
+	if resp.StatusCode != http.StatusOK || body["assignee_id"] != agents["beta"].ID || body["status"] != "todo" {
+		t.Fatalf("handoff to link: %d %v", resp.StatusCode, body)
+	}
+	svc.Hooks.Wait()
+	mu.Lock()
+	if len(bodies) != 1 || bodies[0]["event"] != "task.assigned" || bodies[0]["handoff"] != true {
+		t.Fatalf("handoff webhook: %+v", bodies)
+	}
+	mu.Unlock()
+
+	resp, got := req(t, "GET", srv.URL+"/api/v1/tasks/"+id, adminTok, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get: %d %v", resp.StatusCode, got)
+	}
+	comments, _ := got["comments"].([]any)
+	if len(comments) != 1 || !strings.Contains(comments[0].(map[string]any)["body"].(string), "Researcher handed off to Link: sources are in") {
+		t.Fatalf("log: %v", got["comments"])
+	}
+	resp, caught := req(t, "GET", srv.URL+"/api/v1/messages?after=0", agents["beta"].Token, nil)
+	if resp.StatusCode != http.StatusOK || !mentionsID(t, caught, agents["beta"].ID, "handed off") {
+		t.Fatalf("link was not mentioned: %v", caught)
+	}
+
+	resp, body = req(t, "PATCH", srv.URL+"/api/v1/tasks/"+id, agents["beta"].Token, map[string]any{"status": "done"})
+	if resp.StatusCode != http.StatusForbidden || !strings.Contains(body["error"].(string), "hand it off for review") {
+		t.Fatalf("owner marking done: %d %v", resp.StatusCode, body)
+	}
+
+	resp, body = req(t, "POST", srv.URL+"/api/v1/tasks/"+id+"/handoff", agents["beta"].Token, map[string]any{})
+	if resp.StatusCode != http.StatusOK || body["status"] != "review" || body["assignee_id"] != "admin" || body["review_from_id"] != agents["beta"].ID {
+		t.Fatalf("handoff to review: %d %v", resp.StatusCode, body)
+	}
+
+	resp, body = req(t, "POST", srv.URL+"/api/v1/tasks/"+id+"/reject", adminTok, map[string]any{"note": "needs a source"})
+	if resp.StatusCode != http.StatusOK || body["status"] != "todo" || body["assignee_id"] != agents["beta"].ID {
+		t.Fatalf("reject: %d %v", resp.StatusCode, body)
+	}
+	resp, got = req(t, "GET", srv.URL+"/api/v1/tasks/"+id, adminTok, nil)
+	comments, _ = got["comments"].([]any)
+	last := comments[len(comments)-1].(map[string]any)["body"].(string)
+	if !strings.Contains(last, "Admin sent this back to Link: needs a source") {
+		t.Fatalf("reject log: %q", last)
+	}
+
+	resp, body = req(t, "POST", srv.URL+"/api/v1/tasks/"+id+"/handoff", agents["beta"].Token, map[string]any{})
+	if resp.StatusCode != http.StatusOK || body["status"] != "review" {
+		t.Fatalf("handoff back to review: %d %v", resp.StatusCode, body)
+	}
+	resp, body = req(t, "POST", srv.URL+"/api/v1/tasks/"+id+"/approve", agents["beta"].Token, map[string]any{})
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("non-reviewer approve: %d %v", resp.StatusCode, body)
+	}
+	resp, body = req(t, "POST", srv.URL+"/api/v1/tasks/"+id+"/approve", adminTok, nil)
+	if resp.StatusCode != http.StatusOK || body["status"] != "done" {
+		t.Fatalf("approve: %d %v", resp.StatusCode, body)
+	}
+}
+
+func mentionsID(t *testing.T, body map[string]any, id, needle string) bool {
+	t.Helper()
+	msgs, _ := body["messages"].([]any)
+	for _, raw := range msgs {
+		m, _ := raw.(map[string]any)
+		content, _ := m["content"].(string)
+		if m["kind"] != "chat" || !strings.Contains(content, needle) {
+			continue
+		}
+		ids, _ := m["mentions"].([]any)
+		for _, mid := range ids {
+			if mid == id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func mentionsAdmin(t *testing.T, body map[string]any, needle string) bool {
 	t.Helper()
 	msgs, _ := body["messages"].([]any)

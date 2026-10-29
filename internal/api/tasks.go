@@ -1,7 +1,9 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -35,40 +37,42 @@ func (a *API) writeBoardErr(w http.ResponseWriter, err error) {
 // panel human; an instance token acts as that agent. Kind tokens are rejected
 // by requireAuth. The admin row is created on demand so a fresh database
 // can still open a task before the panel has been used.
-func (a *API) actor(w http.ResponseWriter, r *http.Request) (string, bool) {
+func (a *API) actor(w http.ResponseWriter, r *http.Request) (string, bool, bool) {
 	ident, ok := a.requireAuth(w, r)
 	if !ok {
-		return "", false
+		return "", false, false
 	}
 	if ident.Admin {
 		if _, err := a.Store.GetAgent(r.Context(), adminAgentID); err != nil {
 			if !errors.Is(err, store.ErrNotFound) {
 				writeErr(w, http.StatusInternalServerError, "store error")
-				return "", false
+				return "", false, false
 			}
 			if _, err := a.Store.CreateAgent(r.Context(), adminAgentID, "Admin", "human", "", "", ""); err != nil {
 				writeErr(w, http.StatusInternalServerError, "store error")
-				return "", false
+				return "", false, false
 			}
 		}
-		return adminAgentID, true
+		return adminAgentID, true, true
 	}
-	return ident.Agent.ID, true
+	return ident.Agent.ID, false, true
 }
 
 func (a *API) createTask(w http.ResponseWriter, r *http.Request) {
-	actor, ok := a.actor(w, r)
+	actor, _, ok := a.actor(w, r)
 	if !ok {
 		return
 	}
 	var req struct {
-		ID          string `json:"id"`
-		Title       string `json:"title"`
-		Description string `json:"description"`
-		Status      string `json:"status"`
-		Priority    string `json:"priority"`
-		Assignee    string `json:"assignee"`
-		SessionID   string `json:"session_id"`
+		ID          string   `json:"id"`
+		Title       string   `json:"title"`
+		Description string   `json:"description"`
+		Status      string   `json:"status"`
+		Priority    string   `json:"priority"`
+		Assignee    string   `json:"assignee"`
+		SessionID   string   `json:"session_id"`
+		Chain       []string `json:"chain"`
+		Reviewer    string   `json:"reviewer"`
 	}
 	if !decodeJSON(w, r, &req, maxMessageBytes) {
 		return
@@ -77,6 +81,7 @@ func (a *API) createTask(w http.ResponseWriter, r *http.Request) {
 		ID: req.ID, Title: req.Title, Description: req.Description,
 		Status: req.Status, Priority: req.Priority,
 		Assignee: req.Assignee, SessionID: req.SessionID,
+		Chain: req.Chain, Reviewer: req.Reviewer,
 	})
 	if err != nil {
 		a.writeBoardErr(w, err)
@@ -90,7 +95,7 @@ func (a *API) createTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listTasks(w http.ResponseWriter, r *http.Request) {
-	actor, ok := a.actor(w, r)
+	actor, _, ok := a.actor(w, r)
 	if !ok {
 		return
 	}
@@ -145,7 +150,7 @@ func (a *API) resolveAssignee(r *http.Request, token string) (string, error) {
 }
 
 func (a *API) getTask(w http.ResponseWriter, r *http.Request) {
-	if _, ok := a.actor(w, r); !ok {
+	if _, _, ok := a.actor(w, r); !ok {
 		return
 	}
 	task, err := a.Store.GetTask(r.Context(), r.PathValue("id"))
@@ -167,17 +172,19 @@ func (a *API) getTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) patchTask(w http.ResponseWriter, r *http.Request) {
-	actor, ok := a.actor(w, r)
+	actor, admin, ok := a.actor(w, r)
 	if !ok {
 		return
 	}
 	var req struct {
-		Title       *string `json:"title"`
-		Description *string `json:"description"`
-		Status      *string `json:"status"`
-		Priority    *string `json:"priority"`
-		Assignee    *string `json:"assignee"`
-		SessionID   *string `json:"session_id"`
+		Title       *string   `json:"title"`
+		Description *string   `json:"description"`
+		Status      *string   `json:"status"`
+		Priority    *string   `json:"priority"`
+		Assignee    *string   `json:"assignee"`
+		SessionID   *string   `json:"session_id"`
+		Chain       *[]string `json:"chain"`
+		Reviewer    *string   `json:"reviewer"`
 	}
 	if !decodeJSON(w, r, &req, maxMessageBytes) {
 		return
@@ -185,7 +192,8 @@ func (a *API) patchTask(w http.ResponseWriter, r *http.Request) {
 	res, err := a.Board.Update(r.Context(), actor, r.PathValue("id"), board.UpdateInput{
 		Title: req.Title, Description: req.Description, Status: req.Status,
 		Priority: req.Priority, Assignee: req.Assignee, SessionID: req.SessionID,
-	})
+		Chain: req.Chain, Reviewer: req.Reviewer,
+	}, admin)
 	if err != nil {
 		a.writeBoardErr(w, err)
 		return
@@ -194,7 +202,7 @@ func (a *API) patchTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) commentTask(w http.ResponseWriter, r *http.Request) {
-	actor, ok := a.actor(w, r)
+	actor, _, ok := a.actor(w, r)
 	if !ok {
 		return
 	}
@@ -213,7 +221,7 @@ func (a *API) commentTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) claimTask(w http.ResponseWriter, r *http.Request) {
-	actor, ok := a.actor(w, r)
+	actor, _, ok := a.actor(w, r)
 	if !ok {
 		return
 	}
@@ -223,6 +231,71 @@ func (a *API) claimTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, taskJSON{Task: *res.Task, NotifySeq: res.NotifySeq})
+}
+
+func (a *API) handoffTask(w http.ResponseWriter, r *http.Request) {
+	actor, admin, ok := a.actor(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		To   string `json:"to"`
+		Note string `json:"note"`
+	}
+	if !decodeOptionalJSON(w, r, &req) {
+		return
+	}
+	res, err := a.Board.Handoff(r.Context(), actor, r.PathValue("id"), req.To, req.Note, admin)
+	if err != nil {
+		a.writeBoardErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, taskJSON{Task: *res.Task, NotifySeq: res.NotifySeq})
+}
+
+func (a *API) approveTask(w http.ResponseWriter, r *http.Request) {
+	actor, admin, ok := a.actor(w, r)
+	if !ok {
+		return
+	}
+	res, err := a.Board.Approve(r.Context(), actor, r.PathValue("id"), admin)
+	if err != nil {
+		a.writeBoardErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, taskJSON{Task: *res.Task, NotifySeq: res.NotifySeq})
+}
+
+func (a *API) rejectTask(w http.ResponseWriter, r *http.Request) {
+	actor, admin, ok := a.actor(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		To   string `json:"to"`
+		Note string `json:"note"`
+	}
+	if !decodeOptionalJSON(w, r, &req) {
+		return
+	}
+	res, err := a.Board.Reject(r.Context(), actor, r.PathValue("id"), req.To, req.Note, admin)
+	if err != nil {
+		a.writeBoardErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, taskJSON{Task: *res.Task, NotifySeq: res.NotifySeq})
+}
+
+// decodeOptionalJSON accepts an empty body as an empty value. Handoff and
+// reject are valid with no fields.
+func decodeOptionalJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxMessageBytes)
+	err := json.NewDecoder(r.Body).Decode(v)
+	if err == nil || errors.Is(err, io.EOF) {
+		return true
+	}
+	writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+	return false
 }
 
 func (a *API) listWebhooks(w http.ResponseWriter, r *http.Request) {

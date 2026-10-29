@@ -82,9 +82,15 @@ CREATE TABLE IF NOT EXISTS read_marks (
 );
 
 -- Tasks on the board. status is todo / in_progress / blocked / review / done.
--- priority is low / normal / high / urgent. assignee_id is NULL when nobody
--- owns it yet. session_id optionally ties discussion to a room; deleting that
--- session drops the link (ON DELETE SET NULL) and leaves the task.
+-- priority is low / normal / high / urgent. assignee_id is the single owner
+-- (NULL when nobody owns it yet). reviewer_id empty means the creator is the
+-- reviewer. handoff_chain is a JSON array of agent ids, in order.
+-- review_from_id is who owned the task when it last entered review, so a
+-- reject can send it back. session_id optionally ties discussion to a room;
+-- deleting that session drops the link (ON DELETE SET NULL) and leaves the task.
+-- Columns added after the first board release are also applied to existing
+-- databases by store.migrate (idempotent ALTER TABLE). A fresh database gets
+-- them from this CREATE.
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
@@ -93,6 +99,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     priority TEXT NOT NULL DEFAULT 'normal',
     assignee_id TEXT REFERENCES agents (id),
     creator_id TEXT NOT NULL REFERENCES agents (id),
+    reviewer_id TEXT REFERENCES agents (id),
+    handoff_chain TEXT NOT NULL DEFAULT '[]',
+    review_from_id TEXT REFERENCES agents (id),
     session_id TEXT REFERENCES sessions (id) ON DELETE SET NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL

@@ -121,7 +121,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 // effective registry ids, e.g. "butler_send_message"). wait_for_messages and
 // check_messages stay MCP: the relay already delivers per session, and the
 // blocking-poll tools carry no session context worth binding.
-const SHADOWED = /^(send_message|read_session|list_sessions|set_context|get_context|create_session|join_session|list_tasks|get_task|create_task|update_task_status|comment_task|claim_task)$/
+const SHADOWED = /^(send_message|read_session|list_sessions|set_context|get_context|create_session|join_session|list_tasks|get_task|create_task|update_task_status|comment_task|claim_task|handoff_task|approve_task|reject_task)$/
 const shadowedId = (id: string) => {
   const m = /^butler_*([^_].*)$/.exec(id)
   return m != null && SHADOWED.test(m[1])
@@ -1199,6 +1199,8 @@ export default Plugin.define({
             status: { type: "string", description: "todo, in_progress, blocked, review, or done; default todo" },
             priority: { type: "string", description: "low, normal, high, or urgent; default normal" },
             session: { type: "string", description: "session id to link, optional" },
+            chain: { type: "array", items: { type: "string" }, description: "ordered owners; each an agent id, display name, or kind" },
+            reviewer: { type: "string", description: "who may mark the task done; default is you" },
           },
           required: ["title"],
           additionalProperties: false,
@@ -1215,6 +1217,8 @@ export default Plugin.define({
             status: input?.status ?? "",
             priority: input?.priority ?? "",
             session_id: input?.session ?? "",
+            reviewer: input?.reviewer ?? "",
+            ...(Array.isArray(input?.chain) ? { chain: input.chain } : {}),
           })
           if (!res.ok) return errText(await errBody(res))
           const task = (await res.json()) as ButlerTask
@@ -1294,6 +1298,86 @@ export default Plugin.define({
           if (!res.ok) return errText(await errBody(res))
           const updated = (await res.json()) as ButlerTask
           return { content: `claimed task "${updated.title}" (${updated.id})\nstatus: ${updated.status} · assignee: ${updated.assignee_id}` }
+        }),
+      })
+
+      editor.add({
+        name: "handoff_task",
+        description:
+          "Hand a task you own to the next agent, as your session's butler identity. Omit `to` to follow the chain (or the reviewer, which sets status review). Status becomes todo for a new owner.",
+        input: {
+          type: "object",
+          properties: {
+            task: { type: "string", description: "task id, required" },
+            to: { type: "string", description: "next owner; omit to take the next chain step" },
+            note: { type: "string", description: "optional note recorded in the log" },
+          },
+          required: ["task"],
+          additionalProperties: false,
+        },
+        options: { namespace: "butler", codemode: true },
+        execute: exec(async (input, context) => {
+          const task = String(input?.task ?? "")
+          if (!task) return errText("task is required")
+          const ident = identityFor(context?.sessionID)
+          const res = await api(ident, "POST", `${taskPath(task)}/handoff`, {
+            to: input?.to ?? "",
+            note: input?.note ?? "",
+          })
+          if (!res.ok) return errText(await errBody(res))
+          const updated = (await res.json()) as ButlerTask
+          return { content: `handed off task "${updated.title}" (${updated.id})\nstatus: ${updated.status} · owner: ${updated.assignee_id || "unassigned"}` }
+        }),
+      })
+
+      editor.add({
+        name: "approve_task",
+        description:
+          "Mark a task done, as your session's butler identity. Only the reviewer can do this. Owners hand the task off for review instead.",
+        input: {
+          type: "object",
+          properties: { task: { type: "string", description: "task id, required" } },
+          required: ["task"],
+          additionalProperties: false,
+        },
+        options: { namespace: "butler", codemode: true },
+        execute: exec(async (input, context) => {
+          const task = String(input?.task ?? "")
+          if (!task) return errText("task is required")
+          const ident = identityFor(context?.sessionID)
+          const res = await api(ident, "POST", `${taskPath(task)}/approve`, {})
+          if (!res.ok) return errText(await errBody(res))
+          const updated = (await res.json()) as ButlerTask
+          return { content: `approved task "${updated.title}" (${updated.id})\nstatus: ${updated.status}` }
+        }),
+      })
+
+      editor.add({
+        name: "reject_task",
+        description:
+          "Send a task in review back to an owner, as your session's butler identity. Omit `to` to return it to the previous owner. Only the reviewer can call this.",
+        input: {
+          type: "object",
+          properties: {
+            task: { type: "string", description: "task id, required" },
+            to: { type: "string", description: "who receives it back; omit for the previous owner" },
+            note: { type: "string", description: "why it is coming back" },
+          },
+          required: ["task"],
+          additionalProperties: false,
+        },
+        options: { namespace: "butler", codemode: true },
+        execute: exec(async (input, context) => {
+          const task = String(input?.task ?? "")
+          if (!task) return errText("task is required")
+          const ident = identityFor(context?.sessionID)
+          const res = await api(ident, "POST", `${taskPath(task)}/reject`, {
+            to: input?.to ?? "",
+            note: input?.note ?? "",
+          })
+          if (!res.ok) return errText(await errBody(res))
+          const updated = (await res.json()) as ButlerTask
+          return { content: `sent back task "${updated.title}" (${updated.id})\nstatus: ${updated.status} · owner: ${updated.assignee_id}` }
         }),
       })
     })

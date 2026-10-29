@@ -302,10 +302,14 @@ func (c *Client) GetTask(ctx context.Context, id string) (*TaskView, error) {
 	return &out, nil
 }
 
-func (c *Client) CreateTask(ctx context.Context, title, description, assignee, status, priority, session string) (*TaskView, error) {
-	body := map[string]string{
+func (c *Client) CreateTask(ctx context.Context, title, description, assignee, status, priority, session, reviewer string, chain []string) (*TaskView, error) {
+	body := map[string]any{
 		"title": title, "description": description, "assignee": assignee,
 		"status": status, "priority": priority, "session_id": session,
+		"reviewer": reviewer,
+	}
+	if len(chain) > 0 {
+		body["chain"] = chain
 	}
 	var out TaskView
 	if err := c.do(ctx, "POST", "/api/v1/tasks", body, &out); err != nil {
@@ -332,6 +336,32 @@ func (c *Client) CommentTask(ctx context.Context, id, body string) (*store.TaskC
 		return nil, 0, err
 	}
 	return &out.TaskComment, out.NotifySeq, nil
+}
+
+func (c *Client) HandoffTask(ctx context.Context, id, to, note string) (*TaskView, error) {
+	var out TaskView
+	body := map[string]string{"to": to, "note": note}
+	if err := c.do(ctx, "POST", "/api/v1/tasks/"+url.PathEscape(id)+"/handoff", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) ApproveTask(ctx context.Context, id string) (*TaskView, error) {
+	var out TaskView
+	if err := c.do(ctx, "POST", "/api/v1/tasks/"+url.PathEscape(id)+"/approve", map[string]any{}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) RejectTask(ctx context.Context, id, to, note string) (*TaskView, error) {
+	var out TaskView
+	body := map[string]string{"to": to, "note": note}
+	if err := c.do(ctx, "POST", "/api/v1/tasks/"+url.PathEscape(id)+"/reject", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 func (c *Client) ClaimTask(ctx context.Context, id string) (*TaskView, error) {

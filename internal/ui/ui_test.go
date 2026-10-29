@@ -1793,3 +1793,69 @@ func TestBoardStream(t *testing.T) {
 		t.Fatalf("expected a board event with the new task, got %v", events)
 	}
 }
+
+func TestBoardOwnerChainAndHandoff(t *testing.T) {
+	srv, st, _, adminTok := newPanel(t)
+	ctx := context.Background()
+	for _, a := range []struct{ id, name string }{{"admin", "Admin"}, {"researcher", "Researcher"}, {"link", "Link"}, {"noodle", "Noodle"}} {
+		if _, err := st.CreateAgent(ctx, a.id, a.name, "codex", a.id, "/tmp/"+a.id, ""); err != nil {
+			t.Fatalf("agent %s: %v", a.id, err)
+		}
+	}
+	if _, err := st.EnsureGlobalSession(ctx, "admin"); err != nil {
+		t.Fatalf("global: %v", err)
+	}
+	if _, err := st.CreateTask(ctx, &store.Task{
+		Title: "Walk the chain", AssigneeID: "researcher", CreatorID: "admin",
+		ReviewerID: "noodle", Chain: []string{"researcher", "link"}, Status: "todo", Priority: "high",
+	}); err != nil {
+		t.Fatalf("task: %v", err)
+	}
+
+	client := newBrowser(t)
+	login(t, client, srv.URL, adminTok)
+	resp, err := client.Get(srv.URL + "/panel/board")
+	if err != nil {
+		t.Fatalf("board: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	page := string(body)
+	for _, want := range []string{
+		"Owner: Researcher",
+		"Researcher",
+		"Link",
+		"Noodle (review)",
+		"→",
+		">Hand off<",
+		`class="col-body"`,
+		`class="col-toggle"`,
+		`data-panel="log"`,
+		`data-status="done"`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("board missing %q:\n%s", want, page)
+		}
+	}
+
+	tasks, err := st.ListTasks(ctx, store.TaskFilter{})
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("tasks: %+v %v", tasks, err)
+	}
+	resp, err = client.PostForm(srv.URL+"/panel/tasks/"+tasks[0].ID+"/handoff", url.Values{"note": {"first step"}})
+	if err != nil {
+		t.Fatalf("handoff: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("handoff status: %d", resp.StatusCode)
+	}
+	got, err := st.GetTask(ctx, tasks[0].ID)
+	if err != nil || got.AssigneeID != "link" || got.Status != "todo" {
+		t.Fatalf("after handoff: %+v %v", got, err)
+	}
+	notes, err := st.ListTaskComments(ctx, tasks[0].ID)
+	if err != nil || len(notes) != 1 || !strings.Contains(notes[0].Body, "Admin handed off to Link: first step") {
+		t.Fatalf("log: %+v %v", notes, err)
+	}
+}

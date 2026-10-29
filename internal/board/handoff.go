@@ -117,6 +117,11 @@ func (s *Service) Approve(ctx context.Context, actorID, taskID string, admin boo
 }
 
 func (s *Service) handoffDest(ctx context.Context, task *store.Task, toToken string) (string, bool, error) {
+	// In review the next step is the reviewer's: approve, or send it back.
+	// A bare handoff would otherwise jump to the start of the chain.
+	if task.Status == store.TaskReview && strings.TrimSpace(toToken) == "" {
+		return "", false, bad(409, "this task is in review; send it back or name who should own it")
+	}
 	if strings.TrimSpace(toToken) != "" {
 		id, err := s.resolve(ctx, toToken)
 		if err != nil {

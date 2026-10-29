@@ -175,9 +175,12 @@ func (p *Panel) loadBoard(ctx context.Context) (boardPage, error) {
 			ChainText:    strings.Join(namesInChain, ", "),
 			SessionTitle: titles[t.SessionID],
 			Comments:     cardNotes,
-			ShowHandoff:  t.Status != store.TaskDone,
-			ShowApprove:  t.Status != store.TaskDone,
-			ShowReject:   t.Status == store.TaskReview,
+			ShowHandoff:  t.Status != store.TaskDone && t.Status != store.TaskReview,
+			// Approve and Send back are the review step. Offering Approve
+			// earlier put it next to Hand off, and in a narrow column the
+			// Hand off button was the one that got clipped.
+			ShowApprove: t.Status == store.TaskReview,
+			ShowReject:  t.Status == store.TaskReview,
 		})
 	}
 	cols := make([]boardColumn, 0, len(store.TaskStatuses))

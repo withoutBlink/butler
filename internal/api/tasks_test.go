@@ -363,6 +363,10 @@ func TestHandoffChainReviewAndReject(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || body["status"] != "review" || body["assignee_id"] != "admin" || body["review_from_id"] != agents["beta"].ID {
 		t.Fatalf("handoff to review: %d %v", resp.StatusCode, body)
 	}
+	resp, body = req(t, "POST", srv.URL+"/api/v1/tasks/"+id+"/handoff", adminTok, map[string]any{})
+	if resp.StatusCode != http.StatusConflict || !strings.Contains(body["error"].(string), "in review") {
+		t.Fatalf("bare handoff during review: %d %v", resp.StatusCode, body)
+	}
 
 	resp, body = req(t, "POST", srv.URL+"/api/v1/tasks/"+id+"/reject", adminTok, map[string]any{"note": "needs a source"})
 	if resp.StatusCode != http.StatusOK || body["status"] != "todo" || body["assignee_id"] != agents["beta"].ID {

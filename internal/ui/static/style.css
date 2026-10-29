@@ -200,9 +200,9 @@ main.board-page .new-session { flex: 0 0 auto; }
 .chain { margin: 0 0 6px; font-size: 13px; color: var(--muted); }
 .chain .step.current { color: var(--fg); font-weight: 700; border-bottom: 2px solid var(--accent); }
 .card-actions { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
-.card-actions form { display: flex; gap: 6px; }
-.card-actions input { flex: 1; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; font: inherit; background: var(--bg); color: var(--fg); }
-.card-actions button { padding: 6px 10px; background: var(--accent); color: #fff; border: none; border-radius: 6px; cursor: pointer; font: inherit; }
+.card-actions form { display: flex; flex-direction: column; gap: 6px; }
+.card-actions input { width: 100%; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; font: inherit; background: var(--bg); color: var(--fg); }
+.card-actions button { align-self: flex-start; padding: 6px 10px; background: var(--accent); color: #fff; border: none; border-radius: 6px; cursor: pointer; font: inherit; }
 .card-actions button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--border); }
 .card-session { color: var(--accent); text-decoration: none; font-size: 12px; }
 .pri { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }

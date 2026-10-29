@@ -1832,6 +1832,9 @@ func TestBoardOwnerChainAndHandoff(t *testing.T) {
 		`class="col-toggle"`,
 		`data-panel="log"`,
 		`data-status="done"`,
+		`class="card-title"`,
+		`data-panel="menu"`,
+		`class="step current">R<`,
 	} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("board missing %q:\n%s", want, page)

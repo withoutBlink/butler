@@ -28,6 +28,7 @@ type boardNote struct {
 
 type chainStep struct {
 	Name    string
+	Initial string
 	Current bool
 	Review  bool
 }
@@ -152,6 +153,7 @@ func (p *Panel) loadBoard(ctx context.Context) (boardPage, error) {
 			namesInChain = append(namesInChain, name)
 			steps = append(steps, chainStep{
 				Name:    name,
+				Initial: ownerInitial(name),
 				Current: t.Status != store.TaskReview && id == t.AssigneeID,
 			})
 		}
@@ -161,6 +163,7 @@ func (p *Panel) loadBoard(ctx context.Context) (boardPage, error) {
 		}
 		steps = append(steps, chainStep{
 			Name:    revName,
+			Initial: ownerInitial(revName),
 			Review:  true,
 			Current: t.Status == store.TaskReview,
 		})

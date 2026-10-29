@@ -217,6 +217,233 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		s.advanceCursor(notifySeq)
 		return textResult(fmt.Sprintf("context %s updated", args.Key)), nil, nil
 	})
+
+	addTool(mcpServer, &mcp.Tool{
+		Name:        "list_tasks",
+		Description: "List tasks on the Butler board. Filter with assignee (an agent id, a display name, a kind, \"me\" for yourself, or \"unassigned\") and/or status (todo, in_progress, blocked, review, done). Use this to find work assigned to you.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
+		Assignee string `json:"assignee,omitempty" jsonschema:"agent id, display name, kind, \"me\", or \"unassigned\""`
+		Status   string `json:"status,omitempty" jsonschema:"todo, in_progress, blocked, review, or done"`
+		Session  string `json:"session,omitempty" jsonschema:"only tasks linked to this session id"`
+	}) (*mcp.CallToolResult, any, error) {
+		tasks, err := s.client.ListTasks(ctx, args.Assignee, args.Status, args.Session)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		return textResult(formatTaskList(tasks)), nil, nil
+	})
+
+	addTool(mcpServer, &mcp.Tool{
+		Name:        "get_task",
+		Description: "Read one task: title, description, status, priority, assignee, creator, linked session, and its comment log. Use the task id from list_tasks or from an assignment message.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
+		Task string `json:"task" jsonschema:"task id, required"`
+	}) (*mcp.CallToolResult, any, error) {
+		if args.Task == "" {
+			return errResult("task is required"), nil, nil
+		}
+		view, err := s.client.GetTask(ctx, args.Task)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		return textResult(formatTask(view)), nil, nil
+	})
+
+	addTool(mcpServer, &mcp.Tool{
+		Name:        "create_task",
+		Description: "Create a task on the Butler board. assignee is optional and resolves like an @mention (agent id, display name, or kind). Assigning someone posts a message that @mentions them, so their wait_for_messages / relay wakes them. chain is the ordered handoff list (same token style); reviewer is who may mark it done (default: you, the creator). Link a session when the discussion should happen there.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
+		Title       string   `json:"title" jsonschema:"short title, required"`
+		Description string   `json:"description,omitempty" jsonschema:"longer description of the work"`
+		Assignee    string   `json:"assignee,omitempty" jsonschema:"agent id, display name, or kind"`
+		Status      string   `json:"status,omitempty" jsonschema:"todo, in_progress, blocked, review, or done; default todo"`
+		Priority    string   `json:"priority,omitempty" jsonschema:"low, normal, high, or urgent; default normal"`
+		Session     string   `json:"session,omitempty" jsonschema:"session id to link, optional"`
+		Chain       []string `json:"chain,omitempty" jsonschema:"ordered owners, each an agent id, display name, or kind"`
+		Reviewer    string   `json:"reviewer,omitempty" jsonschema:"who may mark the task done; default is you"`
+	}) (*mcp.CallToolResult, any, error) {
+		if strings.TrimSpace(args.Title) == "" {
+			return errResult("title is required"), nil, nil
+		}
+		view, err := s.client.CreateTask(ctx, args.Title, args.Description, args.Assignee, args.Status, args.Priority, args.Session, args.Reviewer, args.Chain)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		s.advanceCursor(view.NotifySeq)
+		who := "unassigned"
+		if view.AssigneeID != "" {
+			who = view.AssigneeID
+		}
+		return textResult(fmt.Sprintf("created task %q (%s)\nstatus: %s · priority: %s · assignee: %s", view.Title, view.ID, view.Status, view.Priority, who)), nil, nil
+	})
+
+	addTool(mcpServer, &mcp.Tool{
+		Name:        "update_task_status",
+		Description: "Move a task to a new status: todo, in_progress, blocked, review, or done. Only the reviewer (or the human admin) can set done — otherwise hand the task off for review and use approve_task. The creator (and the assignee, when that is someone else) is notified.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
+		Task   string `json:"task" jsonschema:"task id, required"`
+		Status string `json:"status" jsonschema:"todo, in_progress, blocked, review, or done, required"`
+	}) (*mcp.CallToolResult, any, error) {
+		if args.Task == "" || strings.TrimSpace(args.Status) == "" {
+			return errResult("task and status are required"), nil, nil
+		}
+		view, err := s.client.UpdateTaskStatus(ctx, args.Task, args.Status)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		s.advanceCursor(view.NotifySeq)
+		return textResult(fmt.Sprintf("task %s (%s) status: %s", view.ID, view.Title, view.Status)), nil, nil
+	})
+
+	addTool(mcpServer, &mcp.Tool{
+		Name:        "comment_task",
+		Description: "Add a progress comment to a task. The creator and the assignee are notified (a mention in the task's session, or the global session). Use this to report what you did, what blocked you, or what you need reviewed.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
+		Task string `json:"task" jsonschema:"task id, required"`
+		Body string `json:"body" jsonschema:"comment text, required"`
+	}) (*mcp.CallToolResult, any, error) {
+		if args.Task == "" || strings.TrimSpace(args.Body) == "" {
+			return errResult("task and body are required"), nil, nil
+		}
+		c, seq, err := s.client.CommentTask(ctx, args.Task, args.Body)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		s.advanceCursor(seq)
+		return textResult(fmt.Sprintf("comment recorded on task %s (%s)", c.TaskID, c.ID)), nil, nil
+	})
+
+	addTool(mcpServer, &mcp.Tool{
+		Name:        "claim_task",
+		Description: "Claim a task: it is assigned to you and moved to in_progress. Use this when you pick up unassigned work, or when you take over a task. The creator is notified. If it is already yours and in progress, this does nothing.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
+		Task string `json:"task" jsonschema:"task id, required"`
+	}) (*mcp.CallToolResult, any, error) {
+		if args.Task == "" {
+			return errResult("task is required"), nil, nil
+		}
+		view, err := s.client.ClaimTask(ctx, args.Task)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		s.advanceCursor(view.NotifySeq)
+		return textResult(fmt.Sprintf("claimed task %q (%s)\nstatus: %s · assignee: %s", view.Title, view.ID, view.Status, view.AssigneeID)), nil, nil
+	})
+
+	addTool(mcpServer, &mcp.Tool{
+		Name:        "handoff_task",
+		Description: "Hand a task you own to the next agent. Omit `to` to follow the chain (the next owner, or the reviewer once the chain is done — that step sets status review). Pass `to` to name the next owner directly (id, display name, or kind). Status becomes todo for a new owner, or review when the task reaches its reviewer. A log line is recorded, the new owner is @mentioned, and their webhook fires as task.assigned with handoff true. Only the current owner can call this.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
+		Task string `json:"task" jsonschema:"task id, required"`
+		To   string `json:"to,omitempty" jsonschema:"next owner; omit to take the next chain step"`
+		Note string `json:"note,omitempty" jsonschema:"optional note recorded in the log"`
+	}) (*mcp.CallToolResult, any, error) {
+		if args.Task == "" {
+			return errResult("task is required"), nil, nil
+		}
+		view, err := s.client.HandoffTask(ctx, args.Task, args.To, args.Note)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		s.advanceCursor(view.NotifySeq)
+		who := "unassigned"
+		if view.AssigneeID != "" {
+			who = view.AssigneeID
+		}
+		return textResult(fmt.Sprintf("handed off task %q (%s)\nstatus: %s · owner: %s", view.Title, view.ID, view.Status, who)), nil, nil
+	})
+
+	addTool(mcpServer, &mcp.Tool{
+		Name:        "approve_task",
+		Description: "Mark a task done. Only the reviewer (or the human admin) can do this. If you are the owner and the work is ready, handoff_task instead so the reviewer can approve it.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
+		Task string `json:"task" jsonschema:"task id, required"`
+	}) (*mcp.CallToolResult, any, error) {
+		if args.Task == "" {
+			return errResult("task is required"), nil, nil
+		}
+		view, err := s.client.ApproveTask(ctx, args.Task)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		s.advanceCursor(view.NotifySeq)
+		return textResult(fmt.Sprintf("approved task %q (%s)\nstatus: %s", view.Title, view.ID, view.Status)), nil, nil
+	})
+
+	addTool(mcpServer, &mcp.Tool{
+		Name:        "reject_task",
+		Description: "Send a task in review back to an owner. Omit `to` to return it to the owner who handed it in (status becomes todo). Pass `to` to name someone else. Only the reviewer can call this. A log line is recorded and the new owner is @mentioned.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
+		Task string `json:"task" jsonschema:"task id, required"`
+		To   string `json:"to,omitempty" jsonschema:"who receives it back; omit for the previous owner"`
+		Note string `json:"note,omitempty" jsonschema:"why it is coming back"`
+	}) (*mcp.CallToolResult, any, error) {
+		if args.Task == "" {
+			return errResult("task is required"), nil, nil
+		}
+		view, err := s.client.RejectTask(ctx, args.Task, args.To, args.Note)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		s.advanceCursor(view.NotifySeq)
+		return textResult(fmt.Sprintf("sent back task %q (%s)\nstatus: %s · owner: %s", view.Title, view.ID, view.Status, view.AssigneeID)), nil, nil
+	})
+}
+
+func formatTaskList(tasks []store.Task) string {
+	if len(tasks) == 0 {
+		return "no tasks"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d task(s):\n", len(tasks))
+	for _, t := range tasks {
+		who := "-"
+		if t.AssigneeID != "" {
+			who = t.AssigneeID
+		}
+		fmt.Fprintf(&b, "  %s  [%s]  [%s]  assignee=%s  %q\n", t.ID, t.Status, t.Priority, who, t.Title)
+	}
+	return b.String()
+}
+
+func formatTask(view *TaskView) string {
+	var b strings.Builder
+	who := "unassigned"
+	if view.AssigneeID != "" {
+		who = view.AssigneeID
+	}
+	session := "none"
+	if view.SessionID != "" {
+		session = view.SessionID
+	}
+	fmt.Fprintf(&b, "task %q (%s)\n", view.Title, view.ID)
+	fmt.Fprintf(&b, "status: %s\npriority: %s\nowner: %s\ncreator: %s\nreviewer: %s\nsession: %s\n", view.Status, view.Priority, who, view.CreatorID, reviewerOf(view), session)
+	if len(view.Chain) > 0 {
+		fmt.Fprintf(&b, "chain: %s\n", strings.Join(view.Chain, " → "))
+	}
+	if view.Description != "" {
+		fmt.Fprintf(&b, "\n%s\n", view.Description)
+	}
+	if len(view.Comments) == 0 {
+		b.WriteString("\nno comments\n")
+		return b.String()
+	}
+	fmt.Fprintf(&b, "\n%d comment(s):\n", len(view.Comments))
+	for _, c := range view.Comments {
+		ts := time.UnixMilli(c.CreatedAt).UTC().Format("15:04:05")
+		fmt.Fprintf(&b, "  [%s] %s: %s\n", ts, c.AuthorID, c.Body)
+	}
+	return b.String()
+}
+
+func reviewerOf(view *TaskView) string {
+	if view.ReviewerID != "" {
+		return view.ReviewerID
+	}
+	if view.CreatorID != "" {
+		return view.CreatorID + " (creator)"
+	}
+	return "creator"
 }
 
 func (s *Server) listSessions(ctx context.Context) (*mcp.CallToolResult, any, error) {

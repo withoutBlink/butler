@@ -44,12 +44,16 @@ func main() {
 		kindCmd(rest)
 	case "agent":
 		agentCmd(rest)
+	case "task":
+		taskCmd(rest)
+	case "webhook":
+		webhookCmd(rest)
 	case "reset":
 		resetCmd(rest)
 	case "version":
 		fmt.Println("butler " + version)
 	default:
-		fmt.Fprintln(os.Stderr, "usage: butler [serve|kind|agent|reset|version] [flags]")
+		fmt.Fprintln(os.Stderr, "usage: butler [serve|kind|agent|task|webhook|reset|version] [flags]")
 		os.Exit(2)
 	}
 }

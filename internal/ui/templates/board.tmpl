@@ -1,0 +1,173 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Butler — Board</title>
+<link rel="stylesheet" href="{{asset "style.css"}}">
+</head>
+<body>
+<header>
+<span class="brand">Butler</span>
+<nav>
+<a href="/panel/">Sessions</a>
+<form method="post" action="/panel/logout" class="inline"><button type="submit" class="link">Sign out</button></form>
+</nav>
+</header>
+<main class="board-page">
+{{if .Notice}}<p class="notice">{{.Notice}}</p>{{end}}
+<section class="new-session">
+<h2>New task</h2>
+<form method="post" action="/panel/tasks" class="task-form" onsubmit="this.querySelector('button[type=submit]').disabled=true">
+<input type="text" name="title" placeholder="Task title" required maxlength="200">
+<textarea name="description" placeholder="What needs doing (optional)" rows="2"></textarea>
+<div class="task-row">
+<label>Assignee
+<select name="assignee">
+<option value="">Unassigned</option>
+{{range .Agents}}<option value="{{.ID}}">{{.Label}}</option>{{end}}
+</select>
+</label>
+<label>Status
+<select name="status">
+<option value="todo" selected>To do</option>
+<option value="in_progress">In progress</option>
+<option value="blocked">Blocked</option>
+<option value="review">Review</option>
+<option value="done">Done</option>
+</select>
+</label>
+<label>Priority
+<select name="priority">
+<option value="low">Low</option>
+<option value="normal" selected>Normal</option>
+<option value="high">High</option>
+<option value="urgent">Urgent</option>
+</select>
+</label>
+<label>Session
+<select name="session">
+<option value="">No linked session</option>
+{{range .Sessions}}<option value="{{.ID}}">{{.Title}}</option>{{end}}
+</select>
+</label>
+<label>Chain
+<input type="text" name="chain" placeholder="Researcher, Link">
+</label>
+<label>Reviewer
+<select name="reviewer">
+<option value="">You (creator)</option>
+{{range .Agents}}<option value="{{.ID}}">{{.Label}}</option>{{end}}
+</select>
+</label>
+<button type="submit">Create task</button>
+</div>
+</form>
+</section>
+<div id="board" data-stream="/panel/board/stream">
+{{template "board-columns" .}}
+</div>
+</main>
+<script src="{{asset "app.js"}}"></script>
+</body>
+</html>
+
+{{define "board-columns"}}
+<div class="board">
+{{range .Columns}}
+<section class="col" data-status="{{.Status}}">
+<h2><span>{{.Label}} <span class="count">{{len .Tasks}}</span></span>{{if eq .Status "done"}}<button type="button" class="col-toggle" aria-label="Collapse the Done column">Collapse</button>{{end}}</h2>
+<div class="col-body">
+{{range $card := .Tasks}}
+<article class="card{{if eq $card.Task.Priority "urgent"}} pri-urgent-card{{end}}" data-task="{{$card.Task.ID}}">
+<h3 class="card-title">{{$card.Task.Title}}</h3>
+{{if $card.Task.Description}}<p class="desc">{{short $card.Task.Description}}</p>{{end}}
+<div class="card-foot">
+{{if $card.Owner}}<span class="card-owner" title="Owner: {{$card.Owner}}"><span class="vh">Owner: </span><span class="av av-sm {{$card.OwnerClass}}" aria-hidden="true">{{$card.OwnerInitial}}</span><span class="name">{{$card.Owner}}</span></span>{{else}}<span class="card-owner unassigned" title="Unassigned"><span class="av av-sm" aria-hidden="true">?</span><span class="name">Unassigned</span></span>{{end}}
+{{if $card.Chain}}<span class="chain-mini" title="Chain: {{range $i, $s := $card.Chain}}{{if $i}} → {{end}}{{$s.Name}}{{if $s.Review}} (review){{end}}{{end}}"><span class="vh">Chain: {{range $i, $s := $card.Chain}}{{if $i}} → {{end}}{{$s.Name}}{{if $s.Review}} (review){{end}}{{end}}</span><span aria-hidden="true">{{range $i, $s := $card.Chain}}{{if $i}}<span class="arr">→</span>{{end}}<span class="step{{if $s.Current}} current{{end}}{{if $s.Review}} rev{{end}}">{{$s.Initial}}</span>{{end}}</span></span>{{end}}
+{{if ne $card.Task.Priority "normal"}}<span class="pri-tag pri-{{$card.Task.Priority}}">{{$card.Task.Priority}}</span>{{end}}
+</div>
+<details class="card-menu" data-panel="menu">
+<summary aria-label="Actions for {{$card.Task.Title}}" title="Actions">⋯</summary>
+<div class="card-panel">
+<div class="card-actions">
+{{if $card.ShowHandoff}}<form method="post" action="/panel/tasks/{{$card.Task.ID}}/handoff"><input type="text" name="note" placeholder="Handoff note" aria-label="Handoff note for {{$card.Task.Title}}"><button type="submit">Hand off</button></form>{{end}}
+{{if $card.ShowApprove}}<form method="post" action="/panel/tasks/{{$card.Task.ID}}/approve"><button type="submit">Approve</button></form>{{end}}
+{{if $card.ShowReject}}<form method="post" action="/panel/tasks/{{$card.Task.ID}}/reject"><input type="text" name="note" placeholder="Why send it back" aria-label="Send-back note for {{$card.Task.Title}}"><button type="submit" class="ghost">Send back</button></form>{{end}}
+</div>
+<form method="post" action="/panel/tasks/{{$card.Task.ID}}" class="move" onsubmit="this.querySelector('button[type=submit]').disabled=true">
+<select name="status" aria-label="Move {{$card.Task.Title}}">
+<option value="todo"{{if eq $card.Task.Status "todo"}} selected{{end}}>To do</option>
+<option value="in_progress"{{if eq $card.Task.Status "in_progress"}} selected{{end}}>In progress</option>
+<option value="blocked"{{if eq $card.Task.Status "blocked"}} selected{{end}}>Blocked</option>
+<option value="review"{{if eq $card.Task.Status "review"}} selected{{end}}>Review</option>
+<option value="done"{{if eq $card.Task.Status "done"}} selected{{end}}>Done</option>
+</select>
+<button type="submit">Move</button>
+</form>
+<details data-panel="edit">
+<summary>Edit</summary>
+<form method="post" action="/panel/tasks/{{$card.Task.ID}}" class="task-form" onsubmit="this.querySelector('button[type=submit]').disabled=true">
+<input type="text" name="title" value="{{$card.Task.Title}}" required maxlength="200" aria-label="Title">
+<textarea name="description" rows="3" aria-label="Description">{{$card.Task.Description}}</textarea>
+<label>Assignee
+<select name="assignee">
+<option value="">Unassigned</option>
+{{range $.Agents}}<option value="{{.ID}}"{{if eq .ID $card.Task.AssigneeID}} selected{{end}}>{{.Label}}</option>{{end}}
+</select>
+</label>
+<label>Priority
+<select name="priority">
+<option value="low"{{if eq $card.Task.Priority "low"}} selected{{end}}>Low</option>
+<option value="normal"{{if eq $card.Task.Priority "normal"}} selected{{end}}>Normal</option>
+<option value="high"{{if eq $card.Task.Priority "high"}} selected{{end}}>High</option>
+<option value="urgent"{{if eq $card.Task.Priority "urgent"}} selected{{end}}>Urgent</option>
+</select>
+</label>
+<label>Status
+<select name="status">
+<option value="todo"{{if eq $card.Task.Status "todo"}} selected{{end}}>To do</option>
+<option value="in_progress"{{if eq $card.Task.Status "in_progress"}} selected{{end}}>In progress</option>
+<option value="blocked"{{if eq $card.Task.Status "blocked"}} selected{{end}}>Blocked</option>
+<option value="review"{{if eq $card.Task.Status "review"}} selected{{end}}>Review</option>
+<option value="done"{{if eq $card.Task.Status "done"}} selected{{end}}>Done</option>
+</select>
+</label>
+<label>Session
+<select name="session">
+<option value="">No linked session</option>
+{{range $.Sessions}}<option value="{{.ID}}"{{if eq .ID $card.Task.SessionID}} selected{{end}}>{{.Title}}</option>{{end}}
+</select>
+</label>
+<label>Chain
+<input type="text" name="chain" value="{{$card.ChainText}}" placeholder="Researcher, Link" aria-label="Handoff chain">
+</label>
+<label>Reviewer
+<select name="reviewer">
+<option value="">Creator ({{$card.Creator}})</option>
+{{range $.Agents}}<option value="{{.ID}}"{{if eq .ID $card.Task.ReviewerID}} selected{{end}}>{{.Label}}</option>{{end}}
+</select>
+</label>
+<button type="submit">Save</button>
+</form>
+</details>
+<details data-panel="log">
+<summary>Log ({{len $card.Comments}})</summary>
+<ul class="log">
+{{range $card.Comments}}<li><b>{{.Author}}</b> <span class="m-meta">{{ts .At}}</span><div>{{.Body}}</div></li>{{else}}<li class="hint">no comments yet</li>{{end}}
+</ul>
+<form method="post" action="/panel/tasks/{{$card.Task.ID}}/comment" class="task-form" onsubmit="this.querySelector('button[type=submit]').disabled=true">
+<textarea name="body" rows="2" required placeholder="Progress note" aria-label="Comment on {{$card.Task.Title}}"></textarea>
+<button type="submit">Comment</button>
+</form>
+</details>
+<p class="meta-line">by {{$card.Creator}}{{if $card.SessionTitle}} · <a class="card-session" href="/panel/sessions/{{$card.Task.SessionID}}">{{$card.SessionTitle}}</a>{{end}}</p>
+</div>
+</details>
+</article>
+{{else}}<p class="hint empty">nothing here</p>{{end}}
+</div>
+</section>
+{{end}}
+</div>
+{{end}}

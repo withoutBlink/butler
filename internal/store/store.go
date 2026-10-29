@@ -118,18 +118,19 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// ensureSchema applies schema.sql. There is no migration history: butler is
-// pre-release and the schema file is the single source of truth. Every
-// statement is CREATE ... IF NOT EXISTS, so opening an existing database is a
-// no-op; a database from an older schema is NOT upgraded in place — recreate
-// it (`butler reset`).
+// ensureSchema applies schema.sql, then idempotent ALTERs for columns added
+// after a database was created (see migrateTasks). CREATE ... IF NOT EXISTS
+// does not change a table that already exists, so those ALTERs are what let
+// a live database pick up additive changes without `butler reset`. A breaking
+// change still means recreating the database — there is no general migration
+// history.
 func (s *Store) ensureSchema() error {
 	for _, stmt := range splitSQL(schemaSQL) {
 		if _, err := s.db.Exec(stmt); err != nil {
 			return err
 		}
 	}
-	return nil
+	return s.migrateTasks()
 }
 
 func splitSQL(script string) []string {

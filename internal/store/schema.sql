@@ -80,3 +80,57 @@ CREATE TABLE IF NOT EXISTS read_marks (
     last_seq INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (session_id, agent_id)
 );
+
+-- Tasks on the board. status is todo / in_progress / blocked / review / done.
+-- priority is low / normal / high / urgent. assignee_id is the single owner
+-- (NULL when nobody owns it yet). reviewer_id empty means the creator is the
+-- reviewer. handoff_chain is a JSON array of agent ids, in order.
+-- review_from_id is who owned the task when it last entered review, so a
+-- reject can send it back. session_id optionally ties discussion to a room;
+-- deleting that session drops the link (ON DELETE SET NULL) and leaves the task.
+-- Columns added after the first board release are also applied to existing
+-- databases by store.migrate (idempotent ALTER TABLE). A fresh database gets
+-- them from this CREATE.
+CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'todo',
+    priority TEXT NOT NULL DEFAULT 'normal',
+    assignee_id TEXT REFERENCES agents (id),
+    creator_id TEXT NOT NULL REFERENCES agents (id),
+    reviewer_id TEXT REFERENCES agents (id),
+    handoff_chain TEXT NOT NULL DEFAULT '[]',
+    review_from_id TEXT REFERENCES agents (id),
+    session_id TEXT REFERENCES sessions (id) ON DELETE SET NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks (assignee_id);
+
+-- Progress log for a task. One row per comment; the board and get_task show
+-- them in order. Deleting a task (no UI for it today) would take them too.
+CREATE TABLE IF NOT EXISTS task_comments (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks (id) ON DELETE CASCADE,
+    author_id TEXT NOT NULL REFERENCES agents (id),
+    body TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_comments_task ON task_comments (task_id, created_at);
+
+-- Outbound webhook: one URL per agent, or one per kind. An agent URL wins
+-- over the kind URL when both are set. Exactly one of agent_id / kind is
+-- set. UNIQUE treats NULLs as distinct, so the unused column does not
+-- collide across rows.
+CREATE TABLE IF NOT EXISTS webhooks (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT UNIQUE REFERENCES agents (id) ON DELETE CASCADE,
+    kind TEXT UNIQUE REFERENCES kinds (id) ON DELETE CASCADE,
+    url TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    CHECK ((agent_id IS NOT NULL AND kind IS NULL) OR (agent_id IS NULL AND kind IS NOT NULL))
+);

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"butler/internal/auth"
+	"butler/internal/board"
 	"butler/internal/hub"
 	"butler/internal/ids"
 	"butler/internal/store"
@@ -47,6 +48,8 @@ type Panel struct {
 	Hub        *hub.Hub
 	Log        *slog.Logger
 	AdminToken string
+	// Board announces task changes (mention + webhook + SSE wake).
+	Board *board.Service
 
 	sessions     *sessionStore
 	templates    *template.Template
@@ -164,6 +167,7 @@ func New(st *store.Store, h *hub.Hub, adminToken string, log *slog.Logger) (*Pan
 		Hub:          h,
 		Log:          log,
 		AdminToken:   adminToken,
+		Board:        board.New(st, h, log),
 		sessions:     newSessionStore(),
 		templates:    tmpl,
 		Heartbeat:    15 * time.Second,
@@ -210,6 +214,14 @@ func (p *Panel) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /panel/login", p.loginSubmit)
 	mux.HandleFunc("POST /panel/logout", p.logout)
 	mux.HandleFunc("GET /panel/", p.dashboard)
+	mux.HandleFunc("GET /panel/board", p.boardPage)
+	mux.HandleFunc("GET /panel/board/stream", p.boardStream)
+	mux.HandleFunc("POST /panel/tasks", p.createTask)
+	mux.HandleFunc("POST /panel/tasks/{id}", p.updateTask)
+	mux.HandleFunc("POST /panel/tasks/{id}/comment", p.commentTask)
+	mux.HandleFunc("POST /panel/tasks/{id}/handoff", p.handoffTask)
+	mux.HandleFunc("POST /panel/tasks/{id}/approve", p.approveTask)
+	mux.HandleFunc("POST /panel/tasks/{id}/reject", p.rejectTask)
 	mux.HandleFunc("POST /panel/sessions", p.createSession)
 	mux.HandleFunc("GET /panel/sessions/{id}", p.sessionView)
 	mux.HandleFunc("POST /panel/sessions/{id}/join", p.joinParticipant)

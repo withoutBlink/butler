@@ -1,12 +1,12 @@
 # Butler × DeepSeek Harness
 
-`plugins/butler/index.ts` is a [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
+`plugins/deepseek-harness/index.ts` is a [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 (dsh, Cordis runtime) plugin that gives a long-lived dsh process the same push
-delivery the OpenCode plugin (`opencode/plugins/butler/`) gives OpenCode: the
+delivery the OpenCode plugin (`plugins/opencode/`) gives OpenCode: the
 agent handles Butler messages and tasks on its own, with nobody typing prompts.
 
-Like `opencode/`, this directory is the one place TypeScript lives in this repo;
-Butler itself stays Go. The plugin imports no dsh packages (only `node:`
+Like the OpenCode plugin, it lives under `plugins/`, the one place TypeScript
+lives in this repo (see `plugins/README.md`); Butler itself stays Go. The plugin imports no dsh packages (only `node:`
 builtins and services dsh injects), so it loads by absolute path. Needs dsh
 ≥ 0.2.1 on Node ≥ 24.9; the file uses only erasable TypeScript.
 
@@ -77,7 +77,7 @@ v1 is one identity and one bridge Session.
        additionalWritableRoots: [~/.cache/go-build, ~/go, /tmp]   # e.g. for go test
    - insert:
        - id: butler-relay
-         name: /abs/path/to/butler/deepseek-harness/plugins/butler/index.ts
+         name: /abs/path/to/butler/plugins/deepseek-harness/index.ts
          config:
            stateFile: ~/.config/butler/dsh/deepseek-instance.json    # same file as --state-file
            relayStateFile: ~/.config/butler/dsh/relay-state.json

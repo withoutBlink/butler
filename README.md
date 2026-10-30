@@ -7,7 +7,7 @@ Butler is a personal project that lets coding agents (Codex, OpenCode, ...) work
 - M1 (done): backend server — REST API, long-poll delivery, SQLite storage, token auth, metrics.
 - M2 (done): `butler-mcp` — MCP server (stdio) that agents add to their MCP config.
 - M3 (done): web panel — live session view (SSE), presence, posting as the human, shared context editing.
-- M4 (done): push delivery — into OpenCode via the relay plugin (`.opencode/plugins/butler/`), into codex via `butler-mcp relay` + `codex queue`, into DeepSeek Harness via its relay plugin (`deepseek-harness/`, see its README); `butler reset` for wiping the database.
+- M4 (done): push delivery — into OpenCode via the relay plugin (`plugins/opencode/`), into codex via `butler-mcp relay` + `codex queue`, into DeepSeek Harness via its relay plugin (`plugins/deepseek-harness/`, see its README); all harness plugins live in [`plugins/`](plugins/README.md); `butler reset` for wiping the database.
 - M5 (done): task board — the human creates and assigns tasks from the panel; agents list, claim, comment and move them through MCP; assignment wakes the assignee on the existing mention path; a per-agent or per-kind webhook wakes remote assistants that cannot long-poll.
 
 Single user by design. Run it on a remote machine behind your HTTP reverse proxy; Butler itself never does TLS.
@@ -152,14 +152,14 @@ There is no read REST endpoint — the cursors are internal, surfaced only throu
 
 ### Automatic delivery into OpenCode (relay plugin)
 
-`wait_for_messages`/`check_messages` require the agent to poll on its own initiative. For OpenCode there is push delivery instead: `.opencode/plugins/butler/` in this repo is an OpenCode plugin that receives butler messages and injects them into the agent's conversation, so the agent wakes up with new messages without calling any tool.
+`wait_for_messages`/`check_messages` require the agent to poll on its own initiative. For OpenCode there is push delivery instead: `plugins/opencode/` in this repo is an OpenCode plugin that receives butler messages and injects them into the agent's conversation, so the agent wakes up with new messages without calling any tool.
 
 **Why a plugin and not MCP notifications?** An MCP server *can* push `notifications/message` over stdio, but OpenCode only logs those — it does not inject them into agent conversations. The supported route for getting external content into a session is a plugin submitting a prompt through the server's client API. The plugin also solves a second problem MCP cannot: the MCP connection is one per *app*, so it cannot tell OpenCode's sessions apart — the plugin can, and gives each one its own butler identity.
 
 **Components:**
 
 - `butler-mcp` (spawned by OpenCode as usual, per agent kind) — registers, serves the tools, and additionally writes a **state file**: `<workdir>/.butler/instance.json` (atomic rewrite on every registration, 0600) containing the identity name, the live instance token and the server URL. Override the path with `--state-file`/`BUTLER_STATE_FILE`. The file is gitignored.
-- the **relay plugin** (`.opencode/plugins/butler/index.ts`, auto-loaded when OpenCode runs in this repo) — a background loop inside the OpenCode server process, plus a per-session layer.
+- the **relay plugin** (`plugins/opencode/index.ts`; OpenCode auto-loads it once it is linked as the project's `.opencode/plugins/butler/` — see [`plugins/README.md`](plugins/README.md)) — a background loop inside the OpenCode server process, plus a per-session layer.
 
 **Flow:**
 
@@ -202,7 +202,7 @@ Recovery:
 Options (when referenced via the `plugins` array in `opencode.json`): `stateFile`, `bridge`, `delivery`. In other projects, reference the plugin by path:
 
 ```jsonc
-{ "plugins": [{ "package": "/path/to/butler/.opencode/plugins/butler", "options": { "bridge": true } }] }
+{ "plugins": [{ "package": "/path/to/butler/plugins/opencode", "options": { "bridge": true } }] }
 ```
 
 Limitations: roles show offline whenever no OpenCode client context is active — OpenCode tears the plugin (and its wait loops) down between active work, so nothing is polling then; eager activation plus persisted cursors bring the role back and deliver what it missed on the next client activity. Deleting an OpenCode session stops its role's loop but leaves the butler agent behind (kick it from the panel).

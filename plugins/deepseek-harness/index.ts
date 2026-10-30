@@ -1,5 +1,5 @@
 // Butler relay plugin for DeepSeek Harness (dsh) — the DSH counterpart of
-// opencode/plugins/butler. Runs inside a long-lived dsh Host (`dsh web`).
+// plugins/opencode. Runs inside a long-lived dsh Host (`dsh web`).
 //
 // What it does (v1):
 //   - Acts as the Butler identity that butler-mcp (spawned by DSH's own

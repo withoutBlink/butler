@@ -158,7 +158,7 @@ export function apply(ctx: any, rawConfig?: Partial<Config>) {
     }
     if (relayState.bridgeSessionId) {
       const r = await ctx.sessionController.resolveAgent(relayState.bridgeSessionId)
-      if (r?.agent) { bridge = r.agent; return bridge }
+      if (r?.agent) { bridge = r.agent; await attachToWorkspace(relayState.bridgeSessionId); return bridge }
       warn(`bridge Session ${relayState.bridgeSessionId} not resumable (${JSON.stringify(r?.error ?? null)}); creating a new one`)
     }
     const created = await ctx.sessionController.create({ cwd: config.cwd })
@@ -168,8 +168,22 @@ export function apply(ctx: any, rawConfig?: Partial<Config>) {
     relayState.bridgeSessionId = String(created.sessionId)
     saveRelayState()
     try { ctx.sessionTitle.rename(bridge.session, config.title) } catch (err) { warn(`rename failed: ${String(err)}`) }
+    await attachToWorkspace(relayState.bridgeSessionId)
     log(`created bridge Session ${relayState.bridgeSessionId}`)
     return bridge
+  }
+  // Sessions created by a plugin are not members of any Workspace, so the web
+  // UI sidebar would not list the bridge. Attach it to the Workspace for cwd.
+  const attachToWorkspace = async (sessionId: string) => {
+    const registry = ctx.get?.('workspaceRegistry')
+    if (!registry) return
+    try {
+      const ws = (await registry.resolveByPath(config.cwd)) ?? (await registry.create(config.cwd))
+      if (!ws.sessionIds.includes(sessionId)) {
+        await ws.attachSession(sessionId)
+        log(`attached bridge Session to workspace ${ws.id}`)
+      }
+    } catch (err) { warn(`could not attach bridge Session to a workspace: ${String(err)}`) }
   }
   const preparePermissions = (agent: any) => {
     try { ctx.permissionPresets.set(agent.session, config.permissionPreset) } catch (err) {
@@ -271,6 +285,7 @@ export function apply(ctx: any, rawConfig?: Partial<Config>) {
       await sleep(2_000, signal)
     }
     log(`relaying for ${inst.agent} from ${inst.server}`)
+    try { preparePermissions(await resolveBridge()) } catch (err) { warn(`bridge Session not ready yet: ${String(err)}`) }
 
     let cursor = 0
     let swept = false

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -1179,11 +1180,13 @@ func TestRenameAgent(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("blank display_name should 400: %d", resp.StatusCode)
 	}
-	resp, _ = req(t, "POST", base+"/api/v1/agents/rename", appTok, map[string]any{
+	// No client_session with an instance token now means "rename myself"
+	// (see TestSelfRename); here the app identity renames itself.
+	resp, body = req(t, "POST", base+"/api/v1/agents/rename", appTok, map[string]any{
 		"display_name": "x",
 	})
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("missing client_session should 400: %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK || body["id"] != agents["alpha"].ID {
+		t.Fatalf("instance token without client_session renames itself: %d %v", resp.StatusCode, body)
 	}
 	resp, _ = req(t, "POST", base+"/api/v1/agents/rename", adminTok, map[string]any{
 		"display_name": "x",
@@ -1406,5 +1409,143 @@ func TestRemoveParticipantAPI(t *testing.T) {
 	}
 	if resp, body = req(t, "DELETE", removeURL+agents["gamma"].ID, adminTok, nil); resp.StatusCode != http.StatusConflict {
 		t.Fatalf("removal from an archived session should 409: %d %v", resp.StatusCode, body)
+	}
+}
+
+// TestSelfRename: an agent renames itself with its own instance token (the
+// path behind MCP rename_self). The id is unchanged, the new name resolves for
+// @mentions and assignees while the old one stops, every joined room gets an
+// "Old is now New" notice, and names that would make @mentions ambiguous are
+// refused: another live agent's name (case-insensitive) or another kind's id
+// with 409, reserved/@-prefixed names with 400. Renaming someone else with an
+// instance token is 403; title sync (client_session) stays unchecked.
+func TestSelfRename(t *testing.T) {
+	srv, adminTok, _, agents := newTestAPIGlobal(t)
+	base := srv.URL
+	alpha, beta := agents["alpha"], agents["beta"]
+	rename := func(tok string, body map[string]any) (int, map[string]any) {
+		t.Helper()
+		resp, out := req(t, "POST", base+"/api/v1/agents/rename", tok, body)
+		return resp.StatusCode, out
+	}
+	globalNotices := func() []string {
+		t.Helper()
+		resp, body := req(t, "GET", base+"/api/v1/sessions/global/messages?after=0", adminTok, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("global messages: %d %v", resp.StatusCode, body)
+		}
+		var out []string
+		for _, m := range body["messages"].([]any) {
+			mm := m.(map[string]any)
+			if mm["kind"] == "system" && strings.Contains(mm["content"].(string), " is now ") {
+				out = append(out, mm["content"].(string))
+			}
+		}
+		return out
+	}
+
+	code, body := rename(alpha.Token, map[string]any{"display_name": "  Researcher  "})
+	if code != http.StatusOK || body["id"] != alpha.ID || body["display_name"] != "Researcher" || body["previous"] != alpha.ID {
+		t.Fatalf("first self rename: %d %v", code, body)
+	}
+	code, body = rename(alpha.Token, map[string]any{"display_name": "Point"})
+	if code != http.StatusOK || body["previous"] != "Researcher" || body["display_name"] != "Point" {
+		t.Fatalf("second self rename: %d %v", code, body)
+	}
+	// agent = own id is the same self path.
+	code, body = rename(alpha.Token, map[string]any{"agent": alpha.ID, "display_name": "Point"})
+	if code != http.StatusOK {
+		t.Fatalf("self rename by own id: %d %v", code, body)
+	}
+	notices := globalNotices()
+	want := []string{alpha.ID + " is now Researcher", "Researcher is now Point"}
+	if strings.Join(notices, "|") != strings.Join(want, "|") {
+		t.Fatalf("rename notices in global = %q, want %q (an unchanged name posts none)", notices, want)
+	}
+
+	// The new name resolves, the old one does not, and the id is the same.
+	resp, tb := req(t, "POST", base+"/api/v1/tasks", beta.Token, map[string]any{"title": "for point", "assignee": "point"})
+	if resp.StatusCode != http.StatusCreated || tb["assignee_id"] != alpha.ID {
+		t.Fatalf("assign by new name: %d %v", resp.StatusCode, tb)
+	}
+	resp, tb = req(t, "POST", base+"/api/v1/tasks", beta.Token, map[string]any{"title": "for researcher", "assignee": "Researcher"})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("old name should no longer resolve: %d %v", resp.StatusCode, tb)
+	}
+	resp, mb := req(t, "POST", base+"/api/v1/sessions/global/messages", beta.Token, map[string]any{"content": "@Point hello, @Researcher?"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("post: %d %v", resp.StatusCode, mb)
+	}
+	if ms, _ := mb["mentions"].([]any); len(ms) != 1 || ms[0] != alpha.ID {
+		t.Fatalf("@Point should mention alpha only: %v", mb["mentions"])
+	}
+
+	// Conflicts: another live agent's name (any case) and another kind's id.
+	code, body = rename(beta.Token, map[string]any{"display_name": "pOINT"})
+	if code != http.StatusConflict || !strings.Contains(fmt.Sprint(body["error"]), alpha.ID) {
+		t.Fatalf("taken name should 409 naming the owner: %d %v", code, body)
+	}
+	resp, kb := req(t, "POST", base+"/api/v1/kinds", adminTok, map[string]any{"id": "codex"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create kind: %d %v", resp.StatusCode, kb)
+	}
+	if code, body = rename(beta.Token, map[string]any{"display_name": "Codex"}); code != http.StatusConflict {
+		t.Fatalf("another kind's id should 409: %d %v", code, body)
+	}
+	// Its own kind is fine (Link of kind link).
+	if code, body = rename(beta.Token, map[string]any{"display_name": "Test"}); code != http.StatusOK {
+		t.Fatalf("own kind as name: %d %v", code, body)
+	}
+	// Changing only the case of your own name is not a conflict.
+	if code, body = rename(alpha.Token, map[string]any{"display_name": "POINT"}); code != http.StatusOK {
+		t.Fatalf("case-only self rename: %d %v", code, body)
+	}
+	if code, _ = rename(alpha.Token, map[string]any{"display_name": "Point"}); code != http.StatusOK {
+		t.Fatalf("restore case: %d", code)
+	}
+
+	// Invalid names are 400.
+	for _, bad := range []string{"", "   ", "all", "Everyone", "@Point2", strings.Repeat("x", 201), "tab\there"} {
+		if code, body = rename(beta.Token, map[string]any{"display_name": bad}); code != http.StatusBadRequest {
+			t.Fatalf("display_name %q should 400: %d %v", bad, code, body)
+		}
+	}
+
+	// An instance token cannot rename another agent.
+	if code, _ = rename(beta.Token, map[string]any{"agent": alpha.ID, "display_name": "Hijack"}); code != http.StatusForbidden {
+		t.Fatalf("renaming someone else should 403: %d", code)
+	}
+
+	// The admin path is checked and announced too.
+	if code, body = rename(adminTok, map[string]any{"agent": beta.ID, "display_name": "point"}); code != http.StatusConflict {
+		t.Fatalf("admin rename to a taken name should 409: %d %v", code, body)
+	}
+	if code, body = rename(adminTok, map[string]any{"agent": beta.ID, "display_name": "Link"}); code != http.StatusOK {
+		t.Fatalf("admin rename: %d %v", code, body)
+	}
+	if n := globalNotices(); n[len(n)-1] != "Test is now Link (renamed by admin)" {
+		t.Fatalf("admin rename notice: %q", n)
+	}
+
+	// An evicted agent's name is free again.
+	if resp, _ := req(t, "POST", base+"/api/v1/agents/"+beta.ID+"/revoke", adminTok, nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("revoke: %d", resp.StatusCode)
+	}
+	if code, body = rename(alpha.Token, map[string]any{"display_name": "link"}); code != http.StatusOK {
+		t.Fatalf("an evicted agent's name should be free: %d %v", code, body)
+	}
+
+	// Title sync (client_session) mirrors the client's session title: not
+	// conflict-checked and not announced.
+	sib := registerSibling(t, srv, alpha.Token, "ses_x", "Scratch")
+	before := len(globalNotices())
+	if code, body = rename(alpha.Token, map[string]any{"client_session": "ses_x", "display_name": "link"}); code != http.StatusOK {
+		t.Fatalf("title sync should not be conflict-checked: %d %v", code, body)
+	}
+	if body["id"] != sib["name"] {
+		t.Fatalf("title sync renamed the wrong agent: %v", body)
+	}
+	if after := len(globalNotices()); after != before {
+		t.Fatalf("title sync should not post a notice (%d -> %d)", before, after)
 	}
 }

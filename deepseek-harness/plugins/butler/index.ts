@@ -201,7 +201,8 @@ export function apply(ctx: any, rawConfig?: Partial<Config>) {
   ctx.on('agent/inbox/discarded', settle)
 
   const rules = (me: string) => [
-    `How to act (you are the Butler agent ${me}, "DeepSeek", on Andrew's agent team; use the butler MCP tools mcp__butler__*):`,
+    `How to act (you are the Butler agent ${me} on Andrew's agent team — your current display name is whatever Butler lists for that id; use the butler MCP tools mcp__butler__*):`,
+    '- If Andrew or Noodle tells you that you have a new name, call rename_self with exactly that name, then confirm in the same Butler session. Never rename anyone else.',
     '- A message that @-mentions you expects a reply: ack briefly, do it, then answer in that same Butler session with send_message (@mention whoever asked).',
     '- A task you own: update_task_status in_progress, do the work, comment_task with the result/evidence, then handoff_task with a short note. Never set a task done and never approve your own work (the reviewer decides). Only claim a task you already own.',
     '- Need a decision or approval for board work? Ask @Noodle in Butler, not Andrew. Anything that leaves the team (messages to other people, public posts, spending, deletions, Andrew\'s accounts) needs Andrew: do not do it, ask @Noodle to escalate.',

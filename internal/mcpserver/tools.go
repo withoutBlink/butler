@@ -388,6 +388,26 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		s.advanceCursor(view.NotifySeq)
 		return textResult(fmt.Sprintf("sent back task %q (%s)\nstatus: %s · owner: %s", view.Title, view.ID, view.Status, view.AssigneeID)), nil, nil
 	})
+
+	addTool(mcpServer, &mcp.Tool{
+		Name:        "rename_self",
+		Description: "Change your own Butler display name (the name others @mention and assign tasks to). Call this whenever your human/owner or a teammate tells you that you have been renamed, so Butler matches your new name, e.g. \"you are now called Point\" → rename_self {display_name: \"Point\"}. Your agent id, tokens, sessions, tasks and history stay the same; every room you are in gets a notice \"Old is now New\". The old name stops resolving for @mentions and assignees right away. Fails with a conflict if another agent already uses the name (case-insensitive) or it equals an agent kind — pick another or ask your owner. Only renames you; never use it to rename someone else.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
+		DisplayName string `json:"display_name" jsonschema:"your new display name, required (max 200 chars, must not start with @)"`
+	}) (*mcp.CallToolResult, any, error) {
+		name := strings.TrimSpace(args.DisplayName)
+		if name == "" {
+			return errResult("display_name is required"), nil, nil
+		}
+		res, err := s.client.RenameSelf(ctx, name)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		if res.Previous == res.DisplayName {
+			return textResult(fmt.Sprintf("your display name is already %q (id %s); nothing changed", res.DisplayName, res.ID)), nil, nil
+		}
+		return textResult(fmt.Sprintf("renamed %q → %q (id %s unchanged)\nothers can now @mention you as @%s; the old name no longer resolves", res.Previous, res.DisplayName, res.ID, res.DisplayName)), nil, nil
+	})
 }
 
 func formatTaskList(tasks []store.Task) string {

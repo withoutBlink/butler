@@ -224,6 +224,7 @@ func TestToolE2E(t *testing.T) {
 		"list_tasks": false, "get_task": false, "create_task": false,
 		"update_task_status": false, "comment_task": false, "claim_task": false,
 		"handoff_task": false, "approve_task": false, "reject_task": false,
+		"rename_self": false,
 	}
 	if len(toolsRes.Tools) != len(want) {
 		t.Fatalf("expected %d tools, got %d", len(want), len(toolsRes.Tools))
@@ -579,5 +580,63 @@ func TestHandoffTools(t *testing.T) {
 	out, isErr = callTool(t, reviewer, "approve_task", map[string]any{"task": taskID})
 	if isErr || !strings.Contains(out, "done") {
 		t.Fatalf("approve: %q isErr=%v", out, isErr)
+	}
+}
+
+// TestRenameSelfTool: the rename_self tool renames the calling agent only,
+// keeps its id, posts the "Old is now New" notice in global, and surfaces a
+// taken name as a 409 tool error. The new name then works as an assignee.
+func TestRenameSelfTool(t *testing.T) {
+	backend, st, _, kinds := newButlerBackendStore(t)
+	ctx := context.Background()
+	if _, err := st.CreateAgent(ctx, "admin", "Admin", "human", "", "", ""); err != nil {
+		t.Fatalf("admin: %v", err)
+	}
+	if _, err := st.EnsureGlobalSession(ctx, "admin"); err != nil {
+		t.Fatalf("global: %v", err)
+	}
+	alpha, alphaID := connectMCPClient(t, backend.URL, kinds["codex"], "alpha", "/tmp/proj")
+	beta, betaID := connectMCPClient(t, backend.URL, kinds["opencode"], "beta", "/tmp/proj")
+
+	out, isErr := callTool(t, alpha, "rename_self", map[string]any{"display_name": "Point"})
+	if isErr || !strings.Contains(out, `"Point"`) || !strings.Contains(out, alphaID) {
+		t.Fatalf("rename_self: %q isErr=%v", out, isErr)
+	}
+	a, err := st.GetAgent(ctx, alphaID)
+	if err != nil || a.DisplayName != "Point" {
+		t.Fatalf("stored name: %v %v", a, err)
+	}
+	if b, _ := st.GetAgent(ctx, betaID); b.DisplayName == "Point" {
+		t.Fatalf("rename_self renamed the wrong agent")
+	}
+	msgs, err := st.SessionLatestMessages(ctx, store.GlobalSessionID, 100)
+	if err != nil {
+		t.Fatalf("global messages: %v", err)
+	}
+	found := false
+	for _, m := range msgs {
+		if m.Kind == "system" && m.Content == alphaID+" is now Point" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no rename notice in global: %+v", msgs)
+	}
+
+	out, isErr = callTool(t, alpha, "rename_self", map[string]any{"display_name": "Point"})
+	if isErr || !strings.Contains(out, "already") {
+		t.Fatalf("same-name rename_self: %q isErr=%v", out, isErr)
+	}
+	out, isErr = callTool(t, beta, "rename_self", map[string]any{"display_name": "point"})
+	if !isErr || !strings.Contains(out, "409") {
+		t.Fatalf("taken name should be a 409 tool error: %q isErr=%v", out, isErr)
+	}
+	out, isErr = callTool(t, beta, "rename_self", map[string]any{"display_name": "  "})
+	if !isErr {
+		t.Fatalf("blank name should fail: %q", out)
+	}
+	out, isErr = callTool(t, beta, "create_task", map[string]any{"title": "for Point", "assignee": "Point"})
+	if isErr || !strings.Contains(out, alphaID) {
+		t.Fatalf("assign by the new name: %q isErr=%v", out, isErr)
 	}
 }

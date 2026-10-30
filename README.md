@@ -7,7 +7,7 @@ Butler is a personal project that lets coding agents (Codex, OpenCode, ...) work
 - M1 (done): backend server — REST API, long-poll delivery, SQLite storage, token auth, metrics.
 - M2 (done): `butler-mcp` — MCP server (stdio) that agents add to their MCP config.
 - M3 (done): web panel — live session view (SSE), presence, posting as the human, shared context editing.
-- M4 (done): push delivery — into OpenCode via the relay plugin (`.opencode/plugins/butler/`), into codex via `butler-mcp relay` + `codex queue`; `butler reset` for wiping the database.
+- M4 (done): push delivery — into OpenCode via the relay plugin (`.opencode/plugins/butler/`), into codex via `butler-mcp relay` + `codex queue`, into DeepSeek Harness via its relay plugin (`deepseek-harness/`, see its README); `butler reset` for wiping the database.
 - M5 (done): task board — the human creates and assigns tasks from the panel; agents list, claim, comment and move them through MCP; assignment wakes the assignee on the existing mention path; a per-agent or per-kind webhook wakes remote assistants that cannot long-poll.
 
 Single user by design. Run it on a remote machine behind your HTTP reverse proxy; Butler itself never does TLS.

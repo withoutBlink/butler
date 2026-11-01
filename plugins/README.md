@@ -10,6 +10,7 @@ still come from `butler-mcp`.
 |---|---|---|---|
 | [`opencode/`](opencode/) | [OpenCode](https://opencode.ai) | `opencode/index.ts` | [README → "Automatic delivery into OpenCode"](../README.md#automatic-delivery-into-opencode-relay-plugin) |
 | [`deepseek-harness/`](deepseek-harness/) | [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh, Cordis) | `deepseek-harness/index.ts` | [`deepseek-harness/README.md`](deepseek-harness/README.md) |
+| [`pi/`](pi/) | [Pi](https://pi.dev) (`@earendil-works/pi-coding-agent`) | `pi/index.ts` | [`pi/README.md`](pi/README.md) |
 
 Codex needs no plugin: its push delivery is the Go daemon `butler-mcp relay`
 (`cmd/butler-mcp/relay.go`).
@@ -55,9 +56,30 @@ preset, running `dsh web` under a restart loop) is in
 [`deepseek-harness/README.md`](deepseek-harness/README.md). After moving or
 updating the file, restart the dsh Host so it reloads the plugin.
 
+## Install: Pi
+
+Pi loads the extension with jiti (erasable TypeScript, no build step). Link
+the directory where Pi auto-discovers extensions:
+
+```sh
+mkdir -p ~/.pi/agent/extensions
+ln -s /abs/path/to/butler/plugins/pi ~/.pi/agent/extensions/butler
+```
+
+Or point `~/.pi/agent/settings.json` at it (`"extensions": ["/abs/path/to/butler/plugins/pi"]`),
+or run once with `pi -e /abs/path/to/butler/plugins/pi/index.ts`. A trusted
+project can use `.pi/extensions/butler` the same way.
+
+`butler-mcp` is a normal MCP server in `~/.pi/agent/mcp.json` (or
+`pi mcp add butler`). The plugin reads that process's state file
+(`~/.config/butler/pi/instance.json` by default) and does not register a
+kind of its own. Kind setup, `exposure: "direct"`, and the pointer rules are
+in [`pi/README.md`](pi/README.md).
+
 ## Rules for plugins here
 
-- TS/JS only in this folder; no build step (OpenCode runs TS, and the dsh file
-  uses only erasable TypeScript so Node strips the types).
+- TS/JS only in this folder; no build step (OpenCode and Pi run the
+  TypeScript via their loaders; the dsh and Pi files use only erasable
+  TypeScript so the types strip).
 - No secrets in files: tokens come from `butler-mcp`'s state file at runtime.
 - Tool names and behaviour mirror `butler-mcp` (see `internal/mcpserver/`).

@@ -371,3 +371,20 @@ func (c *Client) ClaimTask(ctx context.Context, id string) (*TaskView, error) {
 	}
 	return &out, nil
 }
+
+// RenameResult is the rename endpoint's echo.
+type RenameResult struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+	Previous    string `json:"previous"`
+}
+
+// RenameSelf changes the caller's own display name (POST /api/v1/agents/rename
+// with only display_name). The id never changes.
+func (c *Client) RenameSelf(ctx context.Context, displayName string) (*RenameResult, error) {
+	var out RenameResult
+	if err := c.do(ctx, "POST", "/api/v1/agents/rename", map[string]string{"display_name": displayName}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}

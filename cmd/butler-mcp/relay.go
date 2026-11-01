@@ -21,7 +21,7 @@ import (
 )
 
 // relayCmd is the Codex counterpart of the OpenCode relay plugin
-// (.opencode/plugins/butler): it acts as the agent identity recorded in the
+// (plugins/opencode): it acts as the agent identity recorded in the
 // state file written at registration, long-polls the butler server for new
 // messages, and injects them into a Codex session with `codex queue`. Codex
 // has no in-process plugin API for submitting prompts, but its shared

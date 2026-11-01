@@ -682,13 +682,30 @@ func (a *API) announceEviction(ctx context.Context, agent *store.Agent) {
 }
 
 // renameAgent renames an agent's display title — the id never changes.
-// Two auth paths, mirroring sibling registration:
+// Three auth paths:
+//   - instance token + {display_name} (no client_session, no agent, or
+//     agent = the caller's own id): the caller renames ITSELF. This is the
+//     supported "my human gave me a new name" path, exposed to agents as the
+//     MCP tool rename_self (the CLI `butler agent rename` is the admin path).
 //   - instance token + {client_session, display_name}: renames a
 //     per-client-session sibling of the caller's own identity. The OpenCode
 //     relay plugin uses this to follow session-title changes (renamed
 //     sessions) so butler's panel and participant lists stay readable; the
 //     same call works for any client keyed by session uuid (codex relays).
 //   - admin token + {agent, display_name}: renames any agent by id.
+//
+// Self and admin renames are deliberate name changes, so they are checked and
+// announced: the new name must not already belong to another live agent
+// (case-insensitive — @mentions and task assignees resolve names that way, so
+// two agents sharing a name would make "@Name" ambiguous) nor equal another
+// kind's id (@kind addresses every agent of the kind), else 409; and a system
+// notice "Old is now New" is posted in every session the agent is in. Title
+// sync (the client_session path) stays silent and unchecked: it mirrors a
+// client's session title, fires on every retitle and must not start failing
+// because two sessions happen to share a title.
+//
+// Old names are not kept as aliases: after a rename "@Old" and assignee "Old"
+// stop resolving (task rows store ids, so existing assignments are intact).
 func (a *API) renameAgent(w http.ResponseWriter, r *http.Request) {
 	ident, ok := a.requireAuth(w, r) // also rejects kind tokens (403)
 	if !ok {
@@ -713,13 +730,17 @@ func (a *API) renameAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	var agent *store.Agent
+	deliberate := true // self/admin rename: conflict-checked and announced
+	actor := ""        // "" = the agent itself
 	switch {
-	case ident.Agent != nil:
-		clientSession := strings.TrimSpace(req.ClientSession)
-		if clientSession == "" {
-			writeErr(w, http.StatusBadRequest, "client_session is required when renaming with an instance token")
+	case ident.Agent != nil && strings.TrimSpace(req.ClientSession) == "":
+		if id := strings.TrimSpace(req.Agent); id != "" && id != ident.Agent.ID {
+			writeErr(w, http.StatusForbidden, "an instance token can only rename itself (or its own client sessions)")
 			return
 		}
+		agent = ident.Agent
+	case ident.Agent != nil:
+		clientSession := strings.TrimSpace(req.ClientSession)
 		if len(clientSession) > 128 {
 			writeErr(w, http.StatusBadRequest, "client_session too long (max 128)")
 			return
@@ -732,6 +753,7 @@ func (a *API) renameAgent(w http.ResponseWriter, r *http.Request) {
 			a.writeStoreErr(w, err)
 			return
 		}
+		deliberate = false
 	case ident.Admin:
 		id := strings.TrimSpace(req.Agent)
 		if id == "" {
@@ -744,18 +766,117 @@ func (a *API) renameAgent(w http.ResponseWriter, r *http.Request) {
 			a.writeStoreErr(w, err)
 			return
 		}
+		actor = "admin"
 	default:
 		writeErr(w, http.StatusForbidden, "instance token or admin token required")
 		return
 	}
-	if agent.DisplayName != displayName {
+	oldName := agent.DisplayName
+	if deliberate && oldName != displayName {
+		if code, msg := CheckChosenName(ctx, a.Store, agent, displayName); code != 0 {
+			writeErr(w, code, msg)
+			return
+		}
+	}
+	if oldName != displayName {
 		if err := a.Store.UpdateAgentDisplayName(ctx, agent.ID, displayName); err != nil {
 			a.writeStoreErr(w, err)
 			return
 		}
-		a.Log.Info("renamed agent", "id", agent.ID, "display_name", displayName)
+		a.Log.Info("renamed agent", "id", agent.ID, "from", oldName, "display_name", displayName, "self", actor == "")
+		if deliberate {
+			a.announceRename(ctx, agent, oldName, displayName, actor)
+		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"id": agent.ID, "display_name": displayName})
+	writeJSON(w, http.StatusOK, map[string]any{"id": agent.ID, "display_name": displayName, "previous": oldName})
+}
+
+// CheckChosenName validates a deliberately chosen display name for agent
+// (self or admin rename — shared by the API and `butler agent rename`). It
+// returns (0, "") when the trimmed name is acceptable, else the HTTP status
+// (400 invalid, 409 conflict, 500 store) and a message.
+func CheckChosenName(ctx context.Context, st *store.Store, agent *store.Agent, name string) (int, string) {
+	if name == "" {
+		return http.StatusBadRequest, "display_name is required"
+	}
+	if len(name) > 200 {
+		return http.StatusBadRequest, "display_name too long (max 200)"
+	}
+	if msg := validChosenName(name); msg != "" {
+		return http.StatusBadRequest, msg
+	}
+	owner, err := st.DisplayNameOwner(ctx, name, agent.ID)
+	if err != nil {
+		return http.StatusInternalServerError, "store error"
+	}
+	if owner != "" {
+		return http.StatusConflict, fmt.Sprintf("display name %q is already used by agent %s; pick another so @mentions stay unambiguous", name, owner)
+	}
+	if !strings.EqualFold(name, agent.Kind) {
+		isKind, err := st.KindExists(ctx, name)
+		if err != nil {
+			return http.StatusInternalServerError, "store error"
+		}
+		if isKind {
+			return http.StatusConflict, fmt.Sprintf("display name %q is an agent kind (@%s addresses every agent of that kind); pick another", name, strings.ToLower(name))
+		}
+	}
+	return 0, ""
+}
+
+// RenameNotice is the system notice text for a deliberate rename.
+func RenameNotice(oldName, newName, actor string) string {
+	content := oldName + " is now " + newName
+	if actor != "" {
+		content += " (renamed by " + actor + ")"
+	}
+	return content
+}
+
+// validChosenName is the extra check for a deliberately chosen name (self or
+// admin rename; length and emptiness are checked for every path). It returns
+// "" when the trimmed name is acceptable, else the 400 message. Title sync is
+// exempt: it mirrors whatever the client's session is called.
+func validChosenName(name string) string {
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return "display_name must not contain control characters"
+		}
+	}
+	if strings.HasPrefix(name, "@") {
+		return "display_name must not start with @ (mentions add it)"
+	}
+	switch strings.ToLower(name) {
+	case "all", "everyone", "here":
+		return fmt.Sprintf("display_name %q is reserved (@%s addresses the whole room)", name, strings.ToLower(name))
+	}
+	return ""
+}
+
+// announceRename posts "Old is now New" as a system notice in every session
+// the agent is in (global included), so the room learns the new @name. Like
+// other notices it is a text snapshot; stored mentions are not rewritten.
+func (a *API) announceRename(ctx context.Context, agent *store.Agent, oldName, newName, actor string) {
+	sids, err := a.Store.SessionsForAgent(ctx, agent.ID)
+	if err != nil {
+		a.Log.Error("list sessions for agent", "err", err, "agent", agent.ID)
+		return
+	}
+	if oldName == "" {
+		oldName = agent.ID
+	}
+	content := RenameNotice(oldName, newName, actor)
+	for _, sid := range sids {
+		if _, err := a.Store.InsertMessage(ctx, &store.Message{
+			ID: ids.New(), SessionID: sid, SenderID: agent.ID, Kind: "system", Content: content,
+		}); err != nil {
+			a.Log.Error("announce rename", "err", err, "session", sid)
+			continue
+		}
+		a.notifySession(ctx, sid)
+	}
+	// Board cards show owner names; re-render open boards.
+	a.Hub.NotifyBoard()
 }
 
 func (a *API) listSessions(w http.ResponseWriter, r *http.Request) {

@@ -307,6 +307,30 @@ func (s *Store) UpdateAgentDisplayName(ctx context.Context, agentID, displayName
 	return err
 }
 
+// DisplayNameOwner reports which other live (non-removed) agent already uses
+// displayName, compared case-insensitively — the same rule @mentions and task
+// assignees resolve names by. It returns "" when the name is free. exceptID
+// (the agent being renamed) never counts as a conflict, so re-asserting your
+// own name, or changing only its case, is allowed.
+func (s *Store) DisplayNameOwner(ctx context.Context, displayName, exceptID string) (string, error) {
+	var id string
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM agents
+		WHERE removed_at IS NULL AND id <> ? AND display_name = ? COLLATE NOCASE
+		ORDER BY id LIMIT 1`, exceptID, displayName).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return id, err
+}
+
+// KindExists reports whether a kind with this id is registered (kind ids are
+// lowercase, so the comparison is case-insensitive like @kind mentions).
+func (s *Store) KindExists(ctx context.Context, id string) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM kinds WHERE id = ? COLLATE NOCASE`, id).Scan(&n)
+	return n > 0, err
+}
+
 // RevokeAgentTokens invalidates all instance tokens of an agent.
 func (s *Store) RevokeAgentTokens(ctx context.Context, agentID string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM agent_tokens WHERE agent_id = ?`, agentID)

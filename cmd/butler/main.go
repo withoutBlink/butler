@@ -423,6 +423,49 @@ func agentCmd(args []string) {
 			}
 		}
 		fmt.Printf("evicted %s: tokens revoked, hidden from the panel and sessions until it re-registers\n", id)
+	case "rename":
+		// Admin path of POST /api/v1/agents/rename, straight on the DB (same
+		// checks and notice; agents rename themselves with the MCP tool
+		// rename_self or the API with their own instance token).
+		if len(positional) < 2 {
+			agentUsage()
+			os.Exit(2)
+		}
+		agent, err := st.GetAgent(ctx, positional[0])
+		if err != nil {
+			agent, err = st.ResolveAssignee(ctx, positional[0])
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		name := strings.TrimSpace(strings.Join(positional[1:], " "))
+		old := store.NoticeLabel(agent)
+		if agent.DisplayName == name {
+			fmt.Printf("%s is already called %q; nothing changed\n", agent.ID, name)
+			return
+		}
+		if code, msg := api.CheckChosenName(ctx, st, agent, name); code != 0 {
+			fmt.Fprintf(os.Stderr, "error (%d): %s\n", code, msg)
+			os.Exit(1)
+		}
+		if err := st.UpdateAgentDisplayName(ctx, agent.ID, name); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		sids, err := st.SessionsForAgent(ctx, agent.ID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not list sessions: %v\n", err)
+		}
+		for _, sid := range sids {
+			if _, err := st.InsertMessage(ctx, &store.Message{
+				ID: ids.New(), SessionID: sid, SenderID: agent.ID, Kind: "system",
+				Content: api.RenameNotice(old, name, "admin"),
+			}); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: rename notice for %s: %v\n", sid, err)
+			}
+		}
+		fmt.Printf("renamed %s: %q -> %q (id unchanged; notice posted in %d session(s))\n", agent.ID, old, name, len(sids))
 	default:
 		agentUsage()
 		os.Exit(2)
@@ -442,6 +485,7 @@ func agentUsage() {
 usage (flags before or after the id):
   butler agent list
   butler agent revoke <name>   # evict: revoke tokens + hide until it re-registers
+  butler agent rename <id|name> <new display name>   # admin rename (409-style refusal if taken); agents rename themselves via MCP rename_self
 `)
 }
 

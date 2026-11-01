@@ -121,7 +121,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 // effective registry ids, e.g. "butler_send_message"). wait_for_messages and
 // check_messages stay MCP: the relay already delivers per session, and the
 // blocking-poll tools carry no session context worth binding.
-const SHADOWED = /^(send_message|read_session|list_sessions|set_context|get_context|create_session|join_session|list_tasks|get_task|create_task|update_task_status|comment_task|claim_task|handoff_task|approve_task|reject_task)$/
+const SHADOWED = /^(send_message|read_session|list_sessions|set_context|get_context|create_session|join_session|list_tasks|get_task|create_task|update_task_status|comment_task|claim_task|handoff_task|approve_task|reject_task|rename_self)$/
 const shadowedId = (id: string) => {
   const m = /^butler_*([^_].*)$/.exec(id)
   return m != null && SHADOWED.test(m[1])
@@ -1378,6 +1378,39 @@ export default Plugin.define({
           if (!res.ok) return errText(await errBody(res))
           const updated = (await res.json()) as ButlerTask
           return { content: `sent back task "${updated.title}" (${updated.id})\nstatus: ${updated.status} · owner: ${updated.assignee_id}` }
+        }),
+      })
+
+      // rename_self is shadowed so it renames THIS session's role, never the
+      // backend-only agent client (the MCP original would act as the client).
+      // A role's name normally mirrors its OpenCode session title: the title
+      // sync only pushes when the session title itself changes, so this
+      // rename sticks until the session is retitled or the role re-registers
+      // with its title (plugin restart) — renaming the OpenCode session to the
+      // same name makes it permanent.
+      editor.add({
+        name: "rename_self",
+        description:
+          "Change your own Butler display name (the name others @mention and assign tasks to), as this session's butler role. Use it when your human/owner tells you that you have been renamed. Your id, sessions, tasks and history stay the same; your rooms get an \"Old is now New\" notice and the old name stops resolving. Fails with a conflict if another agent already uses the name. In OpenCode your name follows this session's title, so also rename the session to keep it after a restart.",
+        input: {
+          type: "object",
+          properties: {
+            display_name: { type: "string", description: "your new display name, required" },
+          },
+          required: ["display_name"],
+          additionalProperties: false,
+        },
+        options: { namespace: "butler", codemode: true },
+        execute: exec(async (input, context) => {
+          const name = String(input?.display_name ?? "").trim()
+          if (!name) return errText("display_name is required")
+          const sid = context?.sessionID
+          const entry = typeof sid === "string" ? sessionAgents.get(sid) : undefined
+          if (!entry) return errText("this session has no butler role yet (it registers once the session has a title); nothing renamed")
+          const res = await api(entry, "POST", "/api/v1/agents/rename", { display_name: name })
+          if (!res.ok) return errText(await errBody(res))
+          const out = (await res.json()) as { id: string, display_name: string, previous?: string }
+          return { content: `renamed "${out.previous ?? ""}" → "${out.display_name}" (id ${out.id} unchanged)\nthis lasts until the OpenCode session is retitled or the plugin restarts; rename the session to "${out.display_name}" to keep it` }
         }),
       })
     })

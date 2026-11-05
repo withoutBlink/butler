@@ -104,6 +104,33 @@
   }
   updateReadMarks();
 
+  function applyActivity(map) {
+    var rows = box.querySelectorAll('.msg');
+    for (var i = 0; i < rows.length; i++) {
+      var id = rows[i].getAttribute('data-sender');
+      var info = map[id];
+      if (!info || !info.state) continue;
+      var meta = rows[i].querySelector('.m-meta');
+      if (!meta) continue;
+      var chip = meta.querySelector('.presence');
+      if (!chip) {
+        chip = document.createElement('span');
+        chip.innerHTML = '<span class="act" aria-hidden="true"></span><span class="act-label"></span>';
+        var name = meta.querySelector('b');
+        if (name) meta.insertBefore(chip, name);
+        else meta.appendChild(chip);
+      }
+      var state = info.state;
+      var note = info.note || '';
+      chip.className = 'presence p-' + state;
+      chip.title = note ? state + ' \u2014 ' + note : state;
+      var dot = chip.querySelector('.act');
+      if (dot) dot.className = 'act act-' + state;
+      var label = chip.querySelector('.act-label');
+      if (label) label.textContent = state;
+    }
+  }
+
   function connect() {
     var path = streamPath;
     var seq = lastSeq();
@@ -125,6 +152,11 @@
         if (d && d.agent) readBy[d.agent] = d.seq;
       } catch (err) { /* ignore malformed events */ }
       updateReadMarks();
+    });
+    es.addEventListener('activity', function (e) {
+      // Current activity of each author, so a name already on screen picks up
+      // working / idle / blocked / stalled / offline without a reload.
+      try { applyActivity(JSON.parse(e.data) || {}); } catch (err) { /* ignore malformed events */ }
     });
     es.addEventListener('audience', function (e) {
       // Membership changed (join/removal): the denominator and the tooltips

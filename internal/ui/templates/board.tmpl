@@ -79,11 +79,12 @@
 <h2><span>{{.Label}} <span class="count">{{len .Tasks}}</span></span>{{if eq .Status "done"}}<button type="button" class="col-toggle" aria-label="Collapse the Done column">Collapse</button>{{end}}</h2>
 <div class="col-body">
 {{range $card := .Tasks}}
-<article class="card{{if eq $card.Task.Priority "urgent"}} pri-urgent-card{{end}}" data-task="{{$card.Task.ID}}">
+<article class="card{{if $card.Stalled}} stalled{{end}}{{if eq $card.Task.Priority "urgent"}} pri-urgent-card{{end}}" data-task="{{$card.Task.ID}}">
 <h3 class="card-title">{{$card.Task.Title}}</h3>
 {{if $card.Task.Description}}<p class="desc">{{short $card.Task.Description}}</p>{{end}}
 <div class="card-foot">
-{{if $card.Owner}}<span class="card-owner" title="Owner: {{$card.Owner}}"><span class="vh">Owner: </span><span class="av av-sm {{$card.OwnerClass}}" aria-hidden="true">{{$card.OwnerInitial}}</span><span class="name">{{$card.Owner}}</span></span>{{else}}<span class="card-owner unassigned" title="Unassigned"><span class="av av-sm" aria-hidden="true">?</span><span class="name">Unassigned</span></span>{{end}}
+{{if $card.Owner}}<span class="card-owner" title="Owner: {{$card.Owner}}{{if $card.OwnerActivity.State}} ({{$card.OwnerActivity.Title}}){{end}}"><span class="vh">Owner: </span><span class="av av-sm {{$card.OwnerClass}}" aria-hidden="true">{{$card.OwnerInitial}}</span><span class="name">{{$card.Owner}}</span>{{template "activity" $card.OwnerActivity}}</span>{{else}}<span class="card-owner unassigned" title="Unassigned"><span class="av av-sm" aria-hidden="true">?</span><span class="name">Unassigned</span></span>{{end}}
+{{if $card.Stalled}}<span class="stalled-tag">stalled</span>{{end}}
 {{if $card.Chain}}<span class="chain-mini" title="Chain: {{range $i, $s := $card.Chain}}{{if $i}} → {{end}}{{$s.Name}}{{if $s.Review}} (review){{end}}{{end}}"><span class="vh">Chain: {{range $i, $s := $card.Chain}}{{if $i}} → {{end}}{{$s.Name}}{{if $s.Review}} (review){{end}}{{end}}</span><span aria-hidden="true">{{range $i, $s := $card.Chain}}{{if $i}}<span class="arr">→</span>{{end}}<span class="step{{if $s.Current}} current{{end}}{{if $s.Review}} rev{{end}}">{{$s.Initial}}</span>{{end}}</span></span>{{end}}
 {{if ne $card.Task.Priority "normal"}}<span class="pri-tag pri-{{$card.Task.Priority}}">{{$card.Task.Priority}}</span>{{end}}
 </div>

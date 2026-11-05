@@ -186,6 +186,7 @@ func (s *Service) transfer(ctx context.Context, actorID string, before *store.Ta
 	if err != nil {
 		return Result{}, err
 	}
+	s.touch(ctx, actorID)
 	seq := s.announce(ctx, actorID, before, after, c, &xfer{rejected: rejected})
 	return Result{Task: after, Comment: c, NotifySeq: seq}, nil
 }

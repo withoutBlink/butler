@@ -379,14 +379,19 @@ func agentCmd(args []string) {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
+		snap := activitySnapshot(ctx, st)
 		w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "NAME\tTITLE\tKIND\tHOST\tWORKDIR\tLAST_SEEN")
+		fmt.Fprintln(w, "NAME\tTITLE\tKIND\tHOST\tWORKDIR\tACTIVITY\tLAST_SEEN")
 		for _, a := range agents {
 			last := "never"
 			if a.LastSeenAt != nil {
 				last = time.Unix(*a.LastSeenAt, 0).UTC().Format(time.RFC3339)
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", a.ID, a.DisplayName, a.Kind, a.Hostname, a.Workdir, last)
+			act := snap.ByAgent[a.ID].State
+			if act == "" {
+				act = "-"
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", a.ID, a.DisplayName, a.Kind, a.Hostname, a.Workdir, act, last)
 		}
 		w.Flush()
 	case "revoke":

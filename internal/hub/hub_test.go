@@ -170,3 +170,19 @@ func TestBoardSubscriber(t *testing.T) {
 		t.Fatal("expected board wakeup")
 	}
 }
+
+func TestWaitingAgents(t *testing.T) {
+	h := New()
+	defer h.Close()
+	if h.WaitingAgents()["a"] {
+		t.Fatal("no waiter yet")
+	}
+	_, cancel := h.Subscribe("a")
+	if !h.WaitingAgents()["a"] {
+		t.Fatal("a subscribed long-poll should count as waiting")
+	}
+	cancel()
+	if h.WaitingAgents()["a"] {
+		t.Fatal("cancel should drop the waiter")
+	}
+}

@@ -75,6 +75,22 @@ func (h *Hub) SubscribeSession(sessionID string) (<-chan struct{}, func()) {
 	return h.addSub(h.sessionSubs, sessionID)
 }
 
+// WaitingAgents reports which agents currently hold a long-poll subscription
+// (GET /api/v1/wait). That is a heartbeat: the process is connected even
+// when it has not posted. The returned map is a snapshot safe to use after
+// the call returns.
+func (h *Hub) WaitingAgents() map[string]bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make(map[string]bool, len(h.agentSubs))
+	for id, subs := range h.agentSubs {
+		if len(subs) > 0 {
+			out[id] = true
+		}
+	}
+	return out
+}
+
 func (h *Hub) Notify(agentIDs []string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()

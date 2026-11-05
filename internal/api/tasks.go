@@ -12,13 +12,6 @@ import (
 	"butler/internal/store"
 )
 
-// taskJSON is a task plus the optional bits a write response carries:
-// the seq of the mention that announced it, and (on GET) its comment log.
-type taskJSON struct {
-	store.Task
-	NotifySeq int64 `json:"notify_seq,omitempty"`
-}
-
 type commentJSON struct {
 	store.TaskComment
 	NotifySeq int64 `json:"notify_seq,omitempty"`
@@ -91,7 +84,7 @@ func (a *API) createTask(w http.ResponseWriter, r *http.Request) {
 	if !res.Created {
 		status = http.StatusOK
 	}
-	writeJSON(w, status, taskJSON{Task: *res.Task, NotifySeq: res.NotifySeq})
+	writeJSON(w, status, a.decorateTask(r.Context(), *res.Task, res.NotifySeq))
 }
 
 func (a *API) listTasks(w http.ResponseWriter, r *http.Request) {
@@ -128,7 +121,7 @@ func (a *API) listTasks(w http.ResponseWriter, r *http.Request) {
 		a.writeStoreErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"tasks": tasks})
+	writeJSON(w, http.StatusOK, map[string]any{"tasks": a.decorateTasks(r.Context(), tasks, nil)})
 }
 
 // resolveAssignee maps a list/create token the same way the board service
@@ -165,10 +158,11 @@ func (a *API) getTask(w http.ResponseWriter, r *http.Request) {
 	}
 	// Always a JSON array, including when the log is empty — clients
 	// parse it into a list.
+	view := a.decorateTask(r.Context(), *task, 0)
 	writeJSON(w, http.StatusOK, struct {
-		store.Task
+		taskJSON
 		Comments []store.TaskComment `json:"comments"`
-	}{Task: *task, Comments: comments})
+	}{taskJSON: view, Comments: comments})
 }
 
 func (a *API) patchTask(w http.ResponseWriter, r *http.Request) {
@@ -198,7 +192,7 @@ func (a *API) patchTask(w http.ResponseWriter, r *http.Request) {
 		a.writeBoardErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, taskJSON{Task: *res.Task, NotifySeq: res.NotifySeq})
+	writeJSON(w, http.StatusOK, a.decorateTask(r.Context(), *res.Task, res.NotifySeq))
 }
 
 func (a *API) commentTask(w http.ResponseWriter, r *http.Request) {
@@ -230,7 +224,7 @@ func (a *API) claimTask(w http.ResponseWriter, r *http.Request) {
 		a.writeBoardErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, taskJSON{Task: *res.Task, NotifySeq: res.NotifySeq})
+	writeJSON(w, http.StatusOK, a.decorateTask(r.Context(), *res.Task, res.NotifySeq))
 }
 
 func (a *API) handoffTask(w http.ResponseWriter, r *http.Request) {
@@ -250,7 +244,7 @@ func (a *API) handoffTask(w http.ResponseWriter, r *http.Request) {
 		a.writeBoardErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, taskJSON{Task: *res.Task, NotifySeq: res.NotifySeq})
+	writeJSON(w, http.StatusOK, a.decorateTask(r.Context(), *res.Task, res.NotifySeq))
 }
 
 func (a *API) approveTask(w http.ResponseWriter, r *http.Request) {
@@ -263,7 +257,7 @@ func (a *API) approveTask(w http.ResponseWriter, r *http.Request) {
 		a.writeBoardErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, taskJSON{Task: *res.Task, NotifySeq: res.NotifySeq})
+	writeJSON(w, http.StatusOK, a.decorateTask(r.Context(), *res.Task, res.NotifySeq))
 }
 
 func (a *API) rejectTask(w http.ResponseWriter, r *http.Request) {
@@ -283,7 +277,7 @@ func (a *API) rejectTask(w http.ResponseWriter, r *http.Request) {
 		a.writeBoardErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, taskJSON{Task: *res.Task, NotifySeq: res.NotifySeq})
+	writeJSON(w, http.StatusOK, a.decorateTask(r.Context(), *res.Task, res.NotifySeq))
 }
 
 // decodeOptionalJSON accepts an empty body as an empty value. Handoff and

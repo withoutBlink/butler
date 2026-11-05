@@ -113,12 +113,13 @@ type SessionDetail struct {
 }
 
 type AgentInfo struct {
-	ID          string `json:"id"`
-	DisplayName string `json:"display_name"`
-	Kind        string `json:"kind"`
-	Hostname    string `json:"hostname"`
-	Workdir     string `json:"workdir"`
-	Online      bool   `json:"online"`
+	ID          string             `json:"id"`
+	DisplayName string             `json:"display_name"`
+	Kind        string             `json:"kind"`
+	Hostname    string             `json:"hostname"`
+	Workdir     string             `json:"workdir"`
+	Online      bool               `json:"online"`
+	Activity    store.ActivityView `json:"activity"`
 }
 
 type RegisterResult struct {
@@ -260,11 +261,21 @@ func (c *Client) PutContext(ctx context.Context, sid, key, value string) (*store
 // the write (so the caller's wait cursor can skip its own notice).
 type TaskView struct {
 	store.Task
-	Comments  []store.TaskComment `json:"comments"`
-	NotifySeq int64               `json:"notify_seq,omitempty"`
+	Comments         []store.TaskComment `json:"comments"`
+	NotifySeq        int64               `json:"notify_seq,omitempty"`
+	Stalled          bool                `json:"stalled"`
+	AssigneeActivity string              `json:"assignee_activity,omitempty"`
 }
 
-func (c *Client) ListTasks(ctx context.Context, assignee, status, session string) ([]store.Task, error) {
+// ListedTask is one row of GET /api/v1/tasks, including the derived stall
+// flag and the owner's activity. Those fields are absent on an older server.
+type ListedTask struct {
+	store.Task
+	Stalled          bool   `json:"stalled"`
+	AssigneeActivity string `json:"assignee_activity,omitempty"`
+}
+
+func (c *Client) ListTasks(ctx context.Context, assignee, status, session string) ([]ListedTask, error) {
 	q := url.Values{}
 	if assignee != "" {
 		q.Set("assignee", assignee)
@@ -280,15 +291,27 @@ func (c *Client) ListTasks(ctx context.Context, assignee, status, session string
 		path += "?" + enc
 	}
 	var resp struct {
-		Tasks []store.Task `json:"tasks"`
+		Tasks []ListedTask `json:"tasks"`
 	}
 	if err := c.do(ctx, "GET", path, nil, &resp); err != nil {
 		return nil, err
 	}
 	if resp.Tasks == nil {
-		resp.Tasks = []store.Task{}
+		resp.Tasks = []ListedTask{}
 	}
 	return resp.Tasks, nil
+}
+
+// SetActivity reports the caller's own working, idle, or blocked state.
+// The server does not notify anyone; it only updates the indicator.
+func (c *Client) SetActivity(ctx context.Context, state, note string) (store.ActivityView, error) {
+	var resp struct {
+		Activity store.ActivityView `json:"activity"`
+	}
+	if err := c.do(ctx, "POST", "/api/v1/agents/activity", map[string]string{"state": state, "note": note}, &resp); err != nil {
+		return store.ActivityView{}, err
+	}
+	return resp.Activity, nil
 }
 
 func (c *Client) GetTask(ctx context.Context, id string) (*TaskView, error) {

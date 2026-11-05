@@ -1862,3 +1862,90 @@ func TestBoardOwnerChainAndHandoff(t *testing.T) {
 		t.Fatalf("log: %+v %v", notes, err)
 	}
 }
+
+func TestActivityIndicators(t *testing.T) {
+	srv, st, _, adminTok := newPanel(t)
+	ctx := context.Background()
+	if _, err := st.CreateAgent(ctx, "admin", "Admin", "human", "", "", ""); err != nil {
+		t.Fatalf("admin: %v", err)
+	}
+	if _, err := st.CreateAgent(ctx, "alpha", "Alpha", "codex", "h", "/tmp/proj", ""); err != nil {
+		t.Fatalf("alpha: %v", err)
+	}
+	st.TouchAction(ctx, "alpha")
+	if _, err := st.CreateTask(ctx, &store.Task{
+		Title: "Ship it", Status: store.TaskInProgress, AssigneeID: "alpha", CreatorID: "admin",
+	}); err != nil {
+		t.Fatalf("task: %v", err)
+	}
+	if _, err := st.CreateSession(ctx, "s1", "meeting", "admin", []string{"alpha"}); err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	if _, err := st.InsertMessage(ctx, &store.Message{SessionID: "s1", SenderID: "alpha", Kind: "chat", Content: "on it"}); err != nil {
+		t.Fatalf("message: %v", err)
+	}
+
+	client := newBrowser(t)
+	login(t, client, srv.URL, adminTok)
+
+	resp, err := client.Get(srv.URL + "/panel/board")
+	if err != nil {
+		t.Fatalf("board: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	page := string(body)
+	for _, want := range []string{"Alpha", `p-working`, `act-label">working`, "Ship it"} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("board missing %q:\n%s", want, page)
+		}
+	}
+	if strings.Contains(page, "stalled-tag") {
+		t.Fatalf("a live owner should not be stalled:\n%s", page)
+	}
+
+	resp, err = client.Get(srv.URL + "/panel/sessions/s1")
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	page = string(body)
+	for _, want := range []string{
+		`p-working`,
+		`<b title="alpha">Alpha</b>`,
+		`<span class="id">Alpha</span>`,
+		"on it",
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("session missing %q:\n%s", want, page)
+		}
+	}
+
+	resp, err = client.Get(srv.URL + "/panel/")
+	if err != nil {
+		t.Fatalf("dashboard: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), `p-working`) || !strings.Contains(string(body), "<th>Activity</th>") {
+		t.Fatalf("dashboard should show activity:\n%s", body)
+	}
+
+	past := time.Now().Add(-10 * time.Minute).Unix()
+	if err := st.SetContactTimes(ctx, "alpha", &past, &past); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+	resp, err = client.Get(srv.URL + "/panel/board")
+	if err != nil {
+		t.Fatalf("board again: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	page = string(body)
+	for _, want := range []string{`p-stalled`, `stalled-tag">stalled`, "Alpha"} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("stalled board missing %q:\n%s", want, page)
+		}
+	}
+}

@@ -121,7 +121,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 // effective registry ids, e.g. "butler_send_message"). wait_for_messages and
 // check_messages stay MCP: the relay already delivers per session, and the
 // blocking-poll tools carry no session context worth binding.
-const SHADOWED = /^(send_message|read_session|list_sessions|set_context|get_context|create_session|join_session|list_tasks|get_task|create_task|update_task_status|comment_task|claim_task|handoff_task|approve_task|reject_task|rename_self)$/
+const SHADOWED = /^(send_message|read_session|list_sessions|set_context|get_context|create_session|join_session|list_tasks|get_task|create_task|update_task_status|comment_task|claim_task|handoff_task|approve_task|reject_task|rename_self|set_activity)$/
 const shadowedId = (id: string) => {
   const m = /^butler_*([^_].*)$/.exec(id)
   return m != null && SHADOWED.test(m[1])
@@ -921,7 +921,7 @@ export default Plugin.define({
           if (!detailRes.ok) return errText(await errBody(detailRes))
           const detail = (await detailRes.json()) as {
             session?: { id: string, title: string, status: string, created_by: string },
-            participants?: { id: string, kind: string, hostname: string, online?: boolean }[],
+            participants?: { id: string, kind: string, hostname: string, online?: boolean, activity?: { state?: string } }[],
           }
           const msgRes = await api(ident, "GET", `/api/v1/sessions/${encodeURIComponent(session)}/messages?latest=${n}`)
           if (!msgRes.ok) return errText(await errBody(msgRes))
@@ -933,6 +933,7 @@ export default Plugin.define({
             if (p.hostname) tag += ` (${p.kind}@${p.hostname})`
             else if (p.kind) tag += ` (${p.kind})`
             if (p.online) tag += "*"
+            if (p.activity?.state) tag += ` [${p.activity.state}]`
             return tag
           })
           const lines = [
@@ -1105,13 +1106,17 @@ export default Plugin.define({
         assignee_id?: string
         creator_id: string
         session_id?: string
+        stalled?: boolean
+        assignee_activity?: string
         comments?: { author_id: string, body: string, created_at?: number }[]
       }
       const formatTaskList = (tasks: ButlerTask[]) => {
         if (!tasks.length) return "no tasks"
         const lines = tasks.map(t => {
           const who = t.assignee_id || "-"
-          return `  ${t.id}  [${t.status}]  [${t.priority}]  assignee=${who}  "${t.title}"`
+          const act = t.assignee_activity ? `  activity=${t.assignee_activity}` : ""
+          const stalled = t.stalled ? "  STALLED" : ""
+          return `  ${t.id}  [${t.status}]  [${t.priority}]  assignee=${who}${act}${stalled}  "${t.title}"`
         })
         return `${tasks.length} task(s):\n${lines.join("\n")}`
       }
@@ -1124,6 +1129,8 @@ export default Plugin.define({
           `creator: ${t.creator_id}`,
           `session: ${t.session_id || "none"}`,
         ]
+        if (t.assignee_activity) lines.push(`activity: ${t.assignee_activity}`)
+        if (t.stalled) lines.push("stalled: yes")
         if (t.description) lines.push("", t.description)
         const notes = t.comments ?? []
         if (!notes.length) lines.push("", "no comments")
@@ -1378,6 +1385,34 @@ export default Plugin.define({
           if (!res.ok) return errText(await errBody(res))
           const updated = (await res.json()) as ButlerTask
           return { content: `sent back task "${updated.title}" (${updated.id})\nstatus: ${updated.status} · owner: ${updated.assignee_id}` }
+        }),
+      })
+
+      editor.add({
+        name: "set_activity",
+        description:
+          "Report what this session's butler role is doing: working, idle, or blocked (waiting on a review or a human). A short note is shown next to your name. This does not comment on a task and does not notify anyone. Butler also infers activity from your calls and tasks; a claimed in_progress task goes stalled when you go quiet.",
+        input: {
+          type: "object",
+          properties: {
+            state: { type: "string", description: "working, idle, or blocked" },
+            note: { type: "string", description: "optional short note, max 200 characters" },
+          },
+          required: ["state"],
+          additionalProperties: false,
+        },
+        options: { namespace: "butler", codemode: true },
+        execute: exec(async (input, context) => {
+          const state = String(input?.state ?? "").trim()
+          const note = String(input?.note ?? "").trim()
+          if (!state) return errText("state is required")
+          const ident = identityFor(context?.sessionID)
+          const res = await api(ident, "POST", "/api/v1/agents/activity", { state, note })
+          if (!res.ok) return errText(await errBody(res))
+          const out = (await res.json()) as { activity?: { state?: string, note?: string } }
+          const got = out.activity?.state ?? state
+          const extra = out.activity?.note ? ` (${out.activity.note})` : ""
+          return { content: `activity: ${got}${extra}` }
         }),
       })
 

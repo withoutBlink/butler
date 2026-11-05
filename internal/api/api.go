@@ -80,7 +80,8 @@ type API struct {
 
 type agentJSON struct {
 	store.Agent
-	Online bool `json:"online"`
+	Online   bool               `json:"online"`
+	Activity store.ActivityView `json:"activity"`
 }
 
 func (a *API) Routes() http.Handler {
@@ -99,6 +100,7 @@ func (a *API) Routes() http.Handler {
 	route("GET /api/v1/agents/roles", a.agentRoles)
 	route("POST /api/v1/agents/{id}/revoke", a.revokeAgentTokens)
 	route("POST /api/v1/agents/rename", a.renameAgent)
+	route("POST /api/v1/agents/activity", a.setActivity)
 	route("GET /api/v1/sessions", a.listSessions)
 	route("POST /api/v1/sessions", a.createSession)
 	route("GET /api/v1/sessions/{id}", a.getSession)
@@ -327,13 +329,20 @@ func (a *API) writeMessages(w http.ResponseWriter, msgs []store.Message) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func toAgentJSON(a *store.Agent) agentJSON {
+func toAgentJSON(a *store.Agent, act store.ActivityView) agentJSON {
 	// The admin never authenticates via the agent API (the panel acts as it
 	// directly) — yet whoever reads presence is at the panel, so the admin
 	// counts as always online.
 	online := a.ID == ui.AdminAgentID ||
 		(a.LastSeenAt != nil && time.Since(time.Unix(*a.LastSeenAt, 0)) < presenceWindow)
-	return agentJSON{Agent: *a, Online: online}
+	if act.State == "" {
+		if online {
+			act.State = store.ActivityIdle
+		} else {
+			act.State = store.ActivityOffline
+		}
+	}
+	return agentJSON{Agent: *a, Online: online, Activity: act}
 }
 
 func (a *API) listAgents(w http.ResponseWriter, r *http.Request) {
@@ -345,9 +354,10 @@ func (a *API) listAgents(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "store error")
 		return
 	}
+	snap := a.activities(r.Context())
 	out := make([]agentJSON, 0, len(agents))
 	for i := range agents {
-		out = append(out, toAgentJSON(&agents[i]))
+		out = append(out, toAgentJSON(&agents[i], snap.ByAgent[agents[i].ID]))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"agents": out})
 }
@@ -975,9 +985,10 @@ func (a *API) getSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "store error")
 		return
 	}
+	snap := a.activities(r.Context())
 	out := make([]agentJSON, 0, len(participants))
 	for i := range participants {
-		out = append(out, toAgentJSON(&participants[i]))
+		out = append(out, toAgentJSON(&participants[i], snap.ByAgent[participants[i].ID]))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"session": sess, "participants": out})
 }
@@ -1205,6 +1216,7 @@ func (a *API) postMessage(w http.ResponseWriter, r *http.Request) {
 	if err := a.Store.MarkRead(r.Context(), sid, agent.ID, msg.Seq); err != nil {
 		a.Log.Error("mark read", "err", err, "session", sid, "agent", agent.ID)
 	}
+	a.Store.TouchAction(r.Context(), agent.ID)
 	a.notifySession(r.Context(), sid)
 	a.Metrics.MessagesPosted.Add(1)
 	writeJSON(w, http.StatusCreated, msg)
@@ -1302,6 +1314,7 @@ func (a *API) putContextItem(w http.ResponseWriter, r *http.Request) {
 		a.writeStoreErr(w, err)
 		return
 	}
+	a.Store.TouchAction(r.Context(), agent.ID)
 	a.notifySession(r.Context(), sid)
 	a.Metrics.ContextUpdates.Add(1)
 	writeJSON(w, http.StatusOK, struct {

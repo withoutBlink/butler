@@ -98,14 +98,20 @@ tr.archived td { opacity: 0.6; }
 }
 .sidebar, .chat-pane { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
 .sidebar { display: flex; flex-direction: column; gap: 20px; }
-.p-online { list-style: none; position: relative; padding-left: 16px; }
-.p-online::before { content: ""; position: absolute; left: 2px; top: 7px; width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
-.p-offline { list-style: none; position: relative; padding-left: 16px; }
-.p-offline::before { content: ""; position: absolute; left: 2px; top: 7px; width: 8px; height: 8px; border-radius: 50%; background: var(--border); }
+/* Activity chip: a colored dot plus the state word, next to an agent name.
+   working green, idle blue, blocked amber, stalled red, offline muted. */
+.presence { display: inline-flex; align-items: center; gap: 3px; margin-right: 4px; font-size: 11px; font-weight: 600; letter-spacing: 0.01em; vertical-align: 1px; white-space: nowrap; }
+.presence .act { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: currentColor; flex: 0 0 auto; }
+.p-working { color: var(--ok); }
+.p-idle { color: var(--accent); }
+.p-blocked { color: var(--context); }
+.p-stalled { color: var(--err); }
+.p-offline { color: var(--muted); }
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--border); }
 .dot.on { background: var(--ok); }
-#participants ul { margin: 0; padding: 0; }
-#participants li { padding: 4px 0 4px 16px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+#participants ul { margin: 0; padding: 0; list-style: none; }
+#participants li { padding: 4px 0; list-style: none; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+#participants .who { display: inline-flex; align-items: center; gap: 4px; min-width: 0; }
 /* The remove control sits at the end of the name line; the workdir keeps its
    own line below. */
 #participants li form { margin-left: auto; }
@@ -212,6 +218,8 @@ main.board-page .new-session { flex: 0 0 auto; }
 .hint.empty { margin: 0; }
 /* Task card v2: title first, quiet owner footer, actions in the ⋯ menu. */
 .card.pri-urgent-card { box-shadow: inset 3px 0 0 var(--err); }
+.card.stalled { box-shadow: inset 3px 0 0 var(--err); }
+.stalled-tag { flex: 0 0 auto; font-size: 11px; line-height: 16px; padding: 0 6px; border-radius: 8px; border: 1px solid var(--err); color: var(--err); text-transform: lowercase; }
 .card .card-title { margin: 0; padding-right: 26px; font-size: 15px; line-height: 1.35; font-weight: 600; color: var(--fg);
   text-transform: none; letter-spacing: 0; overflow-wrap: anywhere;
   display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }

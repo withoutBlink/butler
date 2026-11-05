@@ -224,7 +224,7 @@ func TestToolE2E(t *testing.T) {
 		"list_tasks": false, "get_task": false, "create_task": false,
 		"update_task_status": false, "comment_task": false, "claim_task": false,
 		"handoff_task": false, "approve_task": false, "reject_task": false,
-		"rename_self": false,
+		"rename_self": false, "set_activity": false,
 	}
 	if len(toolsRes.Tools) != len(want) {
 		t.Fatalf("expected %d tools, got %d", len(want), len(toolsRes.Tools))
@@ -638,5 +638,40 @@ func TestRenameSelfTool(t *testing.T) {
 	out, isErr = callTool(t, beta, "create_task", map[string]any{"title": "for Point", "assignee": "Point"})
 	if isErr || !strings.Contains(out, alphaID) {
 		t.Fatalf("assign by the new name: %q isErr=%v", out, isErr)
+	}
+}
+
+func TestSetActivityTool(t *testing.T) {
+	backend, _, kinds := newButlerBackend(t)
+	alpha, alphaID := connectMCPClient(t, backend.URL, kinds["codex"], "alpha", "/tmp/alpha")
+
+	out, isErr := callTool(t, alpha, "set_activity", map[string]any{"state": "blocked", "note": "waiting on review"})
+	if isErr || !strings.Contains(out, "activity: blocked") || !strings.Contains(out, "waiting on review") {
+		t.Fatalf("set_activity: %q isErr=%v", out, isErr)
+	}
+	out, isErr = callTool(t, alpha, "set_activity", map[string]any{"state": "asleep"})
+	if !isErr {
+		t.Fatalf("bad state should fail: %q", out)
+	}
+
+	out, isErr = callTool(t, alpha, "create_session", map[string]any{"title": "activity room"})
+	if isErr {
+		t.Fatalf("create session: %s", out)
+	}
+	// The session id is in the tool text; read the only session the agent just made
+	// by listing and then reading via the id embedded as "(<id>)" is brittle, so
+	// read whatever list_sessions would need. create_session returns the id in quotes
+	// after the title. Pull it from the output: created session "activity room" (<id>)
+	const marker = "created session \"activity room\" ("
+	i := strings.Index(out, marker)
+	if i < 0 {
+		t.Fatalf("session id missing: %q", out)
+	}
+	rest := out[i+len(marker):]
+	sid := rest[:strings.Index(rest, ")")]
+
+	out, isErr = callTool(t, alpha, "read_session", map[string]any{"session": sid})
+	if isErr || !strings.Contains(out, "[blocked]") || !strings.Contains(out, alphaID) {
+		t.Fatalf("read_session should show activity: %q isErr=%v", out, isErr)
 	}
 }

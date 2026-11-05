@@ -34,19 +34,21 @@ type chainStep struct {
 }
 
 type boardCard struct {
-	Task         store.Task
-	Assignee     string
-	Creator      string
-	Owner        string
-	OwnerInitial string
-	OwnerClass   string
-	Chain        []chainStep
-	ChainText    string
-	SessionTitle string
-	Comments     []boardNote
-	ShowHandoff  bool
-	ShowApprove  bool
-	ShowReject   bool
+	Task          store.Task
+	Assignee      string
+	Creator       string
+	Owner         string
+	OwnerInitial  string
+	OwnerClass    string
+	OwnerActivity store.ActivityView
+	Stalled       bool
+	Chain         []chainStep
+	ChainText     string
+	SessionTitle  string
+	Comments      []boardNote
+	ShowHandoff   bool
+	ShowApprove   bool
+	ShowReject    bool
 }
 
 type boardColumn struct {
@@ -92,6 +94,7 @@ func (p *Panel) loadBoard(ctx context.Context) (boardPage, error) {
 	if err != nil {
 		return boardPage{}, err
 	}
+	snap := p.loadActivity(ctx)
 	names := map[string]string{}
 	var choices []assignChoice
 	for _, a := range agents {
@@ -168,17 +171,19 @@ func (p *Panel) loadBoard(ctx context.Context) (boardPage, error) {
 			Current: t.Status == store.TaskReview,
 		})
 		byStatus[t.Status] = append(byStatus[t.Status], boardCard{
-			Task:         t,
-			Assignee:     owner,
-			Creator:      label(t.CreatorID),
-			Owner:        owner,
-			OwnerInitial: ownerInitial(owner),
-			OwnerClass:   ownerClass(t.AssigneeID),
-			Chain:        steps,
-			ChainText:    strings.Join(namesInChain, ", "),
-			SessionTitle: titles[t.SessionID],
-			Comments:     cardNotes,
-			ShowHandoff:  t.Status != store.TaskDone && t.Status != store.TaskReview,
+			Task:          t,
+			Assignee:      owner,
+			Creator:       label(t.CreatorID),
+			Owner:         owner,
+			OwnerInitial:  ownerInitial(owner),
+			OwnerClass:    ownerClass(t.AssigneeID),
+			OwnerActivity: snap.ByAgent[t.AssigneeID],
+			Stalled:       snap.Stalled[t.ID],
+			Chain:         steps,
+			ChainText:     strings.Join(namesInChain, ", "),
+			SessionTitle:  titles[t.SessionID],
+			Comments:      cardNotes,
+			ShowHandoff:   t.Status != store.TaskDone && t.Status != store.TaskReview,
 			// Approve and Send back are the review step. Offering Approve
 			// earlier put it next to Hand off, and in a narrow column the
 			// Hand off button was the one that got clipped.

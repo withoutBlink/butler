@@ -159,6 +159,7 @@ func (s *Service) Create(ctx context.Context, actorID string, in CreateInput) (R
 	if err != nil {
 		return Result{}, err
 	}
+	s.touch(ctx, actorID)
 	seq := s.announce(ctx, actorID, nil, task, nil, nil)
 	return Result{Task: task, NotifySeq: seq, Created: true}, nil
 }
@@ -209,6 +210,7 @@ func (s *Service) Comment(ctx context.Context, actorID, taskID, body string) (Re
 	if err != nil {
 		return Result{}, err
 	}
+	s.touch(ctx, actorID)
 	seq := s.announce(ctx, actorID, before, after, c, nil)
 	return Result{Task: after, Comment: c, NotifySeq: seq}, nil
 }
@@ -288,6 +290,7 @@ func (s *Service) apply(ctx context.Context, actorID, taskID string, in UpdateIn
 		s.wakeBoard()
 		return Result{Task: after}, nil
 	}
+	s.touch(ctx, actorID)
 	seq := s.announce(ctx, actorID, before, after, nil, nil)
 	return Result{Task: after, NotifySeq: seq}, nil
 }
@@ -312,6 +315,15 @@ func (s *Service) wakeBoard() {
 	if s.Hub != nil {
 		s.Hub.NotifyBoard()
 	}
+}
+
+// touch records that the actor did something on the board. Activity treats
+// that as working for a short window. It does not post, mention, or webhook.
+func (s *Service) touch(ctx context.Context, actorID string) {
+	if actorID == "" {
+		return
+	}
+	s.Store.TouchAction(ctx, actorID)
 }
 
 func (s *Service) postNotice(ctx context.Context, actorID string, before, after *store.Task, comment *store.TaskComment, xfer *xfer) int64 {

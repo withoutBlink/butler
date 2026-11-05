@@ -390,6 +390,28 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 	})
 
 	addTool(mcpServer, &mcp.Tool{
+		Name:        "set_activity",
+		Description: "Report what you are doing right now: working, idle, or blocked (waiting on a review or a human). Add a short note when it helps (\"waiting on the diff\"). Butler shows that next to your name on the board and in chat. This does not comment on a task and does not notify anyone — call it whenever your state changes. If you skip it, Butler infers activity from your calls and from tasks you own. A claimed in_progress task whose owner goes quiet is marked stalled on its own.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
+		State string `json:"state" jsonschema:"working, idle, or blocked, required"`
+		Note  string `json:"note,omitempty" jsonschema:"optional short note, max 200 characters"`
+	}) (*mcp.CallToolResult, any, error) {
+		state := strings.TrimSpace(args.State)
+		if state == "" {
+			return errResult("state is required"), nil, nil
+		}
+		view, err := s.client.SetActivity(ctx, state, args.Note)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		line := "activity: " + view.State
+		if view.Note != "" {
+			line += " (" + view.Note + ")"
+		}
+		return textResult(line), nil, nil
+	})
+
+	addTool(mcpServer, &mcp.Tool{
 		Name:        "rename_self",
 		Description: "Change your own Butler display name (the name others @mention and assign tasks to). Call this whenever your human/owner or a teammate tells you that you have been renamed, so Butler matches your new name, e.g. \"you are now called Point\" → rename_self {display_name: \"Point\"}. Your agent id, tokens, sessions, tasks and history stay the same; every room you are in gets a notice \"Old is now New\". The old name stops resolving for @mentions and assignees right away. Fails with a conflict if another agent already uses the name (case-insensitive) or it equals an agent kind — pick another or ask your owner. Only renames you; never use it to rename someone else.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
@@ -410,7 +432,7 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 	})
 }
 
-func formatTaskList(tasks []store.Task) string {
+func formatTaskList(tasks []ListedTask) string {
 	if len(tasks) == 0 {
 		return "no tasks"
 	}
@@ -421,7 +443,14 @@ func formatTaskList(tasks []store.Task) string {
 		if t.AssigneeID != "" {
 			who = t.AssigneeID
 		}
-		fmt.Fprintf(&b, "  %s  [%s]  [%s]  assignee=%s  %q\n", t.ID, t.Status, t.Priority, who, t.Title)
+		extra := ""
+		if t.AssigneeActivity != "" {
+			extra += "  activity=" + t.AssigneeActivity
+		}
+		if t.Stalled {
+			extra += "  STALLED"
+		}
+		fmt.Fprintf(&b, "  %s  [%s]  [%s]  assignee=%s%s  %q\n", t.ID, t.Status, t.Priority, who, extra, t.Title)
 	}
 	return b.String()
 }
@@ -438,6 +467,12 @@ func formatTask(view *TaskView) string {
 	}
 	fmt.Fprintf(&b, "task %q (%s)\n", view.Title, view.ID)
 	fmt.Fprintf(&b, "status: %s\npriority: %s\nowner: %s\ncreator: %s\nreviewer: %s\nsession: %s\n", view.Status, view.Priority, who, view.CreatorID, reviewerOf(view), session)
+	if view.AssigneeActivity != "" {
+		fmt.Fprintf(&b, "activity: %s\n", view.AssigneeActivity)
+	}
+	if view.Stalled {
+		b.WriteString("stalled: yes\n")
+	}
 	if len(view.Chain) > 0 {
 		fmt.Fprintf(&b, "chain: %s\n", strings.Join(view.Chain, " → "))
 	}
@@ -540,6 +575,9 @@ func (s *Server) formatSession(detail *SessionDetail, msgs []store.Message) stri
 		}
 		if p.Online {
 			tag += "*"
+		}
+		if p.Activity.State != "" {
+			tag += " [" + p.Activity.State + "]"
 		}
 		names = append(names, tag)
 	}

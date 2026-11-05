@@ -69,21 +69,29 @@ func taskCmd(args []string) {
 			os.Exit(1)
 		}
 		names := agentNames(ctx, st)
+		snap := activitySnapshot(ctx, st)
 		w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "ID\tTITLE\tSTATUS\tPRIORITY\tASSIGNEE\tSESSION\tUPDATED")
+		fmt.Fprintln(w, "ID\tTITLE\tSTATUS\tPRIORITY\tASSIGNEE\tACTIVITY\tSESSION\tUPDATED")
 		for _, t := range tasks {
 			who := "-"
+			act := "-"
 			if t.AssigneeID != "" {
 				who = names[t.AssigneeID]
 				if who == "" {
 					who = t.AssigneeID
 				}
+				if state := snap.ByAgent[t.AssigneeID].State; state != "" {
+					act = state
+				}
+			}
+			if snap.Stalled[t.ID] {
+				act = store.ActivityStalled
 			}
 			sess := "-"
 			if t.SessionID != "" {
 				sess = t.SessionID
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", t.ID, t.Title, t.Status, t.Priority, who, sess,
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", t.ID, t.Title, t.Status, t.Priority, who, act, sess,
 				time.UnixMilli(t.UpdatedAt).UTC().Format(time.RFC3339))
 		}
 		w.Flush()
@@ -102,10 +110,17 @@ func taskCmd(args []string) {
 		fmt.Printf("title:     %s\n", t.Title)
 		fmt.Printf("status:    %s\n", t.Status)
 		fmt.Printf("priority:  %s\n", t.Priority)
+		snap := activitySnapshot(ctx, st)
 		if t.AssigneeID == "" {
 			fmt.Printf("assignee:  unassigned\n")
 		} else {
 			fmt.Printf("assignee:  %s\n", names[t.AssigneeID])
+			if state := snap.ByAgent[t.AssigneeID].State; state != "" {
+				fmt.Printf("activity:  %s\n", state)
+			}
+		}
+		if snap.Stalled[t.ID] {
+			fmt.Printf("stalled:   yes\n")
 		}
 		fmt.Printf("creator:   %s\n", names[t.CreatorID])
 		if t.SessionID == "" {
@@ -299,6 +314,25 @@ func webhookCmd(args []string) {
 		webhookUsage()
 		os.Exit(2)
 	}
+}
+
+// activitySnapshot derives every agent's state and which in_progress tasks
+// are stalled. The CLI has no hub, so a held long-poll is not visible; last
+// seen still covers an agent that polled recently.
+func activitySnapshot(ctx context.Context, st *store.Store) store.ActivitySnapshot {
+	empty := store.ActivitySnapshot{ByAgent: map[string]store.ActivityView{}, Stalled: map[string]bool{}}
+	agents, err := st.AllAgents(ctx)
+	if err != nil {
+		return empty
+	}
+	tasks, err := st.ListTasks(ctx, store.TaskFilter{})
+	if err != nil {
+		return empty
+	}
+	return store.BuildActivity(agents, tasks, store.ActivityInput{
+		Now:           time.Now(),
+		AlwaysPresent: map[string]bool{"admin": true},
+	})
 }
 
 func agentNames(ctx context.Context, st *store.Store) map[string]string {

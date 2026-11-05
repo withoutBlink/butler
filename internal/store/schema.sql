@@ -2,7 +2,8 @@
 -- pre-release, so this file is the single source of truth and is applied
 -- with CREATE ... IF NOT EXISTS on every open. Changing the schema means
 -- editing this file and recreating the database (`butler reset`); a database
--- created by an older schema is not upgraded in place.
+-- created by an older schema is not upgraded in place. Additive columns are
+-- the exception: store.migrate applies idempotent ALTER TABLE on open.
 
 CREATE TABLE IF NOT EXISTS kinds (
     id TEXT PRIMARY KEY,
@@ -27,7 +28,15 @@ CREATE TABLE IF NOT EXISTS agents (
     client_session TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL,
     last_seen_at INTEGER,
-    removed_at INTEGER
+    removed_at INTEGER,
+    -- Explicit self-report (working / idle / blocked). Empty means "infer".
+    -- activity_at and last_action_at are unix milliseconds (so a report and
+    -- an action in the same second still order). last_seen_at stays unix
+    -- seconds. migrateAgents adds these to databases created before them.
+    activity_state TEXT NOT NULL DEFAULT '',
+    activity_note TEXT NOT NULL DEFAULT '',
+    activity_at INTEGER,
+    last_action_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS agent_tokens (

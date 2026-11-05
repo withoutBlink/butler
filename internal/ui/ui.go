@@ -323,7 +323,7 @@ func (p *Panel) logout(w http.ResponseWriter, r *http.Request) {
 
 type dashSessionRow struct {
 	Session      store.Session
-	Participants []store.Agent
+	Participants []dashPerson
 	LastPreview  string
 	LastAt       *int64
 	// Global marks the fixed global session: no archive/reopen/delete control
@@ -361,6 +361,7 @@ type agentRow struct {
 	Workdir  string
 	Online   bool
 	LastTxt  string
+	Activity store.ActivityView
 }
 
 func (p *Panel) dashboard(w http.ResponseWriter, r *http.Request) {
@@ -374,10 +375,12 @@ func (p *Panel) dashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows := make([]dashSessionRow, 0, len(sessions))
+	rawParts := make([][]store.Agent, 0, len(sessions))
 	for _, sess := range sessions {
 		row := dashSessionRow{Session: sess, Global: sess.ID == store.GlobalSessionID}
-		if parts, err := p.Store.Participants(ctx, sess.ID); err == nil {
-			row.Participants = parts
+		var parts []store.Agent
+		if listed, err := p.Store.Participants(ctx, sess.ID); err == nil {
+			parts = listed
 		}
 		if msgs, err := p.Store.SessionLatestMessages(ctx, sess.ID, 1); err == nil && len(msgs) == 1 {
 			row.LastPreview = msgs[0].Content
@@ -385,16 +388,25 @@ func (p *Panel) dashboard(w http.ResponseWriter, r *http.Request) {
 			row.LastAt = &at
 		}
 		rows = append(rows, row)
+		rawParts = append(rawParts, parts)
 	}
 	agents, err := p.Store.ListAgents(ctx)
 	if err != nil {
 		p.httpError(w, "store error", 500)
 		return
 	}
+	snap := p.loadActivity(ctx)
+	for i := range rows {
+		people := make([]dashPerson, len(rawParts[i]))
+		for j, a := range rawParts[i] {
+			people[j] = dashPerson{Agent: a, Activity: snap.ByAgent[a.ID]}
+		}
+		rows[i].Participants = people
+	}
 	agentRows := make([]agentRow, 0, len(agents))
 	pickable := false
 	for _, a := range agents {
-		row := agentRow{ID: a.ID, Kind: a.Kind, Title: a.DisplayName, Hostname: a.Hostname, Workdir: a.Workdir, Online: agentOnline(&a), LastTxt: "never"}
+		row := agentRow{ID: a.ID, Kind: a.Kind, Title: a.DisplayName, Hostname: a.Hostname, Workdir: a.Workdir, Online: agentOnline(&a), LastTxt: "never", Activity: snap.ByAgent[a.ID]}
 		if a.DisplayName != a.ID {
 			row.Sub = a.ID
 		}
@@ -564,7 +576,7 @@ type sessionViewData struct {
 type participantsView struct {
 	SessionID string
 	CanRemove bool
-	Agents    []store.Agent
+	Agents    []participantRow
 }
 
 // agentOption is one entry of the session view's add-participant picker.
@@ -604,12 +616,13 @@ func (p *Panel) addableAgents(ctx context.Context, parts []store.Agent) []agentO
 // uiMsg is a message plus the panel's read state for it.
 type uiMsg struct {
 	store.Message
-	ReadCount  int    // audience members (≠ sender) whose read state covers the message
-	ReadTotal  int    // audience members (≠ sender) who could read it
-	Readers    string // comma-joined display names of the readers
-	Unread     string // comma-joined display names of the audience who have not read it
-	ReadTip    string // the mark's hover text: readers and non-readers
-	SenderName string // sender's display name (session title); the id stays in data-sender/title
+	ReadCount  int                // audience members (≠ sender) whose read state covers the message
+	ReadTotal  int                // audience members (≠ sender) who could read it
+	Readers    string             // comma-joined display names of the readers
+	Unread     string             // comma-joined display names of the audience who have not read it
+	ReadTip    string             // the mark's hover text: readers and non-readers
+	SenderName string             // sender's display name (session title); the id stays in data-sender/title
+	Activity   store.ActivityView // derived activity shown next to the author
 }
 
 // readState is a session's read-cursor snapshot plus its display names: the
@@ -694,6 +707,7 @@ func readTip(readers, unread string) string {
 // a UUID). Only an identity whose display name *is* its id (an untitled
 // app-level identity) shows a UUID in the list.
 func (p *Panel) attachReadState(ctx context.Context, rs readState, msgs []store.Message) []uiMsg {
+	snap := p.loadActivity(ctx)
 	out := make([]uiMsg, len(msgs))
 	nameOf := func(id string) string {
 		if n, ok := rs.names[id]; ok && n != "" {
@@ -711,7 +725,7 @@ func (p *Panel) attachReadState(ctx context.Context, rs readState, msgs []store.
 		return id
 	}
 	for i, m := range msgs {
-		vm := uiMsg{Message: m, SenderName: nameOf(m.SenderID)}
+		vm := uiMsg{Message: m, SenderName: nameOf(m.SenderID), Activity: snap.ByAgent[m.SenderID]}
 		if m.Kind != "chat" {
 			out[i] = vm
 			continue
@@ -807,9 +821,10 @@ func (p *Panel) sessionView(w http.ResponseWriter, r *http.Request) {
 		p.httpError(w, "store error", 500)
 		return
 	}
+	snap := p.loadActivity(ctx)
 	p.render(w, http.StatusOK, "session.tmpl", sessionViewData{
 		Session:      *sess,
-		Participants: participantsView{SessionID: sid, CanRemove: sess.Status == "active", Agents: parts},
+		Participants: participantsView{SessionID: sid, CanRemove: sess.Status == "active", Agents: withActivity(parts, snap)},
 		Messages:     p.attachReadState(ctx, rs, msgs), ContextItems: items, LatestSeq: latest,
 		Mentionables: string(mentionables), Audience: string(audienceJSON), Reads: string(readsJSON),
 		Addable:  p.addableAgents(ctx, parts),
@@ -1083,6 +1098,7 @@ func (p *Panel) postMessage(w http.ResponseWriter, r *http.Request) {
 		p.httpError(w, "store error", 500)
 		return
 	}
+	p.Store.TouchAction(ctx, admin.ID)
 	p.fanout(ctx, sid)
 	p.renderFragment(w, "message", p.attachReadState(ctx, p.loadReadState(ctx, sid), []store.Message{*msg})[0])
 }
@@ -1130,6 +1146,7 @@ func (p *Panel) putContext(w http.ResponseWriter, r *http.Request) {
 		p.httpError(w, "store error", 500)
 		return
 	}
+	p.Store.TouchAction(ctx, admin.ID)
 	p.fanout(ctx, sid)
 	http.Redirect(w, r, "/panel/sessions/"+sid, http.StatusSeeOther)
 }
@@ -1215,6 +1232,7 @@ func (p *Panel) stream(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			emitReads()
+			p.writeActivity(ctx, w, flusher)
 		case <-ticker.C:
 			cancel()
 			// The presence re-send also refreshes the participants list, so a
@@ -1227,7 +1245,11 @@ func (p *Panel) stream(w http.ResponseWriter, r *http.Request) {
 				if sess, err := p.Store.GetSession(ctx, sid); err == nil {
 					canRemove = sess.Status == "active"
 				}
-				writeSSE(w, flusher, "presence", p.fragment("participants", participantsView{SessionID: sid, CanRemove: canRemove, Agents: parts}))
+				snap := p.loadActivity(ctx)
+				writeSSE(w, flusher, "presence", p.fragment("participants", participantsView{SessionID: sid, CanRemove: canRemove, Agents: withActivity(parts, snap)}))
+				if data, err := json.Marshal(snap.ByAgent); err == nil {
+					writeSSE(w, flusher, "activity", string(data))
+				}
 				// The read-mark audience (members, names and join times)
 				// travels with the same heartbeat: a join or removal has to
 				// move the marks' denominator and tooltips, not only the

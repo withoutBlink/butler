@@ -43,6 +43,16 @@ type Agent struct {
 	ClientSession string `json:"client_session,omitempty"`
 	CreatedAt     int64  `json:"created_at"`
 	LastSeenAt    *int64 `json:"last_seen_at,omitempty"`
+	// ActivityState / ActivityNote / ActivityAt are the agent's last explicit
+	// self-report (working, idle, or blocked). Empty state means "infer".
+	// LastActionAt is the last substantive action (a post, a task write, a
+	// context write), which is not the same as LastSeenAt (any authenticated
+	// call, including a long-poll). None of these are the derived activity
+	// the API returns — see BuildActivity.
+	ActivityState string `json:"-"`
+	ActivityNote  string `json:"-"`
+	ActivityAt    *int64 `json:"-"`
+	LastActionAt  *int64 `json:"-"`
 	// RemovedAt is set when the agent is kicked (evicted): it keeps its row
 	// — messages and sessions reference it — but listings, participants and
 	// mentions skip it until it re-registers, which clears the flag.
@@ -130,7 +140,10 @@ func (s *Store) ensureSchema() error {
 			return err
 		}
 	}
-	return s.migrateTasks()
+	if err := s.migrateTasks(); err != nil {
+		return err
+	}
+	return s.migrateAgents()
 }
 
 func splitSQL(script string) []string {
@@ -246,17 +259,26 @@ func (s *Store) CreateAgent(ctx context.Context, name, displayName, kind, hostna
 	return &Agent{ID: name, DisplayName: displayName, Kind: kind, Hostname: hostname, Workdir: workdir, ClientSession: clientSession, CreatedAt: now}, nil
 }
 
-const agentCols = `id, display_name, kind, hostname, workdir, client_session, created_at, last_seen_at, removed_at`
+// agentSelect lists the agent columns in scan order. alias is empty or a
+// table alias ("a"); the JOIN in Participants needs the prefix so the new
+// activity columns cannot collide with another table.
+func agentSelect(alias string) string {
+	p := ""
+	if alias != "" {
+		p = alias + "."
+	}
+	return p + `id, ` + p + `display_name, ` + p + `kind, ` + p + `hostname, ` + p + `workdir, ` + p + `client_session, ` + p + `created_at, ` + p + `last_seen_at, ` + p + `removed_at, COALESCE(` + p + `activity_state, ''), COALESCE(` + p + `activity_note, ''), ` + p + `activity_at, ` + p + `last_action_at`
+}
 
 func (s *Store) GetAgent(ctx context.Context, name string) (*Agent, error) {
-	return scanAgent(s.db.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id = ?`, name))
+	return scanAgent(s.db.QueryRowContext(ctx, `SELECT `+agentSelect("")+` FROM agents WHERE id = ?`, name))
 }
 
 // GetVisibleAgent resolves an agent by id with the same visibility rules as
 // ListAgents and Participants: evicted (kicked) agents and hidden agent
 // clients (app-level identities with live roles) do not resolve.
 func (s *Store) GetVisibleAgent(ctx context.Context, id string) (*Agent, error) {
-	return scanAgent(s.db.QueryRowContext(ctx, `SELECT `+agentCols+`
+	return scanAgent(s.db.QueryRowContext(ctx, `SELECT `+agentSelect("")+`
 		FROM agents WHERE id = ? AND removed_at IS NULL
 		AND NOT (`+clientHidden("agents")+`)`, id))
 }
@@ -264,7 +286,7 @@ func (s *Store) GetVisibleAgent(ctx context.Context, id string) (*Agent, error) 
 // GetAgentByTokenHash resolves an instance token to its agent. Removed
 // (kicked) agents have no tokens, so they never resolve here.
 func (s *Store) GetAgentByTokenHash(ctx context.Context, tokenHash string) (*Agent, error) {
-	return scanAgent(s.db.QueryRowContext(ctx, `SELECT a.id, a.display_name, a.kind, a.hostname, a.workdir, a.client_session, a.created_at, a.last_seen_at, a.removed_at
+	return scanAgent(s.db.QueryRowContext(ctx, `SELECT `+agentSelect("a")+`
 		FROM agents a JOIN agent_tokens t ON t.agent_id = a.id WHERE t.token_hash = ?`, tokenHash))
 }
 
@@ -272,7 +294,7 @@ func (s *Store) GetAgentByTokenHash(ctx context.Context, tokenHash string) (*Age
 // clientSession). clientSession "" is the app-level identity; a non-empty
 // discriminator selects the per-client-session sibling of that identity.
 func (s *Store) FindInstance(ctx context.Context, kind, hostname, workdir, clientSession string) (*Agent, error) {
-	return scanAgent(s.db.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE kind = ? AND hostname = ? AND workdir = ? AND client_session = ?`,
+	return scanAgent(s.db.QueryRowContext(ctx, `SELECT `+agentSelect("")+` FROM agents WHERE kind = ? AND hostname = ? AND workdir = ? AND client_session = ?`,
 		kind, hostname, workdir, clientSession))
 }
 
@@ -387,23 +409,35 @@ func (s *Store) SessionsForAgent(ctx context.Context, agentID string) ([]string,
 }
 
 func scanAgent(row *sql.Row) (*Agent, error) {
-	var a Agent
-	var lastSeen, removed sql.NullInt64
-	if err := row.Scan(&a.ID, &a.DisplayName, &a.Kind, &a.Hostname, &a.Workdir, &a.ClientSession, &a.CreatedAt, &lastSeen, &removed); err != nil {
+	a, err := scanAgentRow(row)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
-	if lastSeen.Valid {
-		v := lastSeen.Int64
-		a.LastSeenAt = &v
+	return a, nil
+}
+
+func scanAgentRow(sc interface{ Scan(...any) error }) (*Agent, error) {
+	var a Agent
+	var lastSeen, removed, activityAt, lastAction sql.NullInt64
+	if err := sc.Scan(&a.ID, &a.DisplayName, &a.Kind, &a.Hostname, &a.Workdir, &a.ClientSession, &a.CreatedAt, &lastSeen, &removed, &a.ActivityState, &a.ActivityNote, &activityAt, &lastAction); err != nil {
+		return nil, err
 	}
-	if removed.Valid {
-		v := removed.Int64
-		a.RemovedAt = &v
-	}
+	a.LastSeenAt = int64Ptr(lastSeen)
+	a.RemovedAt = int64Ptr(removed)
+	a.ActivityAt = int64Ptr(activityAt)
+	a.LastActionAt = int64Ptr(lastAction)
 	return &a, nil
+}
+
+func int64Ptr(v sql.NullInt64) *int64 {
+	if !v.Valid {
+		return nil
+	}
+	n := v.Int64
+	return &n
 }
 
 func (s *Store) queryAgents(ctx context.Context, q string, args ...any) ([]Agent, error) {
@@ -414,20 +448,11 @@ func (s *Store) queryAgents(ctx context.Context, q string, args ...any) ([]Agent
 	defer rows.Close()
 	agents := []Agent{}
 	for rows.Next() {
-		var a Agent
-		var lastSeen, removed sql.NullInt64
-		if err := rows.Scan(&a.ID, &a.DisplayName, &a.Kind, &a.Hostname, &a.Workdir, &a.ClientSession, &a.CreatedAt, &lastSeen, &removed); err != nil {
+		a, err := scanAgentRow(rows)
+		if err != nil {
 			return nil, err
 		}
-		if lastSeen.Valid {
-			v := lastSeen.Int64
-			a.LastSeenAt = &v
-		}
-		if removed.Valid {
-			v := removed.Int64
-			a.RemovedAt = &v
-		}
-		agents = append(agents, a)
+		agents = append(agents, *a)
 	}
 	return agents, rows.Err()
 }
@@ -452,14 +477,32 @@ func clientHidden(alias string) string {
 // Kicked agents stay hidden until they re-register; agent clients with live
 // roles are hidden — the roles represent them.
 func (s *Store) ListAgents(ctx context.Context) ([]Agent, error) {
-	return s.queryAgents(ctx, `SELECT `+agentCols+`
+	return s.queryAgents(ctx, `SELECT `+agentSelect("")+`
 		FROM agents
 		WHERE removed_at IS NULL AND NOT (`+clientHidden("agents")+`)
 		ORDER BY display_name COLLATE NOCASE, id`)
 }
 
+// AllAgents returns every agent row, including kicked identities and hidden
+// agent clients. Activity is computed for assignees who are no longer listed,
+// so the board can still mark their in-progress tasks stalled.
+func (s *Store) AllAgents(ctx context.Context) ([]Agent, error) {
+	return s.queryAgents(ctx, `SELECT `+agentSelect("")+` FROM agents`)
+}
+
 func (s *Store) TouchAgent(ctx context.Context, id string) {
 	_, _ = s.db.ExecContext(ctx, `UPDATE agents SET last_seen_at = ? WHERE id = ?`, time.Now().Unix(), id)
+}
+
+// TouchAction records a substantive action (a chat post, a task write, a
+// context write) and refreshes presence. A long-poll or a plain read is not
+// an action: those only update last_seen_at, so an agent parked in wait stays
+// idle instead of looking busy.
+func (s *Store) TouchAction(ctx context.Context, id string) {
+	// Milliseconds, so an action and a self-report in the same second still
+	// order correctly. last_seen_at stays unix seconds, like every other
+	// presence write.
+	_, _ = s.db.ExecContext(ctx, `UPDATE agents SET last_action_at = ?, last_seen_at = ? WHERE id = ?`, time.Now().UnixMilli(), time.Now().Unix(), id)
 }
 
 // GlobalSessionID is the fixed id of the default session every agent joins
@@ -808,7 +851,7 @@ func (s *Store) IsParticipant(ctx context.Context, sessionID, agentID string) (b
 // Participants lists a session's visible participants ordered by display name
 // (case-insensitive) — what the panel's participants sidebar renders.
 func (s *Store) Participants(ctx context.Context, sessionID string) ([]Agent, error) {
-	return s.queryAgents(ctx, `SELECT `+agentCols+`
+	return s.queryAgents(ctx, `SELECT `+agentSelect("a")+`
 		FROM agents a JOIN participants p ON p.agent_id = a.id
 		WHERE p.session_id = ? AND a.removed_at IS NULL
 		  AND NOT (`+clientHidden("a")+`)
@@ -865,7 +908,7 @@ func (s *Store) SessionAudience(ctx context.Context, sessionID string) ([]Audien
 // key (kind, hostname, workdir): the client itself plus all its roles,
 // removed ones included — the caller decides what to show or re-register.
 func (s *Store) AgentsForIdentity(ctx context.Context, kind, hostname, workdir string) ([]Agent, error) {
-	return s.queryAgents(ctx, `SELECT `+agentCols+`
+	return s.queryAgents(ctx, `SELECT `+agentSelect("")+`
 		FROM agents
 		WHERE kind = ? AND hostname = ? AND workdir = ?
 		ORDER BY id`, kind, hostname, workdir)

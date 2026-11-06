@@ -1893,13 +1893,13 @@ func TestActivityIndicators(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	page := string(body)
-	for _, want := range []string{"Alpha", `p-working`, `act-label">working`, "Ship it"} {
+	for _, want := range []string{"Alpha", `meta-pill p-working`, ">working<", "Ship it"} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("board missing %q:\n%s", want, page)
 		}
 	}
-	if strings.Contains(page, "stalled-tag") {
-		t.Fatalf("a live owner should not be stalled:\n%s", page)
+	if strings.Contains(page, "stalled-tag") || strings.Count(page, ">stalled<") != 0 {
+		t.Fatalf("a live owner should not be stalled, and stalled is not a second badge:\n%s", page)
 	}
 
 	resp, err = client.Get(srv.URL + "/panel/sessions/s1")
@@ -1910,6 +1910,7 @@ func TestActivityIndicators(t *testing.T) {
 	resp.Body.Close()
 	page = string(body)
 	for _, want := range []string{
+		`id="participants"`,
 		`p-working`,
 		`<b title="alpha">Alpha</b>`,
 		`<span class="id">Alpha</span>`,
@@ -1918,6 +1919,9 @@ func TestActivityIndicators(t *testing.T) {
 		if !strings.Contains(page, want) {
 			t.Fatalf("session missing %q:\n%s", want, page)
 		}
+	}
+	if strings.Contains(page, `id="act-`) {
+		t.Fatalf("chat lines should not carry an activity chip:\n%s", page)
 	}
 
 	resp, err = client.Get(srv.URL + "/panel/")
@@ -1941,9 +1945,12 @@ func TestActivityIndicators(t *testing.T) {
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 	page = string(body)
-	for _, want := range []string{`p-stalled`, `stalled-tag">stalled`, "Alpha"} {
+	for _, want := range []string{`meta-pill p-stalled`, ">stalled<", "Alpha", `card stalled`} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("stalled board missing %q:\n%s", want, page)
 		}
+	}
+	if strings.Contains(page, "stalled-tag") || strings.Count(page, ">stalled<") != 1 {
+		t.Fatalf("stalled should appear once, as the owner pill:\n%s", page)
 	}
 }

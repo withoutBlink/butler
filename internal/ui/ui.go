@@ -1200,8 +1200,7 @@ func (p *Panel) stream(w http.ResponseWriter, r *http.Request) {
 			// A read advance re-renders the chips. The server applies the
 			// audience rule (including a member who joined later); the
 			// browser only swaps the HTML.
-			p.writeLiveMeta(ctx, w, flusher, sid, "reads")
-			p.writeLiveMeta(ctx, w, flusher, sid, "activity")
+			p.writeLiveMeta(ctx, w, flusher, sid)
 		case <-ticker.C:
 			cancel()
 			// The presence re-send also refreshes the participants list, so a
@@ -1216,8 +1215,7 @@ func (p *Panel) stream(w http.ResponseWriter, r *http.Request) {
 				}
 				snap := p.loadActivity(ctx)
 				writeSSE(w, flusher, "presence", p.fragment("participants", participantsView{SessionID: sid, CanRemove: canRemove, Agents: p.decorateParticipants(ctx, sid, parts, snap)}))
-				p.writeLiveMeta(ctx, w, flusher, sid, "activity")
-				p.writeLiveMeta(ctx, w, flusher, sid, "reads")
+				p.writeLiveMeta(ctx, w, flusher, sid)
 			} else {
 				writeSSEPing(w, flusher)
 			}

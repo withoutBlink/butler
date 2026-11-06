@@ -242,7 +242,6 @@ article.card > .fold-menu:checked ~ .menu-btn { background: var(--border); }
 /* Task card v2: title first, quiet owner footer, actions in the ⋯ menu. */
 .card.pri-urgent-card { box-shadow: inset 3px 0 0 var(--err); }
 .card.stalled { box-shadow: inset 3px 0 0 var(--err); }
-.stalled-tag { flex: 0 0 auto; font-size: 11px; line-height: 16px; padding: 0 6px; border-radius: 8px; border: 1px solid var(--err); color: var(--err); text-transform: lowercase; }
 .card .card-title { margin: 0; padding-right: 26px; font-size: 15px; line-height: 1.35; font-weight: 600; color: var(--fg);
   text-transform: none; letter-spacing: 0; overflow-wrap: anywhere;
   display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
@@ -257,11 +256,21 @@ article.card > .fold-menu:checked ~ .menu-btn { background: var(--border); }
 .chain-mini .arr { opacity: .6; margin: 0 1px; }
 .chain-mini .step.current { color: var(--fg); font-weight: 600; text-decoration: underline 2px var(--accent); text-underline-offset: 3px; }
 .chain-mini .step.rev { font-style: italic; }
-.pri-tag { margin-left: auto; flex: 0 0 auto; font-size: 11px; line-height: 16px; padding: 0 6px; border-radius: 8px;
-  border: 1px solid var(--border); color: var(--muted); text-transform: capitalize; }
-.pri-tag::before { content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: currentColor; margin-right: 4px; vertical-align: 1px; }
-.pri-tag.pri-high { color: var(--context); border-color: var(--pri-high-line); }
-.pri-tag.pri-urgent { color: var(--err); border-color: var(--pri-urgent-line); }
+/* One pill for owner activity and for priority, so the footer has a single
+   status language. The column is the task's lifecycle; the pill next to the
+   name is the owner. Stalled is that pill (and a quiet red edge), not a
+   second badge. */
+.meta-pill { flex: 0 0 auto; font-size: 11px; line-height: 16px; padding: 0 6px; border-radius: 8px;
+  border: 1px solid var(--border); color: var(--muted); text-transform: lowercase; }
+.meta-pill::before { content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: currentColor; margin-right: 4px; vertical-align: 1px; }
+.meta-pill.p-working { color: var(--ok); border-color: rgba(63,185,80,.45); }
+.meta-pill.p-idle { color: var(--accent); border-color: rgba(68,147,248,.45); }
+.meta-pill.p-blocked { color: var(--context); border-color: var(--pri-high-line); }
+.meta-pill.p-stalled, .meta-pill.p-offline { color: var(--muted); }
+.meta-pill.p-stalled { color: var(--err); border-color: var(--pri-urgent-line); }
+.meta-pill.pri { margin-left: auto; text-transform: capitalize; }
+.meta-pill.pri-high { color: var(--context); border-color: var(--pri-high-line); }
+.meta-pill.pri-urgent { color: var(--err); border-color: var(--pri-urgent-line); }
 .vh { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .card details.card-menu { margin: 0; }
 .card-menu > summary { position: absolute; top: 8px; right: 8px; list-style: none; width: 24px; height: 22px; display: flex; align-items: center; justify-content: center;

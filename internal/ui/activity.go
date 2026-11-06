@@ -61,18 +61,14 @@ func (p *Panel) decorateParticipants(ctx context.Context, sid string, parts []st
 	return rows
 }
 
-// writeLiveMeta sends out-of-band HTML for the read chips and activity chips
-// of the messages currently on the session page. HTMX applies hx-swap-oob;
-// nothing in the browser computes the counts.
-func (p *Panel) writeLiveMeta(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, sid, event string) {
+// writeLiveMeta sends out-of-band HTML for the read chips of the messages
+// currently on the session page. HTMX applies hx-swap-oob. Activity stays on
+// the member list, which the presence event re-renders, not on each line.
+func (p *Panel) writeLiveMeta(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, sid string) {
 	msgs, err := p.Store.SessionLatestMessages(ctx, sid, 200)
 	if err != nil || len(msgs) == 0 {
 		return
 	}
 	vms := p.attachReadState(ctx, p.loadReadState(ctx, sid), msgs)
-	name := "live-reads"
-	if event == "activity" {
-		name = "live-activity"
-	}
-	writeSSE(w, flusher, event, p.fragment(name, vms))
+	writeSSE(w, flusher, "reads", p.fragment("live-reads", vms))
 }

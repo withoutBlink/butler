@@ -52,7 +52,6 @@
 <div sse-swap="message" hx-target="#messages" hx-swap="afterbegin"></div>
 <div sse-swap="presence" hx-target="#participants" hx-swap="outerHTML"></div>
 <div sse-swap="reads" hx-target="#oob" hx-swap="innerHTML"></div>
-<div sse-swap="activity" hx-target="#oob" hx-swap="innerHTML"></div>
 <div id="oob" hidden></div>
 <div id="messages">
 {{range .Messages}}{{template "message" .}}{{end}}

@@ -18,7 +18,7 @@
 {{if .Notice}}<p class="notice">{{.Notice}}</p>{{end}}
 <section class="new-session">
 <h2>New task</h2>
-<form method="post" action="/panel/tasks" class="task-form" onsubmit="this.querySelector('button[type=submit]').disabled=true">
+<form method="post" action="/panel/tasks" class="task-form">
 <input type="text" name="title" placeholder="Task title" required maxlength="200">
 <textarea name="description" placeholder="What needs doing (optional)" rows="2"></textarea>
 <div class="task-row">
@@ -64,19 +64,24 @@
 </div>
 </form>
 </section>
-<div id="board" data-stream="/panel/board/stream">
+<div id="board" hx-ext="sse" sse-connect="/panel/board/stream">
+<div sse-swap="board" hx-target="#board-body" hx-swap="innerHTML"></div>
+<div id="board-body">
 {{template "board-columns" .}}
 </div>
+</div>
 </main>
-<script src="{{asset "app.js"}}"></script>
+{{template "htmx" .}}
 </body>
 </html>
 
 {{define "board-columns"}}
+<form id="done-form" method="post" action="/panel/board/done" hx-post="/panel/board/done" hx-target="#board-body" hx-swap="innerHTML" hx-trigger="change from:#done-collapsed"><noscript><button type="submit">Save Done column</button></noscript></form>
+<input type="checkbox" id="done-collapsed" class="done-toggle" name="collapsed" value="1" form="done-form" hx-preserve="true"{{if .DoneCollapsed}} checked{{end}}>
 <div class="board">
 {{range .Columns}}
 <section class="col" data-status="{{.Status}}">
-<h2><span>{{.Label}} <span class="count">{{len .Tasks}}</span></span>{{if eq .Status "done"}}<button type="button" class="col-toggle" aria-label="Collapse the Done column">Collapse</button>{{end}}</h2>
+<h2><span>{{.Label}} <span class="count">{{len .Tasks}}</span></span>{{if eq .Status "done"}}<label for="done-collapsed" class="col-toggle" aria-label="Collapse or expand the Done column"><span class="when-open">Collapse</span><span class="when-shut">Expand</span></label>{{end}}</h2>
 <div class="col-body">
 {{range $card := .Tasks}}
 <article class="card{{if $card.Stalled}} stalled{{end}}{{if eq $card.Task.Priority "urgent"}} pri-urgent-card{{end}}" data-task="{{$card.Task.ID}}">
@@ -88,15 +93,15 @@
 {{if $card.Chain}}<span class="chain-mini" title="Chain: {{range $i, $s := $card.Chain}}{{if $i}} → {{end}}{{$s.Name}}{{if $s.Review}} (review){{end}}{{end}}"><span class="vh">Chain: {{range $i, $s := $card.Chain}}{{if $i}} → {{end}}{{$s.Name}}{{if $s.Review}} (review){{end}}{{end}}</span><span aria-hidden="true">{{range $i, $s := $card.Chain}}{{if $i}}<span class="arr">→</span>{{end}}<span class="step{{if $s.Current}} current{{end}}{{if $s.Review}} rev{{end}}">{{$s.Initial}}</span>{{end}}</span></span>{{end}}
 {{if ne $card.Task.Priority "normal"}}<span class="pri-tag pri-{{$card.Task.Priority}}">{{$card.Task.Priority}}</span>{{end}}
 </div>
-<details class="card-menu" data-panel="menu">
-<summary aria-label="Actions for {{$card.Task.Title}}" title="Actions">⋯</summary>
+<input type="checkbox" class="fold fold-menu" id="fold-{{$card.Task.ID}}-menu" data-panel="menu" hx-preserve="true">
+<label class="menu-btn" for="fold-{{$card.Task.ID}}-menu" aria-label="Actions for {{$card.Task.Title}}" title="Actions">⋯</label>
 <div class="card-panel">
 <div class="card-actions">
-{{if $card.ShowHandoff}}<form method="post" action="/panel/tasks/{{$card.Task.ID}}/handoff"><input type="text" name="note" placeholder="Handoff note" aria-label="Handoff note for {{$card.Task.Title}}"><button type="submit">Hand off</button></form>{{end}}
+{{if $card.ShowHandoff}}<form method="post" action="/panel/tasks/{{$card.Task.ID}}/handoff"><input type="text" id="handoff-{{$card.Task.ID}}" name="note" placeholder="Handoff note" aria-label="Handoff note for {{$card.Task.Title}}" hx-preserve="true"><button type="submit">Hand off</button></form>{{end}}
 {{if $card.ShowApprove}}<form method="post" action="/panel/tasks/{{$card.Task.ID}}/approve"><button type="submit">Approve</button></form>{{end}}
-{{if $card.ShowReject}}<form method="post" action="/panel/tasks/{{$card.Task.ID}}/reject"><input type="text" name="note" placeholder="Why send it back" aria-label="Send-back note for {{$card.Task.Title}}"><button type="submit" class="ghost">Send back</button></form>{{end}}
+{{if $card.ShowReject}}<form method="post" action="/panel/tasks/{{$card.Task.ID}}/reject"><input type="text" id="reject-{{$card.Task.ID}}" name="note" placeholder="Why send it back" aria-label="Send-back note for {{$card.Task.Title}}" hx-preserve="true"><button type="submit" class="ghost">Send back</button></form>{{end}}
 </div>
-<form method="post" action="/panel/tasks/{{$card.Task.ID}}" class="move" onsubmit="this.querySelector('button[type=submit]').disabled=true">
+<form method="post" action="/panel/tasks/{{$card.Task.ID}}" class="move">
 <select name="status" aria-label="Move {{$card.Task.Title}}">
 <option value="todo"{{if eq $card.Task.Status "todo"}} selected{{end}}>To do</option>
 <option value="in_progress"{{if eq $card.Task.Status "in_progress"}} selected{{end}}>In progress</option>
@@ -106,11 +111,12 @@
 </select>
 <button type="submit">Move</button>
 </form>
-<details data-panel="edit">
-<summary>Edit</summary>
-<form method="post" action="/panel/tasks/{{$card.Task.ID}}" class="task-form" onsubmit="this.querySelector('button[type=submit]').disabled=true">
-<input type="text" name="title" value="{{$card.Task.Title}}" required maxlength="200" aria-label="Title">
-<textarea name="description" rows="3" aria-label="Description">{{$card.Task.Description}}</textarea>
+<div class="fold-block">
+<input type="checkbox" class="fold" id="fold-{{$card.Task.ID}}-edit" data-panel="edit" hx-preserve="true">
+<label for="fold-{{$card.Task.ID}}-edit">Edit</label>
+<form method="post" action="/panel/tasks/{{$card.Task.ID}}" class="task-form fold-body">
+<input type="text" id="edit-title-{{$card.Task.ID}}" name="title" value="{{$card.Task.Title}}" required maxlength="200" aria-label="Title" hx-preserve="true">
+<textarea id="edit-desc-{{$card.Task.ID}}" name="description" rows="3" aria-label="Description" hx-preserve="true">{{$card.Task.Description}}</textarea>
 <label>Assignee
 <select name="assignee">
 <option value="">Unassigned</option>
@@ -141,7 +147,7 @@
 </select>
 </label>
 <label>Chain
-<input type="text" name="chain" value="{{$card.ChainText}}" placeholder="Researcher, Link" aria-label="Handoff chain">
+<input type="text" id="edit-chain-{{$card.Task.ID}}" name="chain" value="{{$card.ChainText}}" placeholder="Researcher, Link" aria-label="Handoff chain" hx-preserve="true">
 </label>
 <label>Reviewer
 <select name="reviewer">
@@ -151,20 +157,22 @@
 </label>
 <button type="submit">Save</button>
 </form>
-</details>
-<details data-panel="log">
-<summary>Log ({{len $card.Comments}})</summary>
+</div>
+<div class="fold-block">
+<input type="checkbox" class="fold" id="fold-{{$card.Task.ID}}-log" data-panel="log" hx-preserve="true">
+<label for="fold-{{$card.Task.ID}}-log">Log ({{len $card.Comments}})</label>
+<div class="fold-body">
 <ul class="log">
 {{range $card.Comments}}<li><b>{{.Author}}</b> <span class="m-meta">{{ts .At}}</span><div>{{.Body}}</div></li>{{else}}<li class="hint">no comments yet</li>{{end}}
 </ul>
-<form method="post" action="/panel/tasks/{{$card.Task.ID}}/comment" class="task-form" onsubmit="this.querySelector('button[type=submit]').disabled=true">
-<textarea name="body" rows="2" required placeholder="Progress note" aria-label="Comment on {{$card.Task.Title}}"></textarea>
+<form method="post" action="/panel/tasks/{{$card.Task.ID}}/comment" class="task-form">
+<textarea id="comment-{{$card.Task.ID}}" name="body" rows="2" required placeholder="Progress note" aria-label="Comment on {{$card.Task.Title}}" hx-preserve="true"></textarea>
 <button type="submit">Comment</button>
 </form>
-</details>
+</div>
+</div>
 <p class="meta-line">by {{$card.Creator}}{{if $card.SessionTitle}} · <a class="card-session" href="/panel/sessions/{{$card.Task.SessionID}}">{{$card.SessionTitle}}</a>{{end}}</p>
 </div>
-</details>
 </article>
 {{else}}<p class="hint empty">nothing here</p>{{end}}
 </div>

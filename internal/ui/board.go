@@ -15,6 +15,11 @@ import (
 	"butler/internal/store"
 )
 
+// doneCookie remembers whether the Done column is collapsed. The checkbox
+// itself is preserved across live board swaps; the cookie is for the next
+// full page load.
+const doneCookie = "butler_done_collapsed"
+
 type assignChoice struct {
 	ID    string
 	Label string
@@ -58,10 +63,11 @@ type boardColumn struct {
 }
 
 type boardPage struct {
-	Notice   string
-	Agents   []assignChoice
-	Sessions []store.Session
-	Columns  []boardColumn
+	Notice        string
+	Agents        []assignChoice
+	Sessions      []store.Session
+	Columns       []boardColumn
+	DoneCollapsed bool
 }
 
 func statusLabel(status string) string {
@@ -235,6 +241,11 @@ func agentChoiceLabel(a *store.Agent) string {
 	return label
 }
 
+func doneCollapsed(r *http.Request) bool {
+	c, err := r.Cookie(doneCookie)
+	return err == nil && c.Value == "1"
+}
+
 func (p *Panel) boardPage(w http.ResponseWriter, r *http.Request) {
 	if !p.requirePanel(w, r) {
 		return
@@ -245,7 +256,46 @@ func (p *Panel) boardPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	page.Notice = p.sessions.takeNotice(p.panelToken(r))
+	page.DoneCollapsed = doneCollapsed(r)
 	p.render(w, http.StatusOK, "board.tmpl", page)
+}
+
+// toggleDone remembers whether the Done column is collapsed. The checkbox
+// flips the layout immediately; this request stores the choice in a cookie
+// so a reload matches, and returns the columns so the open board can swap
+// them without leaving the page.
+func (p *Panel) toggleDone(w http.ResponseWriter, r *http.Request) {
+	if !p.requirePanel(w, r) {
+		return
+	}
+	if !sameOrigin(r) {
+		http.Error(w, "cross-origin rejected", http.StatusForbidden)
+		return
+	}
+	if err := parsePanelForm(r); err != nil && r.ContentLength > 0 {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	collapsed := r.FormValue("collapsed") == "1"
+	value := "0"
+	if collapsed {
+		value = "1"
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: doneCookie, Value: value, Path: "/panel", HttpOnly: true,
+		SameSite: http.SameSiteLaxMode, MaxAge: 365 * 24 * 3600,
+	})
+	if r.Header.Get("HX-Request") != "" {
+		page, err := p.loadBoard(r.Context())
+		if err != nil {
+			p.httpError(w, "store error", http.StatusInternalServerError)
+			return
+		}
+		page.DoneCollapsed = collapsed
+		p.renderFragment(w, "board-columns", page)
+		return
+	}
+	http.Redirect(w, r, "/panel/board", http.StatusSeeOther)
 }
 
 func (p *Panel) boardStream(w http.ResponseWriter, r *http.Request) {
@@ -269,6 +319,7 @@ func (p *Panel) boardStream(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return
 		}
+		page.DoneCollapsed = doneCollapsed(r)
 		writeSSE(w, flusher, "board", p.fragment("board-columns", page))
 	}
 	ticker := time.NewTicker(p.Heartbeat)

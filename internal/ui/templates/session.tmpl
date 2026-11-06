@@ -48,16 +48,22 @@
 </form>{{end}}
 </section>
 </aside>
-<section class="chat-pane">
-<div id="messages" data-stream="/panel/sessions/{{.Session.ID}}/stream?after={{.LatestSeq}}" data-audience="{{.Audience}}" data-reads="{{.Reads}}">
+<section class="chat-pane" hx-ext="sse" sse-connect="/panel/sessions/{{.Session.ID}}/stream?after={{.LatestSeq}}">
+<div sse-swap="message" hx-target="#messages" hx-swap="afterbegin"></div>
+<div sse-swap="presence" hx-target="#participants" hx-swap="outerHTML"></div>
+<div sse-swap="reads" hx-target="#oob" hx-swap="innerHTML"></div>
+<div sse-swap="activity" hx-target="#oob" hx-swap="innerHTML"></div>
+<div id="oob" hidden></div>
+<div id="messages">
 {{range .Messages}}{{template "message" .}}{{end}}
 </div>
-{{if .Archived}}<p class="hint compose-hint">Archived — reopen it from the sessions list to post again.</p>{{else}}<form id="compose" method="post" action="/panel/sessions/{{.Session.ID}}/messages">
-<textarea name="content" placeholder="Send a message as admin… (type @ to mention agents)" required data-mentionables="{{.Mentionables}}"></textarea>
+{{if .Archived}}<p class="hint compose-hint">Archived — reopen it from the sessions list to post again.</p>{{else}}<form id="compose" method="post" action="/panel/sessions/{{.Session.ID}}/messages" hx-post="/panel/sessions/{{.Session.ID}}/messages" hx-target="#oob" hx-swap="innerHTML" hx-disabled-elt="find button">
+{{template "composer" .Composer}}
 <button type="submit">Send</button>
+<div id="mention-menu"></div>
 </form>{{end}}
 </section>
 </main>
-<script src="{{asset "app.js"}}"></script>
+{{template "htmx" .}}
 </body>
 </html>

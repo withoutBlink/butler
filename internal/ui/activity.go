@@ -2,18 +2,18 @@ package ui
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"time"
 
 	"butler/internal/store"
 )
 
-// participantRow is one sidebar entry: the agent plus its derived activity,
-// so the participants fragment can show the indicator without a second lookup.
+// participantRow is one sidebar entry: the agent plus its derived activity
+// and the seq its membership starts at (read-mark audience).
 type participantRow struct {
 	store.Agent
-	Activity store.ActivityView
+	Activity  store.ActivityView
+	JoinedSeq int64
 }
 
 // dashPerson is a dashboard session participant with the same indicator.
@@ -45,19 +45,34 @@ func (p *Panel) loadActivity(ctx context.Context) store.ActivitySnapshot {
 	})
 }
 
-func withActivity(agents []store.Agent, snap store.ActivitySnapshot) []participantRow {
-	rows := make([]participantRow, len(agents))
-	for i, a := range agents {
-		rows[i] = participantRow{Agent: a, Activity: snap.ByAgent[a.ID]}
+func (p *Panel) decorateParticipants(ctx context.Context, sid string, parts []store.Agent, snap store.ActivitySnapshot) []participantRow {
+	since := map[string]int64{}
+	if sid != "" {
+		if aud, err := p.Store.SessionAudience(ctx, sid); err == nil {
+			for _, m := range aud {
+				since[m.ID] = m.JoinedSeq
+			}
+		}
+	}
+	rows := make([]participantRow, len(parts))
+	for i, a := range parts {
+		rows[i] = participantRow{Agent: a, Activity: snap.ByAgent[a.ID], JoinedSeq: since[a.ID]}
 	}
 	return rows
 }
 
-func (p *Panel) writeActivity(ctx context.Context, w http.ResponseWriter, flusher http.Flusher) {
-	snap := p.loadActivity(ctx)
-	data, err := json.Marshal(snap.ByAgent)
-	if err != nil {
+// writeLiveMeta sends out-of-band HTML for the read chips and activity chips
+// of the messages currently on the session page. HTMX applies hx-swap-oob;
+// nothing in the browser computes the counts.
+func (p *Panel) writeLiveMeta(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, sid, event string) {
+	msgs, err := p.Store.SessionLatestMessages(ctx, sid, 200)
+	if err != nil || len(msgs) == 0 {
 		return
 	}
-	writeSSE(w, flusher, "activity", string(data))
+	vms := p.attachReadState(ctx, p.loadReadState(ctx, sid), msgs)
+	name := "live-reads"
+	if event == "activity" {
+		name = "live-activity"
+	}
+	writeSSE(w, flusher, event, p.fragment(name, vms))
 }

@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -20,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"butler/internal/auth"
 	"butler/internal/board"
@@ -216,6 +216,7 @@ func (p *Panel) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /panel/", p.dashboard)
 	mux.HandleFunc("GET /panel/board", p.boardPage)
 	mux.HandleFunc("GET /panel/board/stream", p.boardStream)
+	mux.HandleFunc("POST /panel/board/done", p.toggleDone)
 	mux.HandleFunc("POST /panel/tasks", p.createTask)
 	mux.HandleFunc("POST /panel/tasks/{id}", p.updateTask)
 	mux.HandleFunc("POST /panel/tasks/{id}/comment", p.commentTask)
@@ -229,6 +230,8 @@ func (p *Panel) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /panel/sessions/{id}/status", p.setSessionStatus)
 	mux.HandleFunc("POST /panel/sessions/{id}/delete", p.deleteSession)
 	mux.HandleFunc("POST /panel/sessions/{id}/messages", p.postMessage)
+	mux.HandleFunc("POST /panel/sessions/{id}/mentions", p.mentionSuggest)
+	mux.HandleFunc("POST /panel/sessions/{id}/mentions/apply", p.mentionApply)
 	mux.HandleFunc("POST /panel/sessions/{id}/context", p.putContext)
 	mux.HandleFunc("GET /panel/sessions/{id}/stream", p.stream)
 	mux.HandleFunc("POST /panel/agents/{id}/revoke", p.revokeAgent)
@@ -264,6 +267,9 @@ func (p *Panel) static(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ct := mime.TypeByExtension(filepath.Ext(name))
+	if strings.HasSuffix(name, ".js") {
+		ct = "text/javascript; charset=utf-8"
+	}
 	if ct == "" {
 		ct = "application/octet-stream"
 	}
@@ -546,19 +552,9 @@ type sessionViewData struct {
 	Messages     []uiMsg
 	ContextItems []store.ContextItem
 	LatestSeq    int64
-	// Mentionables is a JSON array of @autocomplete targets for the
-	// composer: every other participant's display name plus "all" (the
-	// server resolves @<title> as well as @<id>, @<kind> and @all).
-	Mentionables string
-	// Audience is a JSON array of the session's participants as the read
-	// marks need them ({id,name,kind,since,human}) and Reads a JSON object of
-	// participant id -> highest read seq. The store supplies id/name/kind and
-	// since (AudienceMember.JoinedSeq marshals as "since"); the panel adds
-	// human, true for the admin identity. app.js uses these (plus SSE
-	// "reads"/"audience" events) to keep the per-message read marks and
-	// their tooltips current without a page reload.
-	Audience string
-	Reads    string
+	// Composer is the message box. HTMX asks the server for @mention
+	// suggestions as the human types; the server completes the token.
+	Composer composerView
 	// Addable are the visible agents (roles) not yet in the session — the
 	// participants-area "add to meeting" picker.
 	Addable []agentOption
@@ -613,6 +609,25 @@ func (p *Panel) addableAgents(ctx context.Context, parts []store.Agent) []agentO
 	return out
 }
 
+// composerView is the message box. OOB replaces the textarea after a send
+// or a mention completion; Focus asks the browser to put the caret back.
+type composerView struct {
+	SessionID string
+	Value     string
+	OOB       bool
+	Focus     bool
+}
+
+// messageLong is the server's stand-in for measuring overflow: a message
+// with several lines, or a long single line, gets a checkbox that lifts the
+// CSS clamp. Short messages stay fully visible.
+func messageLong(s string) bool {
+	if strings.Count(s, "\n") >= 3 {
+		return true
+	}
+	return utf8.RuneCountInString(s) > 180
+}
+
 // uiMsg is a message plus the panel's read state for it.
 type uiMsg struct {
 	store.Message
@@ -623,6 +638,7 @@ type uiMsg struct {
 	ReadTip    string             // the mark's hover text: readers and non-readers
 	SenderName string             // sender's display name (session title); the id stays in data-sender/title
 	Activity   store.ActivityView // derived activity shown next to the author
+	Long       bool               // offer a CSS expand control; the server decides, not the browser
 }
 
 // readState is a session's read-cursor snapshot plus its display names: the
@@ -637,25 +653,6 @@ type readState struct {
 	members []store.AudienceMember
 	marks   map[string]int64
 	names   map[string]string
-}
-
-// audienceMember is a read-mark audience member as app.js consumes it: the
-// store's member plus an explicit human flag. The panel's human is its "admin"
-// identity (AdminAgentID), whatever kind row it has — it needs no read cursor
-// because a mark is only ever visible to it.
-type audienceMember struct {
-	store.AudienceMember
-	Human bool `json:"human"`
-}
-
-// audience returns the members as a slice that is never nil (app.js parses it
-// into a list, and an empty audience must marshal as [] rather than null).
-func (rs readState) audience() []audienceMember {
-	out := make([]audienceMember, 0, len(rs.members))
-	for _, m := range rs.members {
-		out = append(out, audienceMember{AudienceMember: m, Human: m.ID == AdminAgentID})
-	}
-	return out
 }
 
 func (p *Panel) loadReadState(ctx context.Context, sid string) readState {
@@ -725,7 +722,7 @@ func (p *Panel) attachReadState(ctx context.Context, rs readState, msgs []store.
 		return id
 	}
 	for i, m := range msgs {
-		vm := uiMsg{Message: m, SenderName: nameOf(m.SenderID), Activity: snap.ByAgent[m.SenderID]}
+		vm := uiMsg{Message: m, SenderName: nameOf(m.SenderID), Activity: snap.ByAgent[m.SenderID], Long: messageLong(m.Content)}
 		if m.Kind != "chat" {
 			out[i] = vm
 			continue
@@ -785,48 +782,20 @@ func (p *Panel) sessionView(w http.ResponseWriter, r *http.Request) {
 	if len(msgs) > 0 {
 		latest = msgs[len(msgs)-1].Seq
 	}
-	targets := make([]string, 0, len(parts)+1)
-	targets = append(targets, "all")
-	seenTarget := map[string]bool{"all": true}
-	for _, pa := range parts {
-		if pa.ID == AdminAgentID {
-			continue
-		}
-		// The menu shows display names (session titles), not ids: picking
-		// one writes "@<title>" and the server resolves names too. Untitled
-		// identities are labeled with their id, so the id stays mentionable.
-		label := pa.DisplayName
-		if label == "" {
-			label = pa.ID
-		}
-		if seenTarget[label] {
-			continue
-		}
-		seenTarget[label] = true
-		targets = append(targets, label)
-	}
-	mentionables, err := json.Marshal(targets)
-	if err != nil {
-		p.httpError(w, "store error", 500)
-		return
-	}
 	rs := p.loadReadState(ctx, sid)
-	readsJSON, err := json.Marshal(rs.marks)
-	if err != nil {
-		p.httpError(w, "store error", 500)
-		return
-	}
-	audienceJSON, err := json.Marshal(rs.audience())
-	if err != nil {
-		p.httpError(w, "store error", 500)
-		return
-	}
 	snap := p.loadActivity(ctx)
+	shown := p.attachReadState(ctx, rs, msgs)
+	// Newest first in the DOM. The log is a column-reverse flex, so the
+	// newest message sits at the visual bottom and the scroll origin stays
+	// there without a script. New SSE messages are inserted at the start.
+	for i, j := 0, len(shown)-1; i < j; i, j = i+1, j-1 {
+		shown[i], shown[j] = shown[j], shown[i]
+	}
 	p.render(w, http.StatusOK, "session.tmpl", sessionViewData{
 		Session:      *sess,
-		Participants: participantsView{SessionID: sid, CanRemove: sess.Status == "active", Agents: withActivity(parts, snap)},
-		Messages:     p.attachReadState(ctx, rs, msgs), ContextItems: items, LatestSeq: latest,
-		Mentionables: string(mentionables), Audience: string(audienceJSON), Reads: string(readsJSON),
+		Participants: participantsView{SessionID: sid, CanRemove: sess.Status == "active", Agents: p.decorateParticipants(ctx, sid, parts, snap)},
+		Messages:     shown, ContextItems: items, LatestSeq: latest,
+		Composer: composerView{SessionID: sid},
 		Addable:  p.addableAgents(ctx, parts),
 		Archived: sess.Status != "active",
 	})
@@ -1100,7 +1069,18 @@ func (p *Panel) postMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	p.Store.TouchAction(ctx, admin.ID)
 	p.fanout(ctx, sid)
-	p.renderFragment(w, "message", p.attachReadState(ctx, p.loadReadState(ctx, sid), []store.Message{*msg})[0])
+	vm := p.attachReadState(ctx, p.loadReadState(ctx, sid), []store.Message{*msg})[0]
+	// HTMX already has the stream open: the message arrives as an SSE event.
+	// The response only clears the composer (and any open mention menu).
+	// A plain form post still gets the message fragment.
+	if r.Header.Get("HX-Request") != "" {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_ = p.templates.ExecuteTemplate(w, "composer", composerView{SessionID: sid, OOB: true})
+		_ = p.templates.ExecuteTemplate(w, "mention-clear", nil)
+		return
+	}
+	p.renderFragment(w, "message", vm)
 }
 
 func (p *Panel) putContext(w http.ResponseWriter, r *http.Request) {
@@ -1161,8 +1141,15 @@ func (p *Panel) stream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	after := int64(0)
+	// EventSource sends Last-Event-ID when it reconnects. Message events use
+	// the seq as that id, so a dropped stream resumes instead of replaying.
+	if raw := r.Header.Get("Last-Event-ID"); raw != "" {
+		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > after {
+			after = n
+		}
+	}
 	if raw := r.URL.Query().Get("after"); raw != "" {
-		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
+		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > after {
 			after = n
 		}
 	}
@@ -1181,34 +1168,13 @@ func (p *Panel) stream(w http.ResponseWriter, r *http.Request) {
 	cursor := after
 	ticker := time.NewTicker(p.Heartbeat)
 	defer ticker.Stop()
-	// The page embeds the read marks it was rendered with; remember them so
-	// only advances get emitted as "reads" events.
-	lastMarks := map[string]int64{}
-	if marks, err := p.Store.ReadMarks(ctx, sid); err == nil {
-		lastMarks = marks
-	}
-	emitReads := func() {
-		marks, err := p.Store.ReadMarks(ctx, sid)
-		if err != nil {
-			return
-		}
-		for a, seq := range marks {
-			if seq <= lastMarks[a] {
-				continue
-			}
-			lastMarks[a] = seq
-			if data, err := json.Marshal(map[string]any{"agent": a, "seq": seq}); err == nil {
-				writeSSE(w, flusher, "reads", string(data))
-			}
-		}
-	}
 	sendMessages := func(msgs []store.Message) {
 		if len(msgs) == 0 {
 			return
 		}
 		vms := p.attachReadState(ctx, p.loadReadState(ctx, sid), msgs)
 		for _, vm := range vms {
-			writeSSE(w, flusher, "message", p.fragment("message", vm))
+			writeSSEID(w, flusher, "message", p.fragment("message", vm), strconv.FormatInt(vm.Seq, 10))
 			cursor = vm.Seq
 		}
 	}
@@ -1231,8 +1197,11 @@ func (p *Panel) stream(w http.ResponseWriter, r *http.Request) {
 			if p.Hub.Closed() {
 				return
 			}
-			emitReads()
-			p.writeActivity(ctx, w, flusher)
+			// A read advance re-renders the chips. The server applies the
+			// audience rule (including a member who joined later); the
+			// browser only swaps the HTML.
+			p.writeLiveMeta(ctx, w, flusher, sid, "reads")
+			p.writeLiveMeta(ctx, w, flusher, sid, "activity")
 		case <-ticker.C:
 			cancel()
 			// The presence re-send also refreshes the participants list, so a
@@ -1246,21 +1215,12 @@ func (p *Panel) stream(w http.ResponseWriter, r *http.Request) {
 					canRemove = sess.Status == "active"
 				}
 				snap := p.loadActivity(ctx)
-				writeSSE(w, flusher, "presence", p.fragment("participants", participantsView{SessionID: sid, CanRemove: canRemove, Agents: withActivity(parts, snap)}))
-				if data, err := json.Marshal(snap.ByAgent); err == nil {
-					writeSSE(w, flusher, "activity", string(data))
-				}
-				// The read-mark audience (members, names and join times)
-				// travels with the same heartbeat: a join or removal has to
-				// move the marks' denominator and tooltips, not only the
-				// sidebar.
-				if data, err := json.Marshal(p.loadReadState(ctx, sid).audience()); err == nil {
-					writeSSE(w, flusher, "audience", string(data))
-				}
+				writeSSE(w, flusher, "presence", p.fragment("participants", participantsView{SessionID: sid, CanRemove: canRemove, Agents: p.decorateParticipants(ctx, sid, parts, snap)}))
+				p.writeLiveMeta(ctx, w, flusher, sid, "activity")
+				p.writeLiveMeta(ctx, w, flusher, sid, "reads")
 			} else {
 				writeSSEPing(w, flusher)
 			}
-			emitReads()
 		case <-ctx.Done():
 			cancel()
 			return
@@ -1326,7 +1286,17 @@ func (p *Panel) httpError(w http.ResponseWriter, msg string, status int) {
 }
 
 func writeSSE(w io.Writer, flusher http.Flusher, event, data string) {
+	writeSSEID(w, flusher, event, data, "")
+}
+
+func writeSSEID(w io.Writer, flusher http.Flusher, event, data, id string) {
+	if id != "" {
+		fmt.Fprintf(w, "id: %s\n", id)
+	}
 	fmt.Fprintf(w, "event: %s\n", event)
+	if data == "" {
+		fmt.Fprint(w, "data: \n")
+	}
 	for _, line := range strings.Split(data, "\n") {
 		fmt.Fprintf(w, "data: %s\n", line)
 	}

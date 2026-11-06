@@ -133,8 +133,17 @@ tr.archived td { opacity: 0.6; }
    carries class "msg chat" (kind), and a bare .chat selector would hit
    those too (that bug made each message min-height: 70vh). */
 .chat-pane { display: flex; flex-direction: column; min-height: 70vh; }
-#messages { flex: 1; overflow-y: auto; max-height: 70vh; padding-right: 8px; }
-.msg { padding: 3px 0; border-bottom: 1px solid var(--row); line-height: 1.4; }
+/* Newest message is first in the DOM. column-reverse paints that at the
+   bottom and keeps the scroll origin there, so the log stays on the latest
+   line without a script. Scrolling up reads history and stays put. */
+#messages { flex: 1; display: flex; flex-direction: column-reverse; overflow-y: auto; max-height: 70vh; padding-right: 8px; }
+.msg { position: relative; padding: 3px 0; border-bottom: 1px solid var(--row); line-height: 1.4; }
+.expand-toggle, .fold, .done-toggle { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); border: 0; }
+.msg.clip .m-content { max-height: 7em; }
+.msg.clip .expand-toggle:checked ~ .m-content { max-height: none; }
+.expand-label { display: inline-block; color: var(--accent); font-size: 12px; cursor: pointer; }
+.msg.clip .expand-toggle:checked ~ .expand-label .when-clamped,
+.msg.clip .expand-toggle:not(:checked) ~ .expand-label .when-open { display: none; }
 .m-meta { color: var(--muted); font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .m-meta b { color: var(--fg); }
 /* Read mark: "✓k/N" agent participants (≠ sender) have received the message;
@@ -143,9 +152,7 @@ tr.archived td { opacity: 0.6; }
 .m-read.all { color: var(--ok); }
 /* Meta and content share one line; long messages clamp to a few lines and
    expand on click (see app.js markClamp). */
-.m-content { white-space: pre-wrap; word-break: break-word; margin-top: 0; max-height: 7em; overflow: hidden; }
-.m-content.clamped { cursor: pointer; }
-.m-content.expanded { max-height: none; }
+.m-content { white-space: pre-wrap; word-break: break-word; margin-top: 0; overflow: hidden; }
 .msg.system .m-content, .msg.context .m-content { color: var(--muted); font-style: italic; }
 .msg.system .kind { color: var(--system); }
 .msg.context .kind { color: var(--context); }
@@ -209,9 +216,25 @@ main.board-page .new-session { flex: 0 0 auto; }
 .move { display: flex; gap: 6px; margin-bottom: 6px; }
 .move select { flex: 1; }
 .move button { width: auto; padding: 6px 10px; }
-.card details { margin-top: 6px; }
-.card summary { cursor: pointer; color: var(--accent); font-size: 13px; }
-.card details form { margin-top: 8px; }
+.card-panel { display: none; }
+article.card > .fold-menu:checked ~ .card-panel { display: flex; }
+.fold-body { display: none; }
+.fold-block > .fold:checked ~ .fold-body { display: block; }
+.fold-block > .fold:checked ~ form.fold-body { display: flex; }
+.fold-block > label { cursor: pointer; color: var(--accent); font-size: 13px; }
+.menu-btn { position: absolute; top: 6px; right: 6px; z-index: 2; width: 32px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 6px; color: var(--fg); background: var(--row); font-size: 18px; line-height: 1; cursor: pointer; }
+article.card > .fold-menu:checked ~ .menu-btn { background: var(--border); }
+.menu-btn:hover { background: var(--row); color: var(--fg); }
+#done-collapsed:checked ~ .board .col[data-status="done"] { flex: 0 0 auto; max-height: none; }
+#done-collapsed:checked ~ .board .col[data-status="done"] .col-body { display: none; }
+#done-collapsed:checked ~ .board .when-open { display: none; }
+#done-collapsed:not(:checked) ~ .board .when-shut { display: none; }
+.col-toggle { cursor: pointer; }
+[popover] { background: var(--card); color: var(--fg); border: 1px solid var(--border); border-radius: 8px; padding: 16px; max-width: 380px; }
+[popover] p { margin: 0 0 12px; }
+[popover] form { display: flex; gap: 8px; }
+[popover] button { padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--fg); cursor: pointer; font: inherit; }
+[popover] button[type=submit] { background: var(--accent); color: #fff; border-color: transparent; }
 .card label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
 .log { list-style: none; margin: 8px 0; padding: 0; }
 .log li { padding: 4px 0; border-top: 1px solid var(--border); font-size: 13px; white-space: pre-wrap; }
@@ -247,7 +270,9 @@ main.board-page .new-session { flex: 0 0 auto; }
 .card:hover .card-menu > summary, .card:focus-within .card-menu > summary, .card-menu[open] > summary { opacity: 1; }
 .card-menu > summary:hover, .card-menu[open] > summary { background: var(--row); color: var(--fg); }
 .card-menu > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.card-panel { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--row); display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+.card-panel { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--row); flex-direction: column; gap: 6px; font-size: 12px; }
+article.card > .card-panel { display: none; }
+article.card > .fold-menu:checked ~ .card-panel { display: flex; }
 .card-panel .card-actions { margin: 0; }
 .card-panel .move { margin: 0; }
 .card-panel .card-actions button, .card-panel .move button { padding: 4px 10px; font-size: 12px; }

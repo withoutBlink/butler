@@ -129,7 +129,7 @@ func TestSessionViewAndPost(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("session view: %d", resp.StatusCode)
 	}
-	for _, want := range []string{"panel test", "existing message", `data-stream="/panel/sessions/s1/stream?after=`, "alpha", "alpha-host", "/tmp/proj"} {
+	for _, want := range []string{"panel test", "existing message", `sse-connect="/panel/sessions/s1/stream?after=`, "alpha", "alpha-host", "/tmp/proj"} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("session view missing %q in:\n%s", want, string(body))
 		}
@@ -890,21 +890,28 @@ func TestSessionViewMentionables(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	// The composer carries the @autocomplete targets (other participants by
-	// display title + all, "admin" itself excluded) as a JSON data attribute.
-	// html/template escapes quotes in attribute values as &#34;.
-	want := `data-mentionables="[&#34;all&#34;,&#34;Alpha bot&#34;]"`
-	if !strings.Contains(string(body), want) {
-		t.Fatalf("session view missing mentionables %q in:\n%s", want, string(body))
+	// Suggestions come from the server as the human types @. Titles are
+	// offered; an id is not, when the role has a display title.
+	if !strings.Contains(string(body), `hx-post="/panel/sessions/s1/mentions"`) {
+		t.Fatalf("composer should ask the server for mentions:\n%s", string(body))
 	}
-	// The id is not offered when the agent has a title (the id still shows
-	// up in the data-agents map, which is what read marks resolve against).
-	frag := string(body)
-	const attr = `data-mentionables="`
-	frag = frag[strings.Index(frag, attr)+len(attr):]
-	frag = frag[:strings.Index(frag, `"`)]
-	if strings.Contains(frag, "codex:alpha:proj") {
-		t.Fatalf("mentionables should list titles, not ids: %s", frag)
+	resp, err = client.PostForm(srv.URL+"/panel/sessions/s1/mentions", url.Values{"content": {"ping @Al"}})
+	if err != nil {
+		t.Fatalf("mentions: %v", err)
+	}
+	sug, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(sug), "@Alpha bot") || strings.Contains(string(sug), "codex:alpha:proj") {
+		t.Fatalf("mention menu: %d %s", resp.StatusCode, sug)
+	}
+	resp, err = client.PostForm(srv.URL+"/panel/sessions/s1/mentions/apply", url.Values{"content": {"ping @Al"}, "mention": {"Alpha bot"}})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	applied, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(applied), "ping @Alpha bot ") {
+		t.Fatalf("mention apply: %d %s", resp.StatusCode, applied)
 	}
 }
 
@@ -940,16 +947,10 @@ func TestSessionViewReadMarks(t *testing.T) {
 	if !strings.Contains(string(body), `✓0/2`) {
 		t.Fatalf("session view missing unread mark 0/2 in:\n%s", string(body))
 	}
-	// Audience includes the human. Each member's "since" is the seq its
-	// membership starts at: admin created the session (0 = present from the
-	// start), the two agents were added with it.
-	if !strings.Contains(string(body), `data-audience="[`) ||
-		!strings.Contains(string(body), `&#34;id&#34;:&#34;admin&#34;,&#34;name&#34;:&#34;Admin&#34;,&#34;kind&#34;:&#34;human&#34;,&#34;since&#34;:0,&#34;human&#34;:true`) ||
-		!strings.Contains(string(body), `&#34;id&#34;:&#34;opencode:beta:proj&#34;,&#34;name&#34;:&#34;opencode:beta:proj&#34;,&#34;kind&#34;:&#34;opencode&#34;,&#34;since&#34;:0`) {
-		t.Fatalf("session view missing audience in:\n%s", string(body))
-	}
-	if !strings.Contains(string(body), `data-reads="{}"`) {
-		t.Fatalf("session view missing empty data-reads in:\n%s", string(body))
+	// Membership watermarks are on the participant rows (0 = there from the start).
+	if !strings.Contains(string(body), `data-agent="admin" data-since="0"`) ||
+		!strings.Contains(string(body), `data-agent="opencode:beta:proj" data-since="0"`) {
+		t.Fatalf("session view missing membership watermarks in:\n%s", string(body))
 	}
 
 	// One agent waits (cursor lands on the message) → 1/2, not "all".
@@ -1013,11 +1014,8 @@ func TestSessionViewReadMarks(t *testing.T) {
 	}
 	// The late member's membership starts at its join notice's seq (3: the two
 	// chats above), which is what excludes it from the older messages.
-	if !strings.Contains(string(body), `&#34;id&#34;:&#34;codex:late:proj&#34;,&#34;name&#34;:&#34;codex:late:proj&#34;,&#34;kind&#34;:&#34;codex&#34;,&#34;since&#34;:3`) {
-		t.Fatalf("audience should pin the late joiner to its join seq in:\n%s", string(body))
-	}
-	if !strings.Contains(string(body), `data-reads="{&#34;codex:alpha:proj&#34;:1,&#34;opencode:beta:proj&#34;:1}"`) {
-		t.Fatalf("data-reads should carry both agent cursors in:\n%s", string(body))
+	if !strings.Contains(string(body), `data-agent="codex:late:proj" data-since="3"`) {
+		t.Fatalf("participant row should pin the late joiner to its join seq in:\n%s", string(body))
 	}
 
 	// A removal shrinks N retroactively: the removed member has no read state
@@ -1127,8 +1125,8 @@ func TestReadMarksLateJoinerHuman(t *testing.T) {
 	}
 	// The human's watermark is its join notice's seq (2: the one message sent
 	// before it), which is exactly what excludes it from that message.
-	if !strings.Contains(string(body), `&#34;id&#34;:&#34;admin&#34;,&#34;name&#34;:&#34;Admin&#34;,&#34;kind&#34;:&#34;human&#34;,&#34;since&#34;:2,&#34;human&#34;:true`) {
-		t.Fatalf("audience should pin the late human to its join seq in:\n%s", string(body))
+	if !strings.Contains(string(body), `data-agent="admin" data-since="2"`) {
+		t.Fatalf("participant row should pin the late human to its join seq in:\n%s", string(body))
 	}
 }
 
@@ -1195,11 +1193,11 @@ func TestSSEStreamReads(t *testing.T) {
 		if ev.name == "reads" && strings.Contains(ev.data, "codex:alpha:proj") {
 			gotReads = true
 		}
-		// The audience is raw JSON (no HTML escaping): the human is flagged
-		// and the late joiner carries the seq its membership starts at.
-		if ev.name == "audience" &&
-			strings.Contains(ev.data, `"id":"admin","name":"Admin","kind":"human","since":0,"human":true`) &&
-			strings.Contains(ev.data, `"id":"codex:late:proj","name":"codex:late:proj","kind":"codex","since":2`) {
+		// The participants fragment carries each member's join watermark.
+		// The late joiner's is its join notice (seq 2), so older messages
+		// stay out of its audience. The chips in the reads event are the
+		// HTML the browser swaps; they already apply that rule.
+		if ev.name == "presence" && strings.Contains(ev.data, `data-agent="codex:late:proj" data-since="2"`) {
 			gotAudience = true
 		}
 	}
@@ -1210,7 +1208,7 @@ func TestSSEStreamReads(t *testing.T) {
 		t.Fatalf("expected reads event for codex:alpha:proj, got %v", events)
 	}
 	if !gotAudience {
-		t.Fatalf("expected audience event with the human and the late joiner, got %v", events)
+		t.Fatalf("expected presence event with the late joiner's watermark, got %v", events)
 	}
 }
 
@@ -1515,7 +1513,7 @@ func TestPanelRemoveParticipant(t *testing.T) {
 		`action="/panel/sessions/s1/participants/admin/remove"`,
 		`aria-label="Remove Fix read marks from this session"`,
 		`class="rowbtn"`,
-		`onclick="return confirm('Remove Fix read marks from this session?`,
+		`Remove Fix read marks from this session?`,
 	} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("participants sidebar missing %q in:\n%s", want, string(body))
@@ -1653,7 +1651,7 @@ func TestBoardPage(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("board status: %d %s", resp.StatusCode, body)
 	}
-	for _, want := range []string{"To do", "In progress", "Blocked", "Review", "Done", "Alpha", "New task", `data-stream="/panel/board/stream"`} {
+	for _, want := range []string{"To do", "In progress", "Blocked", "Review", "Done", "Alpha", "New task", `sse-connect="/panel/board/stream"`} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("board missing %q:\n%s", want, body)
 		}
@@ -1895,13 +1893,13 @@ func TestActivityIndicators(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	page := string(body)
-	for _, want := range []string{"Alpha", `p-working`, `act-label">working`, "Ship it"} {
+	for _, want := range []string{"Alpha", `meta-pill p-working`, ">working<", "Ship it"} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("board missing %q:\n%s", want, page)
 		}
 	}
-	if strings.Contains(page, "stalled-tag") {
-		t.Fatalf("a live owner should not be stalled:\n%s", page)
+	if strings.Contains(page, "stalled-tag") || strings.Count(page, ">stalled<") != 0 {
+		t.Fatalf("a live owner should not be stalled, and stalled is not a second badge:\n%s", page)
 	}
 
 	resp, err = client.Get(srv.URL + "/panel/sessions/s1")
@@ -1912,6 +1910,7 @@ func TestActivityIndicators(t *testing.T) {
 	resp.Body.Close()
 	page = string(body)
 	for _, want := range []string{
+		`id="participants"`,
 		`p-working`,
 		`<b title="alpha">Alpha</b>`,
 		`<span class="id">Alpha</span>`,
@@ -1920,6 +1919,9 @@ func TestActivityIndicators(t *testing.T) {
 		if !strings.Contains(page, want) {
 			t.Fatalf("session missing %q:\n%s", want, page)
 		}
+	}
+	if strings.Contains(page, `id="act-`) {
+		t.Fatalf("chat lines should not carry an activity chip:\n%s", page)
 	}
 
 	resp, err = client.Get(srv.URL + "/panel/")
@@ -1943,9 +1945,12 @@ func TestActivityIndicators(t *testing.T) {
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 	page = string(body)
-	for _, want := range []string{`p-stalled`, `stalled-tag">stalled`, "Alpha"} {
+	for _, want := range []string{`meta-pill p-stalled`, ">stalled<", "Alpha", `card stalled`} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("stalled board missing %q:\n%s", want, page)
 		}
+	}
+	if strings.Contains(page, "stalled-tag") || strings.Count(page, ">stalled<") != 1 {
+		t.Fatalf("stalled should appear once, as the owner pill:\n%s", page)
 	}
 }

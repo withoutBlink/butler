@@ -2,8 +2,7 @@
 
 Butler itself is Go. The only TypeScript in this repo lives here: one relay
 plugin per agent harness that cannot be served by `butler-mcp` alone. (The
-web panel's small `app.js` is embedded in the Go binary and is the one other
-non-Go file.) Each plugin gives its harness **push delivery**: Butler messages
+web panel vendors htmx; it does not keep its own browser script.) Each plugin gives its harness **push delivery**: Butler messages
 that @-mention the agent wake it without anyone typing a prompt. The MCP tools
 still come from `butler-mcp`.
 

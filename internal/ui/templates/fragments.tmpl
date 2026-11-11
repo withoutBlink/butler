@@ -1,6 +1,8 @@
 {{define "htmx"}}<script src="{{asset "vendor/htmx.min.js"}}"></script>
 <script src="{{asset "vendor/sse.js"}}"></script>{{end}}
 {{define "activity"}}{{if .State}}<span class="presence p-{{.State}}" title="{{.Title}}"><span class="act act-{{.State}}" aria-hidden="true"></span><span class="act-label">{{.State}}</span></span>{{end}}{{end}}
+{{/* One truncated name in the dashboard sessions table. */}}
+{{define "part-line"}}<li><span class="part-name" title="{{.Tip}}">{{template "activity" .Activity}}<span class="clip">{{if .DisplayName}}{{.DisplayName}}{{else}}{{.ID}}{{end}}</span></span></li>{{end}}
 {{/* One nested session in the new-session picker. The value is that role's id. */}}
 {{define "roster-pick"}}<label class="pick pick-session" title="{{.Tip}}"><input type="checkbox" name="agents" value="{{.ID}}"{{if .Checked}} checked{{end}}> {{template "activity" .Activity}}<span class="id clip">{{.Title}}</span>{{if .Default}} <span class="default-tag">default</span>{{end}}</label>{{end}}
 {{/* The same session under its teammate in the agents table, with a kick. */}}

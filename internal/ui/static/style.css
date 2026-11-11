@@ -83,6 +83,15 @@ details.earlier { margin-top: 2px; }
 .session-list li .kick { margin-left: auto; }
 .hint { color: var(--muted); font-size: 13px; }
 .preview { color: var(--muted); font-size: 12px; }
+/* Session participants: a few names, each on one line. The rest stay under
+   “+N more”, and that list scrolls so opening it does not stretch the page. */
+.part-list { list-style: none; margin: 0; padding: 0; }
+.part-name { display: flex; align-items: center; gap: 4px; min-width: 0; max-width: 240px; }
+.part-name .presence { flex: 0 0 auto; }
+.part-name .clip { flex: 1 1 auto; }
+.part-more summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.part-more summary:hover { color: var(--fg); }
+.part-more .part-list { max-height: 140px; overflow: auto; margin-top: 4px; }
 table { border-collapse: collapse; width: 100%; table-layout: auto; }
 td, th { text-align: left; padding: 8px 10px; border-top: 1px solid var(--border); vertical-align: top; }
 th { border-top: none; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }

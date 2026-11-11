@@ -376,6 +376,81 @@ func TestDashboardScalesLongTitles(t *testing.T) {
 	assertParticipants(t, st, sid, "admin", "other-1")
 }
 
+func TestDashboardCondensesSessionParticipants(t *testing.T) {
+	srv, st, _, adminTok := newPanel(t)
+	ctx := context.Background()
+	now := time.Now().Unix()
+	long := func(name string) string {
+		return strings.Repeat("Session member with a very long display name ", 3) + name
+	}
+	type member struct {
+		id   string
+		seen int64
+	}
+	members := []member{
+		{"live-new", now},
+		{"live-old", now - 15},
+		{"off-1", now - 2*3600},
+		{"off-2", now - 3*3600},
+		{"off-3", now - 4*3600},
+		{"off-4", now - 5*3600},
+		{"off-5", now - 6*3600},
+		{"off-6", now - 7*3600},
+	}
+	for _, m := range members {
+		if _, err := st.CreateAgent(ctx, m.id, long(m.id), "codex", "h-"+m.id, "/work/"+m.id, ""); err != nil {
+			t.Fatalf("create %s: %v", m.id, err)
+		}
+		seen := m.seen
+		if err := st.SetContactTimes(ctx, m.id, &seen, nil); err != nil {
+			t.Fatalf("seen %s: %v", m.id, err)
+		}
+	}
+	if _, err := st.CreateSession(ctx, "crowd", "Crowd", "live-new", nil); err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	for _, m := range members[1:] {
+		if _, err := st.JoinSession(ctx, "crowd", m.id); err != nil {
+			t.Fatalf("join %s: %v", m.id, err)
+		}
+	}
+	if _, err := st.CreateAgent(ctx, "pair-a", "Pair A", "pi", "h", "/p", ""); err != nil {
+		t.Fatalf("pair: %v", err)
+	}
+	if _, err := st.CreateSession(ctx, "pair", "Pair", "pair-a", []string{"live-new"}); err != nil {
+		t.Fatalf("pair session: %v", err)
+	}
+
+	client := newBrowser(t)
+	login(t, client, srv.URL, adminTok)
+	body := getDash(t, client, srv.URL)
+	sessions := section(body, `<section class="sessions">`, `</section>`)
+	crowd := tableRow(sessions, ">Crowd</a>")
+	if crowd == "" {
+		t.Fatalf("missing crowd row:\n%s", sessions)
+	}
+	if !strings.Contains(crowd, `4 more`) || !strings.Contains(crowd, `class="part-more"`) {
+		t.Fatalf("crowd row should collapse the tail:\n%s", crowd)
+	}
+	detailsAt := strings.Index(crowd, `<details class="part-more"`)
+	if detailsAt < 0 || strings.Index(crowd, long("live-new")) > detailsAt || strings.Index(crowd, long("live-old")) > detailsAt {
+		t.Fatalf("live names should be visible before the disclosure:\n%s", crowd)
+	}
+	if strings.Index(crowd, long("off-6")) < detailsAt {
+		t.Fatalf("oldest name should be inside +N more, not in the visible set:\n%s", crowd)
+	}
+	if !strings.Contains(crowd, `title="`+long("live-new")+` (live-new)"`) {
+		t.Fatalf("full name should be the tooltip:\n%s", crowd)
+	}
+	pair := tableRow(sessions, ">Pair</a>")
+	if strings.Contains(pair, `class="part-more"`) {
+		t.Fatalf("a two-person meeting should list everyone:\n%s", pair)
+	}
+	if !strings.Contains(pair, "Pair A") || !strings.Contains(pair, long("live-new")) {
+		t.Fatalf("pair row missing a name:\n%s", pair)
+	}
+}
+
 func ctxBackground() context.Context { return context.Background() }
 
 func section(s, start, end string) string {

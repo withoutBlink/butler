@@ -329,10 +329,12 @@ func (p *Panel) logout(w http.ResponseWriter, r *http.Request) {
 }
 
 type dashSessionRow struct {
-	Session      store.Session
-	Participants []dashPerson
-	LastPreview  string
-	LastAt       *int64
+	Session     store.Session
+	Shown       []dashPerson
+	More        []dashPerson
+	MoreLabel   string
+	LastPreview string
+	LastAt      *int64
 	// Global marks the fixed global session: no archive/reopen/delete control
 	// (the store refuses both), everyone is in it.
 	Global bool
@@ -397,7 +399,7 @@ func (p *Panel) dashboard(w http.ResponseWriter, r *http.Request) {
 		for j, a := range rawParts[i] {
 			people[j] = dashPerson{Agent: a, Activity: snap.ByAgent[a.ID]}
 		}
-		rows[i].Participants = people
+		rows[i].Shown, rows[i].More, rows[i].MoreLabel = condenseParticipants(people)
 	}
 	roster := p.groupVisible(ctx, agents, snap.ByAgent)
 	picks := filterRoster(roster, "", nil)

@@ -196,6 +196,52 @@ func TestGroupRosterSameHostDifferentWorkdir(t *testing.T) {
 	}
 }
 
+func TestCondenseParticipants(t *testing.T) {
+	long := strings.Repeat("Very long participant title ", 4)
+	people := []dashPerson{
+		{Agent: store.Agent{ID: "old-b", DisplayName: long + "old-b"}, Activity: store.ActivityView{State: store.ActivityOffline}},
+		{Agent: store.Agent{ID: "live-old", DisplayName: long + "live-old", LastSeenAt: unixPtr(100)}, Activity: store.ActivityView{State: store.ActivityIdle}},
+		{Agent: store.Agent{ID: "old-a", DisplayName: long + "old-a"}, Activity: store.ActivityView{State: store.ActivityOffline}},
+		{Agent: store.Agent{ID: "live-new", DisplayName: long + "live-new", LastSeenAt: unixPtr(200)}, Activity: store.ActivityView{State: store.ActivityWorking}},
+		{Agent: store.Agent{ID: "old-c", DisplayName: long + "old-c"}, Activity: store.ActivityView{State: store.ActivityOffline}},
+		{Agent: store.Agent{ID: "old-d", DisplayName: long + "old-d"}, Activity: store.ActivityView{State: store.ActivityOffline}},
+	}
+	// Give the offline ones a recency order: old-a newest among them.
+	people[0].LastSeenAt = unixPtr(10)
+	people[2].LastSeenAt = unixPtr(40)
+	people[4].LastSeenAt = unixPtr(30)
+	people[5].LastSeenAt = unixPtr(20)
+
+	shown, more, label := condenseParticipants(people)
+	if label != "+2 more" || len(shown) != dashParticipantLimit || len(more) != 2 {
+		t.Fatalf("split: shown %d more %d label %q", len(shown), len(more), label)
+	}
+	if idsOf(shown) != "live-new,live-old,old-a,old-c" {
+		t.Fatalf("shown order: %s", idsOf(shown))
+	}
+	if shown[0].Tip != long+"live-new (live-new)" {
+		t.Fatalf("tip: %q", shown[0].Tip)
+	}
+	if idsOf(more) != "old-d,old-b" {
+		t.Fatalf("more order: %s", idsOf(more))
+	}
+
+	small, rest, none := condenseParticipants(people[:2])
+	if len(small) != 2 || rest != nil || none != "" {
+		t.Fatalf("a short meeting stays open: %d %v %q", len(small), rest, none)
+	}
+}
+
+func idsOf(people []dashPerson) string {
+	out := make([]string, len(people))
+	for i, p := range people {
+		out[i] = p.ID
+	}
+	return strings.Join(out, ",")
+}
+
+func unixPtr(n int64) *int64 { return &n }
+
 func TestRosterCSSIsCompact(t *testing.T) {
 	b, err := os.ReadFile("static/style.css")
 	if err != nil {
@@ -205,6 +251,7 @@ func TestRosterCSSIsCompact(t *testing.T) {
 	for _, want := range []string{
 		".picks-scroll { max-height: 240px; overflow: auto;",
 		".agents-scroll { max-height: 360px; overflow: auto;",
+		".part-more .part-list { max-height: 140px; overflow: auto;",
 		"text-overflow: ellipsis",
 		"position: sticky",
 	} {

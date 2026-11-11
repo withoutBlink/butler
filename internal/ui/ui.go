@@ -214,6 +214,7 @@ func (p *Panel) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /panel/login", p.loginSubmit)
 	mux.HandleFunc("POST /panel/logout", p.logout)
 	mux.HandleFunc("GET /panel/", p.dashboard)
+	mux.HandleFunc("GET /panel/picks", p.picks)
 	mux.HandleFunc("GET /panel/board", p.boardPage)
 	mux.HandleFunc("GET /panel/board/stream", p.boardStream)
 	mux.HandleFunc("POST /panel/board/done", p.toggleDone)
@@ -339,7 +340,11 @@ type dashSessionRow struct {
 
 type dashData struct {
 	Sessions []dashSessionRow
-	Agents   []agentRow
+	// Roster is one row per teammate identity, live and recent first.
+	// Sibling roles that share kind + hostname + workdir nest under that row.
+	Roster []rosterIdentity
+	// Picks is the new-session list (admin omitted), ready for the filter box.
+	Picks pickerModel
 	// Pickable reports whether any agent other than "admin" exists (i.e.
 	// the new-session form has someone to pick).
 	Pickable bool
@@ -353,21 +358,6 @@ type dashData struct {
 type errorData struct {
 	Title   string
 	Message string
-}
-
-type agentRow struct {
-	ID   string
-	Kind string
-	// Title is the display title (the OpenCode/codex session title for
-	// per-session agents, its own UUID otherwise). Sub shows the id when
-	// it differs — it is what @mentions resolve against.
-	Title    string
-	Sub      string
-	Hostname string
-	Workdir  string
-	Online   bool
-	LastTxt  string
-	Activity store.ActivityView
 }
 
 func (p *Panel) dashboard(w http.ResponseWriter, r *http.Request) {
@@ -409,22 +399,46 @@ func (p *Panel) dashboard(w http.ResponseWriter, r *http.Request) {
 		}
 		rows[i].Participants = people
 	}
-	agentRows := make([]agentRow, 0, len(agents))
-	pickable := false
-	for _, a := range agents {
-		row := agentRow{ID: a.ID, Kind: a.Kind, Title: a.DisplayName, Hostname: a.Hostname, Workdir: a.Workdir, Online: agentOnline(&a), LastTxt: "never", Activity: snap.ByAgent[a.ID]}
-		if a.DisplayName != a.ID {
-			row.Sub = a.ID
-		}
-		if a.LastSeenAt != nil {
-			row.LastTxt = time.Unix(*a.LastSeenAt, 0).UTC().Format("15:04:05")
-		}
-		if a.ID != AdminAgentID {
-			pickable = true
-		}
-		agentRows = append(agentRows, row)
+	roster := p.groupVisible(ctx, agents, snap.ByAgent)
+	picks := filterRoster(roster, "", nil)
+	p.render(w, http.StatusOK, "dashboard.tmpl", dashData{Sessions: rows, Roster: roster, Picks: picks, Pickable: picks.Total > 0, Notice: p.sessions.takeNotice(p.panelToken(r))})
+}
+
+// picks re-renders the new-session roster for the filter box. Checked agent
+// ids travel with the request and come back as checkboxes, or as hidden
+// inputs when the filter hides them, so creating the session still invites
+// whoever was selected.
+func (p *Panel) picks(w http.ResponseWriter, r *http.Request) {
+	if !p.requirePanel(w, r) {
+		return
 	}
-	p.render(w, http.StatusOK, "dashboard.tmpl", dashData{Sessions: rows, Agents: agentRows, Pickable: pickable, Notice: p.sessions.takeNotice(p.panelToken(r))})
+	ctx := r.Context()
+	agents, err := p.Store.ListAgents(ctx)
+	if err != nil {
+		p.httpError(w, "store error", 500)
+		return
+	}
+	selected := map[string]bool{}
+	for _, id := range r.URL.Query()["agents"] {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			selected[id] = true
+		}
+	}
+	roster := p.groupVisible(ctx, agents, p.loadActivity(ctx).ByAgent)
+	p.renderFragment(w, "picks", filterRoster(roster, r.URL.Query().Get("pick"), selected))
+}
+
+func (p *Panel) groupVisible(ctx context.Context, agents []store.Agent, byAgent map[string]store.ActivityView) []rosterIdentity {
+	kindNames := map[string]string{}
+	if kinds, err := p.Store.ListKinds(ctx); err != nil {
+		p.Log.Error("list kinds", "err", err)
+	} else {
+		for _, k := range kinds {
+			kindNames[k.ID] = k.DisplayName
+		}
+	}
+	return groupRoster(agents, byAgent, kindNames)
 }
 
 // createSession handles the dashboard "New session" form: a title plus a
@@ -432,6 +446,13 @@ func (p *Panel) dashboard(w http.ResponseWriter, r *http.Request) {
 // automatically), every picked agent is added with a join notice so waiting
 // agents learn they were added, and the browser lands on the session page.
 // An agent can be in any number of sessions at once.
+//
+// The picker posts agent ids, never a group token. An identity checkbox's
+// value is already the one role (or the app-level agent) that should be
+// invited; a nested session checkbox posts that role's id. This handler
+// joins every distinct id, so checking the identity and a specific session
+// invites both, and checking the identity alone does not fan out to every
+// historical sibling.
 func (p *Panel) createSession(w http.ResponseWriter, r *http.Request) {
 	if !p.requirePanel(w, r) {
 		return

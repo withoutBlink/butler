@@ -57,11 +57,30 @@ h2, h3 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.05em; col
 .dashboard { display: grid; gap: 20px; }
 .agents, .sessions, .new-session { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
 .new-session-form { display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }
-.new-session-form input[type=text] { padding: 8px; border: 1px solid var(--border); border-radius: 6px; font: inherit; background: var(--bg); color: var(--fg); }
+.new-session-form input[type=text], .pick-filter { padding: 8px; border: 1px solid var(--border); border-radius: 6px; font: inherit; background: var(--bg); color: var(--fg); width: 100%; }
 .new-session-form button { align-self: flex-start; padding: 8px 16px; background: var(--accent); color: #fff; border: none; border-radius: 6px; cursor: pointer; }
-.picks { display: flex; flex-wrap: wrap; gap: 8px; }
-.pick { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 14px; cursor: pointer; }
-.pick input { margin: 0; }
+/* The roster scrolls inside the card. Rows are one line each, so a long
+   title ellipsizes instead of wrapping the card, and 20–50 teammates do
+   not push the sessions and agents cards down the page. */
+.picks-scroll { max-height: 240px; overflow: auto; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); }
+.pick-count { margin: 0; padding: 4px 8px; }
+.roster-item { display: block; max-width: 100%; padding: 2px 6px 4px; border-bottom: 1px solid var(--border); }
+.roster-item:last-child { border-bottom: none; }
+.pick { display: flex; align-items: center; gap: 6px; width: 100%; min-width: 0; padding: 3px 4px; background: transparent; border: none; border-radius: 4px; cursor: pointer; }
+.pick input { margin: 0; flex: 0 0 auto; }
+.pick .presence { margin-right: 0; flex: 0 0 auto; }
+.pick-sessions { display: flex; flex-direction: column; gap: 0; padding: 0 0 0 18px; }
+/* Live sessions start open so a current session can be targeted; earlier
+   ones stay collapsed so historical roles do not fill the list. */
+details.live, details.earlier { max-width: 100%; }
+details.live summary, details.earlier summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+details.live summary:hover, details.earlier summary:hover { color: var(--fg); }
+details.earlier { margin-top: 2px; }
+.default-tag { flex: 0 1 auto; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 8px; padding: 0 6px; }
+.session-list { list-style: none; margin: 6px 0 0; padding: 0 0 0 8px; }
+.session-list li { display: flex; flex-wrap: nowrap; align-items: center; gap: 6px; padding: 2px 0; min-width: 0; }
+.session-list .clip { flex: 1 1 auto; }
+.session-list li .kick { margin-left: auto; }
 .hint { color: var(--muted); font-size: 13px; }
 .preview { color: var(--muted); font-size: 12px; }
 table { border-collapse: collapse; width: 100%; table-layout: auto; }
@@ -69,6 +88,19 @@ td, th { text-align: left; padding: 8px 10px; border-top: 1px solid var(--border
 th { border-top: none; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
 td a { color: var(--accent); text-decoration: none; font-weight: 600; }
 .id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; overflow-wrap: anywhere; }
+/* Truncate a long title, host, or workdir. The full value stays on title=. */
+.clip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; overflow-wrap: normal; min-width: 0; max-width: 100%; }
+.pick .clip { flex: 1 1 auto; }
+.agents-scroll { max-height: 360px; overflow: auto; }
+.agents-scroll table { table-layout: fixed; }
+.agents-scroll th { position: sticky; top: 0; background: var(--card); z-index: 1; }
+.agents-scroll td, .agents-scroll th { padding: 4px 8px; }
+.agents-scroll .c-act { width: 96px; }
+.agents-scroll .c-kind { width: 88px; }
+.agents-scroll .c-host { width: 14%; }
+.agents-scroll .c-dir { width: 18%; }
+.agents-scroll .c-seen { width: 76px; }
+.agents-scroll .c-kick { width: 64px; }
 .sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
 .kick { padding: 2px 10px; background: transparent; color: var(--muted); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; font: inherit; font-size: 12px; }
 .kick:hover { color: var(--err); border-color: var(--err); }

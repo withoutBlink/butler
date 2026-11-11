@@ -20,10 +20,8 @@
 <h2>New session</h2>
 <form method="post" action="/panel/sessions" class="new-session-form">
 <input type="text" name="title" placeholder="Session title, e.g. “fix flaky integration tests”" required maxlength="200">
-<div class="picks">
-{{range .Agents}}{{if ne .ID "admin"}}<label class="pick" title="{{.ID}}"><input type="checkbox" name="agents" value="{{.ID}}"> <span class="id">{{if .Title}}{{.Title}}{{else}}{{.ID}}{{end}}</span></label>
-{{end}}{{end}}{{if .Pickable}} {{else}}<span class="hint">no agents registered yet — sessions with only you still work</span>{{end}}
-</div>
+{{if .Pickable}}<input type="search" name="pick" class="pick-filter" placeholder="Filter teammates" autocomplete="off" hx-get="/panel/picks" hx-trigger="keyup changed delay:200ms, search" hx-target="#picks" hx-swap="innerHTML" hx-include="this, #picks">
+<div id="picks">{{template "picks" .Picks}}</div>{{else}}<span class="hint">no agents registered yet — sessions with only you still work</span>{{end}}
 <button type="submit">Create session</button>
 </form>
 </section>
@@ -44,20 +42,28 @@
 </section>
 <section class="agents">
 <h2>Agents</h2>
+<div class="agents-scroll">
 <table>
-<tr><th>Activity</th><th>Kind</th><th>Title</th><th>Host</th><th>Working directory</th><th>Seen</th><th></th></tr>
-{{range .Agents}}
+<colgroup><col class="c-act"><col class="c-kind"><col class="c-title"><col class="c-host"><col class="c-dir"><col class="c-seen"><col class="c-kick"></colgroup>
+<thead><tr><th>Activity</th><th>Kind</th><th>Title</th><th>Host</th><th>Working directory</th><th>Seen</th><th></th></tr></thead>
+<tbody>
+{{range .Roster}}
 <tr>
 <td>{{template "activity" .Activity}}</td>
-<td>{{.Kind}}</td>
-<td>{{if .Title}}{{.Title}}{{else}}—{{end}}{{if .Sub}}<div class="sub id">{{.Sub}}</div>{{end}}</td>
-<td>{{if .Hostname}}{{.Hostname}}{{else}}—{{end}}</td>
-<td class="id" title="{{.Workdir}}">{{if .Workdir}}{{path .Workdir}}{{else}}—{{end}}</td>
+<td class="clip" title="{{.Kind}}">{{.Kind}}</td>
+<td><div class="clip" title="{{.Tip}}"><span class="id">{{if .Title}}{{.Title}}{{else}}—{{end}}</span>{{if .Invite}} <span class="default-tag" title="{{.Invite}}">{{.Invite}}</span>{{end}}</div>
+{{if .Live}}<details class="live" open><summary>{{.LiveLabel}}</summary><ul class="session-list">{{range .Live}}{{template "roster-row" .}}{{end}}</ul></details>{{end}}
+{{if .Earlier}}<details class="earlier"><summary>{{.EarlierLabel}}</summary><ul class="session-list">{{range .Earlier}}{{template "roster-row" .}}{{end}}</ul></details>{{end}}
+</td>
+<td class="clip" title="{{.Hostname}}">{{if .Hostname}}{{.Hostname}}{{else}}—{{end}}</td>
+<td class="id clip" title="{{.Workdir}}">{{if .Workdir}}{{.Workdir}}{{else}}—{{end}}</td>
 <td>{{.LastTxt}}</td>
-<td>{{if ne .ID "admin"}}<button type="button" class="kick" popovertarget="kick-{{.ID}}" title="Revoke this agent's tokens — its live processes get 401 until they re-register">kick</button><div id="kick-{{.ID}}" popover class="confirm"><p>Kick {{.ID}}? Its live processes will be disconnected until they re-register.</p><form method="post" action="/panel/agents/{{.ID}}/revoke"><button type="submit">Kick</button><button type="button" popovertarget="kick-{{.ID}}" popovertargetaction="hide">Cancel</button></form></div>{{end}}</td>
+<td>{{if .Kick}}{{template "roster-kick" .}}{{end}}</td>
 </tr>
 {{else}}<tr><td colspan="7">none</td></tr>{{end}}
+</tbody>
 </table>
+</div>
 </section>
 </main>
 {{template "htmx" .}}

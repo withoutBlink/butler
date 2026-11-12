@@ -214,6 +214,7 @@ func (p *Panel) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /panel/login", p.loginSubmit)
 	mux.HandleFunc("POST /panel/logout", p.logout)
 	mux.HandleFunc("GET /panel/", p.dashboard)
+	mux.HandleFunc("GET /panel/picks", p.picks)
 	mux.HandleFunc("GET /panel/board", p.boardPage)
 	mux.HandleFunc("GET /panel/board/stream", p.boardStream)
 	mux.HandleFunc("POST /panel/board/done", p.toggleDone)
@@ -328,10 +329,12 @@ func (p *Panel) logout(w http.ResponseWriter, r *http.Request) {
 }
 
 type dashSessionRow struct {
-	Session      store.Session
-	Participants []dashPerson
-	LastPreview  string
-	LastAt       *int64
+	Session     store.Session
+	Shown       []dashPerson
+	More        []dashPerson
+	MoreLabel   string
+	LastPreview string
+	LastAt      *int64
 	// Global marks the fixed global session: no archive/reopen/delete control
 	// (the store refuses both), everyone is in it.
 	Global bool
@@ -339,7 +342,11 @@ type dashSessionRow struct {
 
 type dashData struct {
 	Sessions []dashSessionRow
-	Agents   []agentRow
+	// Roster is one row per teammate identity, live and recent first.
+	// Sibling roles that share kind + hostname + workdir nest under that row.
+	Roster []rosterIdentity
+	// Picks is the new-session list (admin omitted), ready for the filter box.
+	Picks pickerModel
 	// Pickable reports whether any agent other than "admin" exists (i.e.
 	// the new-session form has someone to pick).
 	Pickable bool
@@ -353,21 +360,6 @@ type dashData struct {
 type errorData struct {
 	Title   string
 	Message string
-}
-
-type agentRow struct {
-	ID   string
-	Kind string
-	// Title is the display title (the OpenCode/codex session title for
-	// per-session agents, its own UUID otherwise). Sub shows the id when
-	// it differs — it is what @mentions resolve against.
-	Title    string
-	Sub      string
-	Hostname string
-	Workdir  string
-	Online   bool
-	LastTxt  string
-	Activity store.ActivityView
 }
 
 func (p *Panel) dashboard(w http.ResponseWriter, r *http.Request) {
@@ -407,24 +399,48 @@ func (p *Panel) dashboard(w http.ResponseWriter, r *http.Request) {
 		for j, a := range rawParts[i] {
 			people[j] = dashPerson{Agent: a, Activity: snap.ByAgent[a.ID]}
 		}
-		rows[i].Participants = people
+		rows[i].Shown, rows[i].More, rows[i].MoreLabel = condenseParticipants(people)
 	}
-	agentRows := make([]agentRow, 0, len(agents))
-	pickable := false
-	for _, a := range agents {
-		row := agentRow{ID: a.ID, Kind: a.Kind, Title: a.DisplayName, Hostname: a.Hostname, Workdir: a.Workdir, Online: agentOnline(&a), LastTxt: "never", Activity: snap.ByAgent[a.ID]}
-		if a.DisplayName != a.ID {
-			row.Sub = a.ID
-		}
-		if a.LastSeenAt != nil {
-			row.LastTxt = time.Unix(*a.LastSeenAt, 0).UTC().Format("15:04:05")
-		}
-		if a.ID != AdminAgentID {
-			pickable = true
-		}
-		agentRows = append(agentRows, row)
+	roster := p.groupVisible(ctx, agents, snap.ByAgent)
+	picks := filterRoster(roster, "", nil)
+	p.render(w, http.StatusOK, "dashboard.tmpl", dashData{Sessions: rows, Roster: roster, Picks: picks, Pickable: picks.Total > 0, Notice: p.sessions.takeNotice(p.panelToken(r))})
+}
+
+// picks re-renders the new-session roster for the filter box. Checked agent
+// ids travel with the request and come back as checkboxes, or as hidden
+// inputs when the filter hides them, so creating the session still invites
+// whoever was selected.
+func (p *Panel) picks(w http.ResponseWriter, r *http.Request) {
+	if !p.requirePanel(w, r) {
+		return
 	}
-	p.render(w, http.StatusOK, "dashboard.tmpl", dashData{Sessions: rows, Agents: agentRows, Pickable: pickable, Notice: p.sessions.takeNotice(p.panelToken(r))})
+	ctx := r.Context()
+	agents, err := p.Store.ListAgents(ctx)
+	if err != nil {
+		p.httpError(w, "store error", 500)
+		return
+	}
+	selected := map[string]bool{}
+	for _, id := range r.URL.Query()["agents"] {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			selected[id] = true
+		}
+	}
+	roster := p.groupVisible(ctx, agents, p.loadActivity(ctx).ByAgent)
+	p.renderFragment(w, "picks", filterRoster(roster, r.URL.Query().Get("pick"), selected))
+}
+
+func (p *Panel) groupVisible(ctx context.Context, agents []store.Agent, byAgent map[string]store.ActivityView) []rosterIdentity {
+	kindNames := map[string]string{}
+	if kinds, err := p.Store.ListKinds(ctx); err != nil {
+		p.Log.Error("list kinds", "err", err)
+	} else {
+		for _, k := range kinds {
+			kindNames[k.ID] = k.DisplayName
+		}
+	}
+	return groupRoster(agents, byAgent, kindNames)
 }
 
 // createSession handles the dashboard "New session" form: a title plus a
@@ -432,6 +448,11 @@ func (p *Panel) dashboard(w http.ResponseWriter, r *http.Request) {
 // automatically), every picked agent is added with a join notice so waiting
 // agents learn they were added, and the browser lands on the session page.
 // An agent can be in any number of sessions at once.
+//
+// A project checkbox posts "project:" plus the working directory. That
+// expands to the live (or most recently seen) role of each teammate in the
+// project — not every historical OpenCode session, and not the hidden
+// app-level client. A nested teammate posts that role's id alone.
 func (p *Panel) createSession(w http.ResponseWriter, r *http.Request) {
 	if !p.requirePanel(w, r) {
 		return
@@ -460,19 +481,14 @@ func (p *Panel) createSession(w http.ResponseWriter, r *http.Request) {
 		p.httpError(w, "store error", 500)
 		return
 	}
-	seen := map[string]bool{}
-	picked := []string{}
-	for _, a := range r.PostForm["agents"] {
-		a = strings.TrimSpace(a)
-		if a == "" || a == AdminAgentID || seen[a] {
-			continue
-		}
-		if _, err := p.Store.GetAgent(ctx, a); err != nil {
-			http.Error(w, "unknown agent "+a, http.StatusBadRequest)
+	picked, err := p.resolvePicks(ctx, r.PostForm["agents"])
+	if err != nil {
+		if errors.Is(err, errUnknownPick) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		seen[a] = true
-		picked = append(picked, a)
+		p.httpError(w, "store error", 500)
+		return
 	}
 	sid := ids.New()
 	if _, err := p.Store.CreateSession(ctx, sid, title, admin.ID, nil); err != nil {
@@ -487,6 +503,64 @@ func (p *Panel) createSession(w http.ResponseWriter, r *http.Request) {
 	}
 	p.fanout(ctx, sid)
 	http.Redirect(w, r, "/panel/sessions/"+sid, http.StatusSeeOther)
+}
+
+var errUnknownPick = errors.New("unknown agent")
+
+// resolvePicks turns form values into agent ids. A project token invites the
+// representative role of every teammate in that working directory.
+func (p *Panel) resolvePicks(ctx context.Context, tokens []string) ([]string, error) {
+	var projects map[string][]string
+	for _, token := range tokens {
+		if _, ok := projectWorkdir(strings.TrimSpace(token)); ok {
+			agents, err := p.Store.ListAgents(ctx)
+			if err != nil {
+				return nil, err
+			}
+			projects = map[string][]string{}
+			for _, row := range p.groupVisible(ctx, agents, p.loadActivity(ctx).ByAgent) {
+				if !row.Grouped {
+					continue
+				}
+				ids := make([]string, len(row.Members))
+				for i, m := range row.Members {
+					ids[i] = m.ID
+				}
+				projects[row.Workdir] = ids
+			}
+			break
+		}
+	}
+	var picked []string
+	seen := map[string]bool{}
+	add := func(id string) {
+		if id == "" || id == AdminAgentID || seen[id] {
+			return
+		}
+		seen[id] = true
+		picked = append(picked, id)
+	}
+	for _, token := range tokens {
+		token = strings.TrimSpace(token)
+		if token == "" || token == AdminAgentID {
+			continue
+		}
+		if wd, ok := projectWorkdir(token); ok {
+			ids := projects[wd]
+			if len(ids) == 0 {
+				return nil, fmt.Errorf("%w: project %s", errUnknownPick, wd)
+			}
+			for _, id := range ids {
+				add(id)
+			}
+			continue
+		}
+		if _, err := p.Store.GetAgent(ctx, token); err != nil {
+			return nil, fmt.Errorf("%w: %s", errUnknownPick, token)
+		}
+		add(token)
+	}
+	return picked, nil
 }
 
 // revokeAgent is the dashboard agents-table "kick" button. It evicts the

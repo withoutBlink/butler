@@ -449,12 +449,10 @@ func (p *Panel) groupVisible(ctx context.Context, agents []store.Agent, byAgent 
 // agents learn they were added, and the browser lands on the session page.
 // An agent can be in any number of sessions at once.
 //
-// The picker posts agent ids, never a group token. An identity checkbox's
-// value is already the one role (or the app-level agent) that should be
-// invited; a nested session checkbox posts that role's id. This handler
-// joins every distinct id, so checking the identity and a specific session
-// invites both, and checking the identity alone does not fan out to every
-// historical sibling.
+// A project checkbox posts "project:" plus the working directory. That
+// expands to the live (or most recently seen) role of each teammate in the
+// project — not every historical OpenCode session, and not the hidden
+// app-level client. A nested teammate posts that role's id alone.
 func (p *Panel) createSession(w http.ResponseWriter, r *http.Request) {
 	if !p.requirePanel(w, r) {
 		return
@@ -483,19 +481,14 @@ func (p *Panel) createSession(w http.ResponseWriter, r *http.Request) {
 		p.httpError(w, "store error", 500)
 		return
 	}
-	seen := map[string]bool{}
-	picked := []string{}
-	for _, a := range r.PostForm["agents"] {
-		a = strings.TrimSpace(a)
-		if a == "" || a == AdminAgentID || seen[a] {
-			continue
-		}
-		if _, err := p.Store.GetAgent(ctx, a); err != nil {
-			http.Error(w, "unknown agent "+a, http.StatusBadRequest)
+	picked, err := p.resolvePicks(ctx, r.PostForm["agents"])
+	if err != nil {
+		if errors.Is(err, errUnknownPick) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		seen[a] = true
-		picked = append(picked, a)
+		p.httpError(w, "store error", 500)
+		return
 	}
 	sid := ids.New()
 	if _, err := p.Store.CreateSession(ctx, sid, title, admin.ID, nil); err != nil {
@@ -510,6 +503,64 @@ func (p *Panel) createSession(w http.ResponseWriter, r *http.Request) {
 	}
 	p.fanout(ctx, sid)
 	http.Redirect(w, r, "/panel/sessions/"+sid, http.StatusSeeOther)
+}
+
+var errUnknownPick = errors.New("unknown agent")
+
+// resolvePicks turns form values into agent ids. A project token invites the
+// representative role of every teammate in that working directory.
+func (p *Panel) resolvePicks(ctx context.Context, tokens []string) ([]string, error) {
+	var projects map[string][]string
+	for _, token := range tokens {
+		if _, ok := projectWorkdir(strings.TrimSpace(token)); ok {
+			agents, err := p.Store.ListAgents(ctx)
+			if err != nil {
+				return nil, err
+			}
+			projects = map[string][]string{}
+			for _, row := range p.groupVisible(ctx, agents, p.loadActivity(ctx).ByAgent) {
+				if !row.Grouped {
+					continue
+				}
+				ids := make([]string, len(row.Members))
+				for i, m := range row.Members {
+					ids[i] = m.ID
+				}
+				projects[row.Workdir] = ids
+			}
+			break
+		}
+	}
+	var picked []string
+	seen := map[string]bool{}
+	add := func(id string) {
+		if id == "" || id == AdminAgentID || seen[id] {
+			return
+		}
+		seen[id] = true
+		picked = append(picked, id)
+	}
+	for _, token := range tokens {
+		token = strings.TrimSpace(token)
+		if token == "" || token == AdminAgentID {
+			continue
+		}
+		if wd, ok := projectWorkdir(token); ok {
+			ids := projects[wd]
+			if len(ids) == 0 {
+				return nil, fmt.Errorf("%w: project %s", errUnknownPick, wd)
+			}
+			for _, id := range ids {
+				add(id)
+			}
+			continue
+		}
+		if _, err := p.Store.GetAgent(ctx, token); err != nil {
+			return nil, fmt.Errorf("%w: %s", errUnknownPick, token)
+		}
+		add(token)
+	}
+	return picked, nil
 }
 
 // revokeAgent is the dashboard agents-table "kick" button. It evicts the

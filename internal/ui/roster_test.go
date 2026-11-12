@@ -4,106 +4,67 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"butler/internal/store"
 )
 
-func TestGroupRosterCrowdedSiblings(t *testing.T) {
-	const (
-		kind = "opencode"
-		host = "laptop"
-		dir  = "/work/app"
-	)
-	liveNew := agent("role-new", "Ship the roster", kind, host, dir, "ses-new", 2_000)
-	liveOld := agent("role-old-live", "Review the board", kind, host, dir, "ses-old-live", 1_500)
-	stale := agent("role-stale", "Ancient notes", kind, host, dir, "ses-stale", 100)
-	stalled := agent("role-stalled", "Stuck migration", kind, host, dir, "ses-stalled", 200)
-	codex := agent("codex-1", "Codex", "codex", "laptop", "/work/codex", "", 2_000)
+func TestGroupRosterByWorkdir(t *testing.T) {
+	const dir = "/work/app"
+	liveNew := agent("role-new", "Ship the roster", "opencode", "laptop", dir, "ses-new", 2_000)
+	liveOld := agent("role-old-live", "Review the board", "opencode", "laptop", dir, "ses-old-live", 1_500)
+	stale := agent("role-stale", "Ancient notes", "opencode", "laptop", dir, "ses-stale", 100)
+	codex := agent("codex-1", "Codex", "codex", "laptop", dir, "", 1_800)
 	pi := agent("pi-1", "Pi", "pi", "laptop", "/work/pi", "", 0)
-	// A second install of the same kind must not merge with the first, and
-	// must not share an unqualified "OpenCode" label.
-	otherA := agent("other-a", "Older board", kind, "otherbox", "/work/other", "ses-a", 300)
-	otherB := agent("other-b", "Even older", kind, "otherbox", "/work/other", "ses-b", 100)
+	admin := agent("admin", "Admin", "human", "", "", "", 0)
+	otherA := agent("other-a", "Older board", "opencode", "otherbox", "/work/other", "ses-a", 300)
+	otherB := agent("other-b", "Even older", "opencode", "otherbox", "/work/other", "ses-b", 100)
 
 	activity := map[string]store.ActivityView{
 		liveNew.ID: {State: store.ActivityIdle},
 		liveOld.ID: {State: store.ActivityWorking},
 		stale.ID:   {State: store.ActivityOffline},
-		stalled.ID: {State: store.ActivityStalled},
 		codex.ID:   {State: store.ActivityIdle},
 		pi.ID:      {State: store.ActivityOffline},
+		admin.ID:   {State: store.ActivityIdle},
 		otherA.ID:  {State: store.ActivityOffline},
 		otherB.ID:  {State: store.ActivityOffline},
 	}
-	// The hidden app-level client is not in this list — ListAgents already
-	// removed it. Grouping must not invent it.
-	roster := groupRoster([]store.Agent{stale, liveOld, pi, otherB, codex, liveNew, stalled, otherA}, activity, map[string]string{
-		kind: "OpenCode",
+	roster := groupRoster([]store.Agent{stale, liveOld, pi, otherB, codex, liveNew, admin, otherA}, activity, map[string]string{
+		"opencode": "OpenCode",
 	})
-
-	if len(roster) != 4 {
-		t.Fatalf("identities: got %d, want 4 (codex, pi, two opencode installs)", len(roster))
-	}
 	byTitle := map[string]rosterIdentity{}
 	for _, idn := range roster {
 		byTitle[idn.Title] = idn
 	}
-	codexRow, ok := byTitle["Codex"]
-	if !ok || codexRow.Grouped || codexRow.ID != "codex-1" || codexRow.Tip != "Codex (codex-1)" || !codexRow.Kick {
-		t.Fatalf("codex row: %+v", codexRow)
+	// Codex and the OpenCode sessions share a project. Pi is alone in its
+	// project, so it is just Pi. Admin has no workdir and stays ungrouped.
+	project, ok := byTitle["app"]
+	if !ok || !project.Grouped || project.ID != "project:"+dir || project.Workdir != dir {
+		t.Fatalf("project row: %+v titles %v", project, titles(roster))
 	}
-	if len(codexRow.Live) != 0 || len(codexRow.Earlier) != 0 {
-		t.Fatalf("single identity should not nest sessions: %+v", codexRow)
+	if project.Kick || project.MemberLabel != "2 teammates" {
+		t.Fatalf("project shape: %+v", project)
+	}
+	if memberIDs(project.Members) != "role-new,codex-1" {
+		t.Fatalf("teammates: %s", memberIDs(project.Members))
+	}
+	if project.Members[0].Title != "OpenCode" || !strings.Contains(project.Members[0].Tip, "Ship the roster") {
+		t.Fatalf("opencode teammate should name the live role: %+v", project.Members[0])
+	}
+	if !strings.Contains(project.Tip, dir) || !strings.Contains(project.Tip, "Codex") {
+		t.Fatalf("project tip: %q", project.Tip)
 	}
 	piRow := byTitle["Pi"]
-	if piRow.Grouped || piRow.ID != "pi-1" || piRow.Kick != true || piRow.LastTxt != "never" {
-		t.Fatalf("pi row: %+v", piRow)
+	if piRow.Grouped || piRow.ID != "pi-1" || len(piRow.Members) != 0 || piRow.Workdir != "/work/pi" {
+		t.Fatalf("single-agent project: %+v", piRow)
 	}
-
-	group, ok := byTitle["OpenCode · laptop"]
-	if !ok {
-		t.Fatalf("missing disambiguated laptop group, titles: %v", titles(roster))
+	adminRow := byTitle["Admin"]
+	if adminRow.Grouped || adminRow.Workdir != "" || adminRow.Kick {
+		t.Fatalf("admin: %+v", adminRow)
 	}
-	if group.ID != liveNew.ID || group.Activity.State != store.ActivityIdle {
-		t.Fatalf("identity checkbox should invite the freshest live role, got %+v", group)
-	}
-	if group.Tip != "OpenCode · laptop — Invites Ship the roster (role-new)" || group.Invite != "invites Ship the roster" {
-		t.Fatalf("tip: %q invite: %q", group.Tip, group.Invite)
-	}
-	if group.Kick {
-		t.Fatal("a group parent is not itself kickable")
-	}
-	if group.LiveLabel != "2 live sessions" || group.EarlierLabel != "2 earlier sessions" {
-		t.Fatalf("labels: live %q earlier %q", group.LiveLabel, group.EarlierLabel)
-	}
-	if sessionIDs(group.Live) != "role-new,role-old-live" {
-		t.Fatalf("live order: %s", sessionIDs(group.Live))
-	}
-	if !group.Live[0].Default || group.Live[1].Default {
-		t.Fatalf("default flag: %+v", group.Live)
-	}
-	// Stalled is not "live" — it is a quiet owner, collapsed with history.
-	if sessionIDs(group.Earlier) != "role-stalled,role-stale" {
-		t.Fatalf("earlier order: %s", sessionIDs(group.Earlier))
-	}
-	if group.Kind != "opencode" || group.Hostname != "laptop" || group.Workdir != "/work/app" {
-		t.Fatalf("group coordinates: %+v", group)
-	}
-	wantSeen := time.Unix(2_000, 0).UTC().Format("15:04:05")
-	if group.LastTxt != wantSeen {
-		t.Fatalf("seen: got %q want %q", group.LastTxt, wantSeen)
-	}
-
-	other, ok := byTitle["OpenCode · otherbox"]
-	if !ok {
-		t.Fatalf("missing other install, titles: %v", titles(roster))
-	}
-	if other.ID != "other-a" || other.LiveLabel != "" || other.EarlierLabel != "2 sessions" {
-		t.Fatalf("all-offline group: %+v", other)
-	}
-	if len(other.Live) != 0 || !other.Earlier[0].Default {
-		t.Fatalf("offline default: %+v", other.Earlier)
+	other := byTitle["OpenCode"]
+	if other.Grouped || other.ID != "other-a" || other.Workdir != "/work/other" {
+		t.Fatalf("sibling roles in their own project collapse to one teammate: %+v", other)
 	}
 }
 
@@ -152,17 +113,16 @@ func TestGroupRosterInviteRules(t *testing.T) {
 		t.Fatalf("last_action should win recency, got %s", roster[0].ID)
 	}
 
-	// When the app-level agent is actually listable it is the invite, even
-	// next to a newer live role. ListAgents does not return it in that
-	// situation; this locks the rule the picker falls back from.
+	// A live role is the teammate even if the app-level client is also in
+	// the list. The client is not who the checkbox invites.
 	client := agent("client", "client", "opencode", "h", "/w", "", 10)
 	role := agent("role", "Live role", "opencode", "h", "/w", "ses", 99)
 	roster = groupRoster([]store.Agent{role, client}, map[string]store.ActivityView{
 		"client": {State: store.ActivityOffline},
 		"role":   {State: store.ActivityWorking},
 	}, map[string]string{"opencode": "OpenCode"})
-	if roster[0].ID != "client" || roster[0].Title != "OpenCode" {
-		t.Fatalf("listable client should be the invite: %+v", roster[0])
+	if len(roster) != 1 || roster[0].ID != "role" || roster[0].Title != "OpenCode" {
+		t.Fatalf("live role should be the invite: %+v", roster)
 	}
 
 	// Untitled identity: the id is the label, and there is nothing else to show.
@@ -185,14 +145,16 @@ func TestGroupRosterSameHostDifferentWorkdir(t *testing.T) {
 		"d": {State: store.ActivityIdle},
 	}, map[string]string{"opencode": "OpenCode"})
 	if len(roster) != 2 {
-		t.Fatalf("got %d groups", len(roster))
+		t.Fatalf("got %d rows", len(roster))
 	}
 	got := map[string]string{}
 	for _, idn := range roster {
-		got[idn.Title] = idn.ID
+		got[idn.Workdir] = idn.ID
 	}
-	if got["OpenCode · laptop · alpha"] != "b" || got["OpenCode · laptop · beta"] != "d" {
-		t.Fatalf("workdir disambiguation: %v", got)
+	// Each directory has only OpenCode roles, so each is one teammate,
+	// labeled by the kind, not a project disclosure.
+	if got["/work/alpha"] != "b" || got["/work/beta"] != "d" {
+		t.Fatalf("one teammate per project: %v", got)
 	}
 }
 
@@ -317,8 +279,8 @@ func TestFilterRosterKeepsSelection(t *testing.T) {
 			t.Fatal("filter should drop Other person")
 		}
 	}
-	if !opencode.ForceOpen || len(opencode.Earlier) != 1 || opencode.Earlier[0].ID != "role-parser" {
-		t.Fatalf("session match should open just that session: %+v", opencode)
+	if opencode.ID != "role-parser" || opencode.Grouped || !strings.Contains(opencode.Tip, "Port the parser") {
+		t.Fatalf("session roles should be one teammate, inviting the recent one: %+v", opencode)
 	}
 }
 
@@ -341,13 +303,10 @@ func titles(roster []rosterIdentity) []string {
 	return out
 }
 
-func sessionIDs(sessions []rosterSession) string {
-	out := ""
-	for i, s := range sessions {
-		if i > 0 {
-			out += ","
-		}
-		out += s.ID
+func memberIDs(members []rosterMember) string {
+	out := make([]string, len(members))
+	for i, m := range members {
+		out[i] = m.ID
 	}
-	return out
+	return strings.Join(out, ",")
 }

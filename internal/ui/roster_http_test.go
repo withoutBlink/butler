@@ -26,7 +26,7 @@ func TestDashboardGroupsSiblingRoster(t *testing.T) {
 	if _, err := st.CreateAgent(ctx, "admin", "Admin", "human", "", "", ""); err != nil {
 		t.Fatalf("admin: %v", err)
 	}
-	if _, err := st.CreateAgent(ctx, "codex-1", "Codex", "codex", "laptop", "/work/codex", ""); err != nil {
+	if _, err := st.CreateAgent(ctx, "codex-1", "Codex", "codex", "laptop", "/work/app", ""); err != nil {
 		t.Fatalf("codex: %v", err)
 	}
 	if _, err := st.CreateAgent(ctx, "pi-1", "Pi", "pi", "laptop", "/work/pi", ""); err != nil {
@@ -101,95 +101,73 @@ func TestDashboardGroupsSiblingRoster(t *testing.T) {
 	form := section(body, `class="new-session-form"`, `</form>`)
 	agents := section(body, `<section class="agents">`, `</section>`)
 
-	// Teammates, not one chip per session: admin is omitted, the two
-	// OpenCode installs are groups, Codex and Pi stay single chips.
-	if got := strings.Count(form, `class="roster-item`); got != 4 {
-		t.Fatalf("picker identities: got %d want 4\n%s", got, form)
+	// One project for /work/app (Codex + OpenCode), Pi alone, the other
+	// OpenCode install alone. Historical sessions are not rows.
+	if got := strings.Count(form, `class="roster-item`); got != 3 {
+		t.Fatalf("picker rows: got %d want 3\n%s", got, form)
 	}
-	if got := strings.Count(form, `class="roster-item grouped"`); got != 2 {
-		t.Fatalf("grouped identities: got %d want 2\n%s", got, form)
+	if got := strings.Count(form, `class="roster-item grouped"`); got != 1 {
+		t.Fatalf("project groups: got %d want 1\n%s", got, form)
 	}
 	for _, want := range []string{
-		`value="codex-1"`, `value="pi-1"`,
-		`>Codex</span>`, `>Pi</span>`,
-		`>OpenCode · laptop</span>`, `>OpenCode · otherbox</span>`,
+		`value="project:/work/app"`,
+		`value="codex-1"`, `value="pi-1"`, `value="role-new"`,
+		`>app</span>`, `>Codex</span>`, `>OpenCode</span>`, `>Pi</span>`,
+		`2 teammates`,
 		`Invites Ship the roster (role-new)`,
-		`>invites Ship the roster</span>`,
-		`2 live sessions`, `3 earlier sessions`, `2 sessions`,
-		`value="role-new"`, `value="role-older-live"`, `value="role-ancient"`,
-		`value="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"`,
-		`class="live" open`, `class="earlier"`,
+		`title="/work/app — invites `,
 	} {
 		if !strings.Contains(form, want) {
 			t.Fatalf("picker missing %q\n%s", want, form)
 		}
 	}
-	if strings.Contains(form, `class="earlier" open`) {
-		t.Fatalf("historical sessions should stay collapsed:\n%s", form)
+	for _, banned := range []string{
+		`value="role-ancient"`, `value="role-older-live"`, `value="role-history"`,
+		`value="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"`,
+		`earlier sessions`, `live sessions`,
+	} {
+		if strings.Contains(form, banned) {
+			t.Fatalf("picker should not list historical session %q\n%s", banned, form)
+		}
 	}
-	// The identity checkbox and the nested default session both post role-new.
-	// No other laptop role is that value, and the hidden client is not a value.
-	if got := strings.Count(form, `value="role-new"`); got != 2 {
-		t.Fatalf("role-new values: got %d want 2 (identity + its session)", got)
-	}
-	if strings.Contains(sectionOf(form, "Codex"), "<details") {
-		t.Fatalf("single-identity chip should not nest sessions:\n%s", sectionOf(form, "Codex"))
-	}
-	if cls := detailsAround(form, ">Ancient notes</span>"); !strings.Contains(cls, `class="earlier"`) || strings.Contains(cls, "open") {
-		t.Fatalf("ancient session details: %q", cls)
-	}
-	if cls := detailsAround(form, ">Ship the roster</span>"); !strings.Contains(cls, `class="live"`) || !strings.Contains(cls, "open") {
-		t.Fatalf("live session details: %q", cls)
-	}
-	if cls := detailsAround(form, ">Other old</span>"); !strings.Contains(cls, `class="earlier"`) {
-		t.Fatalf("other install should be collapsed history: %q", cls)
+	if strings.Contains(sectionOf(form, "Pi"), "<details") {
+		t.Fatalf("a one-agent project should not be a disclosure:\n%s", sectionOf(form, "Pi"))
 	}
 
-	// One parent row per identity, kicks on the roles (including historical).
-	if got := strings.Count(agents, "<tr>"); got != 6 {
-		t.Fatalf("agents rows (header + 5 identities): got %d\n%s", got, agents)
+	// Header + admin + the app project + Pi + the other OpenCode.
+	if got := strings.Count(agents, "<tr>"); got != 5 {
+		t.Fatalf("agents rows: got %d\n%s", got, agents)
 	}
-	for _, id := range []string{"codex-1", "pi-1", "role-new", "role-older-live", "role-ancient", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "role-history", "other-recent", "other-old"} {
+	for _, id := range []string{"codex-1", "pi-1", "role-new", "other-recent"} {
 		if !strings.Contains(agents, `action="/panel/agents/`+id+`/revoke"`) {
 			t.Fatalf("agents table missing kick for %s\n%s", id, agents)
 		}
 	}
-	if strings.Count(body, "/revoke") != 9 {
-		t.Fatalf("revoke count: got %d want 9 (admin is not kickable)", strings.Count(body, "/revoke"))
+	if strings.Contains(agents, `action="/panel/agents/role-ancient/revoke"`) {
+		t.Fatalf("historical session should not have its own kick row:\n%s", agents)
 	}
-	if strings.Count(body, `id="kick-role-new"`) != 1 {
-		t.Fatalf("group parent must not duplicate the default role's kick")
+	if strings.Count(body, "/revoke") != 4 {
+		t.Fatalf("revoke count: got %d want 4", strings.Count(body, "/revoke"))
 	}
-	// The uuid is available on the role, not as a sub-line under the teammate.
-	if !strings.Contains(agents, `title="Fix read marks (aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee)"`) {
-		t.Fatalf("session id should stay available as a tooltip")
-	}
-	laptopRow := tableRow(agents, "OpenCode · laptop")
-	if !strings.Contains(laptopRow, `p-idle`) || strings.Contains(laptopRow[:strings.Index(laptopRow, "OpenCode · laptop")], "p-offline") {
-		t.Fatalf("group activity should be the live role's, got:\n%s", laptopRow)
+	appRow := tableRow(agents, ">app</span>")
+	if !strings.Contains(appRow, "OpenCode") || !strings.Contains(appRow, "Codex") {
+		t.Fatalf("project row should list teammates:\n%s", appRow)
 	}
 
-	// Identity checked, no specific extra session: invite only the default role.
-	// Not the hidden client, and not every historical sibling.
-	sid := createSession(t, client, srv.URL, "invite the teammate", "role-new")
+	// Checking the project invites each teammate's live role, not history.
+	sid := createSession(t, client, srv.URL, "invite the project", "project:/work/app")
+	assertParticipants(t, st, sid, "admin", "codex-1", "role-new")
+	assertNotParticipants(t, st, sid, hidden, "client-other", "role-older-live", "role-ancient", "role-history", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "pi-1", "other-recent")
+	assertJoinNotices(t, st, sid, 2, "Codex", "Ship the roster")
+
+	// Checking one nested teammate invites only that role.
+	sid = createSession(t, client, srv.URL, "just opencode", "role-new")
 	assertParticipants(t, st, sid, "admin", "role-new")
-	assertNotParticipants(t, st, sid, hidden, "client-other", "role-older-live", "role-ancient", "role-history", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "other-recent", "other-old", "codex-1", "pi-1")
-	assertJoinNotices(t, st, sid, 1, "Ship the roster")
+	assertNotParticipants(t, st, sid, "codex-1", hidden, "role-ancient")
 
-	// A specific historical session, and not the identity: only that role.
-	sid = createSession(t, client, srv.URL, "a particular session", "role-ancient")
-	assertParticipants(t, st, sid, "admin", "role-ancient")
-	assertNotParticipants(t, st, sid, "role-new", hidden)
-	assertJoinNotices(t, st, sid, 1, "Ancient notes")
-
-	// Identity plus another session invites both and drops nothing.
-	sid = createSession(t, client, srv.URL, "teammate and a session", "role-new", "role-history")
-	assertParticipants(t, st, sid, "admin", "role-new", "role-history")
-	assertNotParticipants(t, st, sid, hidden, "role-ancient", "role-older-live")
-	assertJoinNotices(t, st, sid, 2, "Ship the roster", "Port the parser")
-
-	// Kick still addresses the role, including one that was collapsed.
-	resp, err := client.PostForm(srv.URL+"/panel/agents/role-ancient/revoke", nil)
+	// Kick the representative role. The project keeps Codex, and OpenCode
+	// falls through to its next live session.
+	resp, err := client.PostForm(srv.URL+"/panel/agents/role-new/revoke", nil)
 	if err != nil {
 		t.Fatalf("kick: %v", err)
 	}
@@ -198,17 +176,13 @@ func TestDashboardGroupsSiblingRoster(t *testing.T) {
 		t.Fatalf("kick: %d", resp.StatusCode)
 	}
 	body = getDash(t, client, srv.URL)
-	if strings.Contains(body, `value="role-ancient"`) || strings.Contains(body, `action="/panel/agents/role-ancient/revoke"`) {
+	if strings.Contains(body, `value="role-new"`) || strings.Contains(body, `action="/panel/agents/role-new/revoke"`) {
 		t.Fatalf("kicked role still listed:\n%s", body)
 	}
-	for _, want := range []string{`value="role-new"`, "Ship the roster", "Fix read marks", "OpenCode · laptop", `value="codex-1"`} {
+	for _, want := range []string{`value="project:/work/app"`, `value="codex-1"`, `value="role-older-live"`, ">OpenCode</span>"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("after kick, dashboard missing %q", want)
 		}
-	}
-	// One historical role gone, the install is still a group.
-	if !strings.Contains(body, "2 earlier sessions") {
-		t.Fatalf("group should keep the remaining history collapsed:\n%s", body)
 	}
 }
 

@@ -51,9 +51,8 @@
 <tr>
 <td>{{template "activity" .Activity}}</td>
 <td class="clip" title="{{.Kind}}">{{.Kind}}</td>
-<td><div class="clip" title="{{.Tip}}"><span class="id">{{if .Title}}{{.Title}}{{else}}—{{end}}</span>{{if .Invite}} <span class="default-tag" title="{{.Invite}}">{{.Invite}}</span>{{end}}</div>
-{{if .Live}}<details class="live" open><summary>{{.LiveLabel}}</summary><ul class="session-list">{{range .Live}}{{template "roster-row" .}}{{end}}</ul></details>{{end}}
-{{if .Earlier}}<details class="earlier"><summary>{{.EarlierLabel}}</summary><ul class="session-list">{{range .Earlier}}{{template "roster-row" .}}{{end}}</ul></details>{{end}}
+<td><div class="clip" title="{{.Tip}}"><span class="id">{{if .Title}}{{.Title}}{{else}}—{{end}}</span></div>
+{{if .Members}}<details class="project" open><summary>{{.MemberLabel}}</summary><ul class="session-list">{{range .Members}}{{template "roster-row" .}}{{end}}</ul></details>{{end}}
 </td>
 <td class="clip" title="{{.Hostname}}">{{if .Hostname}}{{.Hostname}}{{else}}—{{end}}</td>
 <td class="id clip" title="{{.Workdir}}">{{if .Workdir}}{{.Workdir}}{{else}}—{{end}}</td>

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -16,31 +15,45 @@ import (
 const defaultWaitSeconds = 20
 
 type Server struct {
-	client      *Client
-	agentName   string // server-generated identity, used for @mentions
-	mu          sync.Mutex
-	lastSeq     int64
-	initialized bool
+	fallback *caller
+	threads  *threadBook
 }
 
 func New(client *Client, agentName string) *Server {
-	return &Server{client: client, agentName: agentName}
+	return &Server{fallback: &caller{client: client, agent: agentName, cur: &seqCursor{}}}
 }
 
-func addTool[In, Out any](mcpServer *mcp.Server, tool *mcp.Tool, h func(context.Context, *mcp.CallToolRequest, In) (*mcp.CallToolResult, Out, error)) {
-	mcp.AddTool(mcpServer, tool, h)
+func addTool[In, Out any](s *Server, mcpServer *mcp.Server, tool *mcp.Tool, h func(context.Context, *mcp.CallToolRequest, In) (*mcp.CallToolResult, Out, error)) {
+	mcp.AddTool(mcpServer, tool, func(ctx context.Context, req *mcp.CallToolRequest, in In) (*mcp.CallToolResult, Out, error) {
+		var zero Out
+		ctx, err := s.prepareCall(ctx, req)
+		if err != nil {
+			return errResult(err), zero, nil
+		}
+		res, out, err := h(ctx, req, in)
+		if err != nil || !unauthorizedToolResult(res) {
+			return res, out, err
+		}
+		// A thread token was revoked (the thread resumed in another process).
+		// Adopt the state file's token, or re-register, and retry once.
+		rebound, rerr := s.rebind(ctx, req)
+		if rerr != nil || rebound == ctx {
+			return res, out, err
+		}
+		return h(rebound, req, in)
+	})
 }
 
 func RegisterTools(mcpServer *mcp.Server, s *Server) {
 
-	addTool(mcpServer, &mcp.Tool{
+	addTool(s, mcpServer, &mcp.Tool{
 		Name:        "list_sessions",
 		Description: "List Butler messaging sessions. The \"global\" session has every connected agent as a member — use it to reach everyone. Also shows your other joined sessions (with unread hints) and active sessions you can join. Use this first to discover where to send messages.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct{}) (*mcp.CallToolResult, any, error) {
 		return s.listSessions(ctx)
 	})
 
-	addTool(mcpServer, &mcp.Tool{
+	addTool(s, mcpServer, &mcp.Tool{
 		Name:        "create_session",
 		Description: "Create a new messaging session for a task and optionally invite other agents by name (names are generated per agent, e.g. \"codex-laptop\" — find them in list_sessions/read_session participant lists; \"you\" is the human on the panel). You are added as a participant automatically. Returns the session id to use with the other tools.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
@@ -50,14 +63,14 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		if strings.TrimSpace(args.Title) == "" {
 			return errResult("title is required"), nil, nil
 		}
-		sess, err := s.client.CreateSession(ctx, args.Title, args.Participants)
+		sess, err := s.use(ctx).client.CreateSession(ctx, args.Title, args.Participants)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
 		return textResult(fmt.Sprintf("created session %q (%s)\nyou are a participant; others can join it via list_sessions + join_session", sess.Title, sess.ID)), nil, nil
 	})
 
-	addTool(mcpServer, &mcp.Tool{
+	addTool(s, mcpServer, &mcp.Tool{
 		Name:        "join_session",
 		Description: "Join a session so you can read and send messages in it. Idempotent. After joining, call read_session to catch up on history.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
@@ -66,7 +79,7 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		if args.Session == "" {
 			return errResult("session is required"), nil, nil
 		}
-		joined, err := s.client.JoinSession(ctx, args.Session)
+		joined, err := s.use(ctx).client.JoinSession(ctx, args.Session)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
@@ -76,7 +89,7 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		return textResult("already a participant of session " + args.Session), nil, nil
 	})
 
-	addTool(mcpServer, &mcp.Tool{
+	addTool(s, mcpServer, &mcp.Tool{
 		Name:        "read_session",
 		Description: "Read a session: title, participants (with presence) and the most recent messages (default 50, newest last). Use to catch up on a conversation or check shared context.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
@@ -93,18 +106,18 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		if n > 500 {
 			n = 500
 		}
-		detail, err := s.client.SessionDetail(ctx, args.Session)
+		detail, err := s.use(ctx).client.SessionDetail(ctx, args.Session)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		msgs, err := s.client.SessionMessagesLatest(ctx, args.Session, n)
+		msgs, err := s.use(ctx).client.SessionMessagesLatest(ctx, args.Session, n)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		return textResult(s.formatSession(detail, msgs)), nil, nil
+		return textResult(s.formatSession(ctx, detail, msgs)), nil, nil
 	})
 
-	addTool(mcpServer, &mcp.Tool{
+	addTool(s, mcpServer, &mcp.Tool{
 		Name:        "send_message",
 		Description: "Send a chat message to a session. You must be a participant (join_session first). Address specific agents with @mentions: \"@<agent id>\" or \"@<display name>\" (the title list_sessions/read_session show; case-insensitive, spaces allowed) for one agent, \"@<kind>\" for every agent of that kind in the session, or \"@all\" for all participants. Mentioned agents are expected to reply; unmentioned participants only get the message as FYI. Returns the message sequence number.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
@@ -117,15 +130,15 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		if strings.TrimSpace(args.Content) == "" {
 			return errResult("content is required"), nil, nil
 		}
-		msg, err := s.client.PostMessage(ctx, args.Session, args.Content)
+		msg, err := s.use(ctx).client.PostMessage(ctx, args.Session, args.Content)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		s.advanceCursor(msg.Seq)
+		s.advanceCursor(ctx, msg.Seq)
 		return textResult(fmt.Sprintf("sent message seq=%d", msg.Seq)), nil, nil
 	})
 
-	addTool(mcpServer, &mcp.Tool{
+	addTool(s, mcpServer, &mcp.Tool{
 		Name:        "wait_for_messages",
 		Description: "Wait for new messages in your joined sessions (long-poll, near real time). Blocks up to timeout_seconds (default 20, max 60), then reports no new messages. Call this repeatedly to listen for replies from other agents and humans — it returns immediately when a message arrives. Messages are grouped per session; ones that @-mention you are marked \"(mentioned you)\" and expect a reply, the rest are FYI you may ignore if not relevant. Etiquette: when you decide to act on a message, ack briefly first (send_message), then do the work and report back — don't go silent until done. It only sees messages newer than your cursor; use read_session for older history.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
@@ -142,18 +155,18 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		msgs, latest, err := s.client.Wait(ctx, after, timeout)
+		msgs, latest, err := s.use(ctx).client.Wait(ctx, after, timeout)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		s.advanceCursor(latest)
+		s.advanceCursor(ctx, latest)
 		if len(msgs) == 0 {
 			return textResult("no new messages"), nil, nil
 		}
 		return textResult(s.formatNotification(ctx, msgs)), nil, nil
 	})
 
-	addTool(mcpServer, &mcp.Tool{
+	addTool(s, mcpServer, &mcp.Tool{
 		Name:        "check_messages",
 		Description: "Fetch new messages in your joined sessions without blocking (unlike wait_for_messages). Messages that @-mention you are marked and expect a reply; the rest are FYI. Useful when you want a quick non-blocking check between other work.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct{}) (*mcp.CallToolResult, any, error) {
@@ -161,18 +174,18 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		msgs, latest, err := s.client.Catchup(ctx, after)
+		msgs, latest, err := s.use(ctx).client.Catchup(ctx, after)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		s.advanceCursor(latest)
+		s.advanceCursor(ctx, latest)
 		if len(msgs) == 0 {
 			return textResult("no new messages"), nil, nil
 		}
 		return textResult(s.formatNotification(ctx, msgs)), nil, nil
 	})
 
-	addTool(mcpServer, &mcp.Tool{
+	addTool(s, mcpServer, &mcp.Tool{
 		Name:        "get_context",
 		Description: "Read the shared context items (key/value notes) of a session: durable session-level facts like decisions, file paths, task state. Different from chat history — this is structured info all participants share.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
@@ -181,7 +194,7 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		if args.Session == "" {
 			return errResult("session is required"), nil, nil
 		}
-		items, err := s.client.Context(ctx, args.Session)
+		items, err := s.use(ctx).client.Context(ctx, args.Session)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
@@ -196,7 +209,7 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		return textResult(b.String()), nil, nil
 	})
 
-	addTool(mcpServer, &mcp.Tool{
+	addTool(s, mcpServer, &mcp.Tool{
 		Name:        "set_context",
 		Description: "Set or update a shared context item (key/value note) on a session, visible to all participants. Use for durable facts other agents should know: decisions, links, task state. Updates are announced in the session message stream.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
@@ -210,15 +223,15 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		if strings.TrimSpace(args.Key) == "" || strings.TrimSpace(args.Value) == "" {
 			return errResult("key and value are required"), nil, nil
 		}
-		_, notifySeq, err := s.client.PutContext(ctx, args.Session, args.Key, args.Value)
+		_, notifySeq, err := s.use(ctx).client.PutContext(ctx, args.Session, args.Key, args.Value)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		s.advanceCursor(notifySeq)
+		s.advanceCursor(ctx, notifySeq)
 		return textResult(fmt.Sprintf("context %s updated", args.Key)), nil, nil
 	})
 
-	addTool(mcpServer, &mcp.Tool{
+	addTool(s, mcpServer, &mcp.Tool{
 		Name:        "list_tasks",
 		Description: "List tasks on the Butler board. Filter with assignee (an agent id, a display name, a kind, \"me\" for yourself, or \"unassigned\") and/or status (todo, in_progress, blocked, review, done). Use this to find work assigned to you.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
@@ -226,14 +239,14 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		Status   string `json:"status,omitempty" jsonschema:"todo, in_progress, blocked, review, or done"`
 		Session  string `json:"session,omitempty" jsonschema:"only tasks linked to this session id"`
 	}) (*mcp.CallToolResult, any, error) {
-		tasks, err := s.client.ListTasks(ctx, args.Assignee, args.Status, args.Session)
+		tasks, err := s.use(ctx).client.ListTasks(ctx, args.Assignee, args.Status, args.Session)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
 		return textResult(formatTaskList(tasks)), nil, nil
 	})
 
-	addTool(mcpServer, &mcp.Tool{
+	addTool(s, mcpServer, &mcp.Tool{
 		Name:        "get_task",
 		Description: "Read one task: title, description, status, priority, assignee, creator, linked session, and its comment log. Use the task id from list_tasks or from an assignment message.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
@@ -242,14 +255,14 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		if args.Task == "" {
 			return errResult("task is required"), nil, nil
 		}
-		view, err := s.client.GetTask(ctx, args.Task)
+		view, err := s.use(ctx).client.GetTask(ctx, args.Task)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
 		return textResult(formatTask(view)), nil, nil
 	})
 
-	addTool(mcpServer, &mcp.Tool{
+	addTool(s, mcpServer, &mcp.Tool{
 		Name:        "create_task",
 		Description: "Create a task on the Butler board. assignee is optional and resolves like an @mention (agent id, display name, or kind). Assigning someone posts a message that @mentions them, so their wait_for_messages / relay wakes them. chain is the ordered handoff list (same token style); reviewer is who may mark it done (default: you, the creator). Link a session when the discussion should happen there.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
@@ -265,11 +278,11 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		if strings.TrimSpace(args.Title) == "" {
 			return errResult("title is required"), nil, nil
 		}
-		view, err := s.client.CreateTask(ctx, args.Title, args.Description, args.Assignee, args.Status, args.Priority, args.Session, args.Reviewer, args.Chain)
+		view, err := s.use(ctx).client.CreateTask(ctx, args.Title, args.Description, args.Assignee, args.Status, args.Priority, args.Session, args.Reviewer, args.Chain)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		s.advanceCursor(view.NotifySeq)
+		s.advanceCursor(ctx, view.NotifySeq)
 		who := "unassigned"
 		if view.AssigneeID != "" {
 			who = view.AssigneeID
@@ -277,7 +290,7 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		return textResult(fmt.Sprintf("created task %q (%s)\nstatus: %s · priority: %s · assignee: %s", view.Title, view.ID, view.Status, view.Priority, who)), nil, nil
 	})
 
-	addTool(mcpServer, &mcp.Tool{
+	addTool(s, mcpServer, &mcp.Tool{
 		Name:        "update_task_status",
 		Description: "Move a task to a new status: todo, in_progress, blocked, review, or done. Only the reviewer (or the human admin) can set done — otherwise hand the task off for review and use approve_task. The creator (and the assignee, when that is someone else) is notified.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
@@ -287,15 +300,15 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		if args.Task == "" || strings.TrimSpace(args.Status) == "" {
 			return errResult("task and status are required"), nil, nil
 		}
-		view, err := s.client.UpdateTaskStatus(ctx, args.Task, args.Status)
+		view, err := s.use(ctx).client.UpdateTaskStatus(ctx, args.Task, args.Status)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		s.advanceCursor(view.NotifySeq)
+		s.advanceCursor(ctx, view.NotifySeq)
 		return textResult(fmt.Sprintf("task %s (%s) status: %s", view.ID, view.Title, view.Status)), nil, nil
 	})
 
-	addTool(mcpServer, &mcp.Tool{
+	addTool(s, mcpServer, &mcp.Tool{
 		Name:        "comment_task",
 		Description: "Add a progress comment to a task. The creator and the assignee are notified (a mention in the task's session, or the global session). Use this to report what you did, what blocked you, or what you need reviewed.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
@@ -305,15 +318,15 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		if args.Task == "" || strings.TrimSpace(args.Body) == "" {
 			return errResult("task and body are required"), nil, nil
 		}
-		c, seq, err := s.client.CommentTask(ctx, args.Task, args.Body)
+		c, seq, err := s.use(ctx).client.CommentTask(ctx, args.Task, args.Body)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		s.advanceCursor(seq)
+		s.advanceCursor(ctx, seq)
 		return textResult(fmt.Sprintf("comment recorded on task %s (%s)", c.TaskID, c.ID)), nil, nil
 	})
 
-	addTool(mcpServer, &mcp.Tool{
+	addTool(s, mcpServer, &mcp.Tool{
 		Name:        "claim_task",
 		Description: "Claim a task: it is assigned to you and moved to in_progress. Use this when you pick up unassigned work, or when you take over a task. The creator is notified. If it is already yours and in progress, this does nothing.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
@@ -322,15 +335,15 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		if args.Task == "" {
 			return errResult("task is required"), nil, nil
 		}
-		view, err := s.client.ClaimTask(ctx, args.Task)
+		view, err := s.use(ctx).client.ClaimTask(ctx, args.Task)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		s.advanceCursor(view.NotifySeq)
+		s.advanceCursor(ctx, view.NotifySeq)
 		return textResult(fmt.Sprintf("claimed task %q (%s)\nstatus: %s · assignee: %s", view.Title, view.ID, view.Status, view.AssigneeID)), nil, nil
 	})
 
-	addTool(mcpServer, &mcp.Tool{
+	addTool(s, mcpServer, &mcp.Tool{
 		Name:        "handoff_task",
 		Description: "Hand a task you own to the next agent. Omit `to` to follow the chain (the next owner, or the reviewer once the chain is done — that step sets status review). Pass `to` to name the next owner directly (id, display name, or kind). Status becomes todo for a new owner, or review when the task reaches its reviewer. A log line is recorded, the new owner is @mentioned, and their webhook fires as task.assigned with handoff true. Only the current owner can call this.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
@@ -341,11 +354,11 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		if args.Task == "" {
 			return errResult("task is required"), nil, nil
 		}
-		view, err := s.client.HandoffTask(ctx, args.Task, args.To, args.Note)
+		view, err := s.use(ctx).client.HandoffTask(ctx, args.Task, args.To, args.Note)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		s.advanceCursor(view.NotifySeq)
+		s.advanceCursor(ctx, view.NotifySeq)
 		who := "unassigned"
 		if view.AssigneeID != "" {
 			who = view.AssigneeID
@@ -353,7 +366,7 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		return textResult(fmt.Sprintf("handed off task %q (%s)\nstatus: %s · owner: %s", view.Title, view.ID, view.Status, who)), nil, nil
 	})
 
-	addTool(mcpServer, &mcp.Tool{
+	addTool(s, mcpServer, &mcp.Tool{
 		Name:        "approve_task",
 		Description: "Mark a task done. Only the reviewer (or the human admin) can do this. If you are the owner and the work is ready, handoff_task instead so the reviewer can approve it.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
@@ -362,15 +375,15 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		if args.Task == "" {
 			return errResult("task is required"), nil, nil
 		}
-		view, err := s.client.ApproveTask(ctx, args.Task)
+		view, err := s.use(ctx).client.ApproveTask(ctx, args.Task)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		s.advanceCursor(view.NotifySeq)
+		s.advanceCursor(ctx, view.NotifySeq)
 		return textResult(fmt.Sprintf("approved task %q (%s)\nstatus: %s", view.Title, view.ID, view.Status)), nil, nil
 	})
 
-	addTool(mcpServer, &mcp.Tool{
+	addTool(s, mcpServer, &mcp.Tool{
 		Name:        "reject_task",
 		Description: "Send a task in review back to an owner. Omit `to` to return it to the owner who handed it in (status becomes todo). Pass `to` to name someone else. Only the reviewer can call this. A log line is recorded and the new owner is @mentioned.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
@@ -381,15 +394,15 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		if args.Task == "" {
 			return errResult("task is required"), nil, nil
 		}
-		view, err := s.client.RejectTask(ctx, args.Task, args.To, args.Note)
+		view, err := s.use(ctx).client.RejectTask(ctx, args.Task, args.To, args.Note)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		s.advanceCursor(view.NotifySeq)
+		s.advanceCursor(ctx, view.NotifySeq)
 		return textResult(fmt.Sprintf("sent back task %q (%s)\nstatus: %s · owner: %s", view.Title, view.ID, view.Status, view.AssigneeID)), nil, nil
 	})
 
-	addTool(mcpServer, &mcp.Tool{
+	addTool(s, mcpServer, &mcp.Tool{
 		Name:        "set_activity",
 		Description: "Report what you are doing right now: working, idle, or blocked (waiting on a review or a human). Add a short note when it helps (\"waiting on the diff\"). Butler shows that next to your name on the board and in chat. This does not comment on a task and does not notify anyone — call it whenever your state changes. If you skip it, Butler infers activity from your calls and from tasks you own. A claimed in_progress task whose owner goes quiet is marked stalled on its own.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
@@ -400,7 +413,7 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		if state == "" {
 			return errResult("state is required"), nil, nil
 		}
-		view, err := s.client.SetActivity(ctx, state, args.Note)
+		view, err := s.use(ctx).client.SetActivity(ctx, state, args.Note)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
@@ -411,7 +424,7 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		return textResult(line), nil, nil
 	})
 
-	addTool(mcpServer, &mcp.Tool{
+	addTool(s, mcpServer, &mcp.Tool{
 		Name:        "rename_self",
 		Description: "Change your own Butler display name (the name others @mention and assign tasks to). Call this whenever your human/owner or a teammate tells you that you have been renamed, so Butler matches your new name, e.g. \"you are now called Point\" → rename_self {display_name: \"Point\"}. Your agent id, tokens, sessions, tasks and history stay the same; every room you are in gets a notice \"Old is now New\". The old name stops resolving for @mentions and assignees right away. Fails with a conflict if another agent already uses the name (case-insensitive) or it equals an agent kind — pick another or ask your owner. Only renames you; never use it to rename someone else.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args struct {
@@ -421,7 +434,7 @@ func RegisterTools(mcpServer *mcp.Server, s *Server) {
 		if name == "" {
 			return errResult("display_name is required"), nil, nil
 		}
-		res, err := s.client.RenameSelf(ctx, name)
+		res, err := s.use(ctx).client.RenameSelf(ctx, name)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
@@ -502,11 +515,11 @@ func reviewerOf(view *TaskView) string {
 }
 
 func (s *Server) listSessions(ctx context.Context) (*mcp.CallToolResult, any, error) {
-	joined, err := s.client.Sessions(ctx, true)
+	joined, err := s.use(ctx).client.Sessions(ctx, true)
 	if err != nil {
 		return errResult(err), nil, nil
 	}
-	all, err := s.client.Sessions(ctx, false)
+	all, err := s.use(ctx).client.Sessions(ctx, false)
 	if err != nil {
 		return errResult(err), nil, nil
 	}
@@ -522,7 +535,7 @@ func (s *Server) listSessions(ctx context.Context) (*mcp.CallToolResult, any, er
 	}
 	sort.Slice(joined, func(i, j int) bool { return joined[i].CreatedAt > joined[j].CreatedAt })
 	var b strings.Builder
-	fmt.Fprintf(&b, "you are %s\n", s.agentName)
+	fmt.Fprintf(&b, "you are %s\n", s.use(ctx).agent)
 	if len(joined) == 0 {
 		fmt.Fprintln(&b, "you have not joined any sessions; create one with create_session or join one below")
 	} else {
@@ -541,28 +554,15 @@ func (s *Server) listSessions(ctx context.Context) (*mcp.CallToolResult, any, er
 }
 
 func (s *Server) cursor(ctx context.Context) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.initialized {
-		n, err := s.client.LatestSeq(ctx)
-		if err != nil {
-			return 0, err
-		}
-		s.lastSeq = n
-		s.initialized = true
-	}
-	return s.lastSeq, nil
+	c := s.use(ctx)
+	return c.cur.get(ctx, c.client)
 }
 
-func (s *Server) advanceCursor(seq int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if seq > s.lastSeq {
-		s.lastSeq = seq
-	}
+func (s *Server) advanceCursor(ctx context.Context, seq int64) {
+	s.use(ctx).cur.advance(seq)
 }
 
-func (s *Server) formatSession(detail *SessionDetail, msgs []store.Message) string {
+func (s *Server) formatSession(ctx context.Context, detail *SessionDetail, msgs []store.Message) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "session %q (%s) [%s]\ncreated by %s\n", detail.Session.Title, detail.Session.ID, detail.Session.Status, detail.Session.CreatedBy)
 	names := make([]string, 0, len(detail.Participants))
@@ -587,14 +587,15 @@ func (s *Server) formatSession(detail *SessionDetail, msgs []store.Message) stri
 		return b.String()
 	}
 	fmt.Fprintf(&b, "last %d message(s):\n", len(msgs))
-	b.WriteString(s.formatMessages(msgs))
+	b.WriteString(s.formatMessages(ctx, msgs))
 	return b.String()
 }
 
-func (s *Server) formatMessages(msgs []store.Message) string {
+func (s *Server) formatMessages(ctx context.Context, msgs []store.Message) string {
+	agent := s.use(ctx).agent
 	var b strings.Builder
 	for _, m := range msgs {
-		fmt.Fprintf(&b, "%s\n", s.formatMessageLine(m))
+		fmt.Fprintf(&b, "%s\n", formatMessageLine(agent, m))
 	}
 	return b.String()
 }
@@ -602,13 +603,13 @@ func (s *Server) formatMessages(msgs []store.Message) string {
 // formatMessageLine renders one message as "[seq time] sender: content".
 // Messages that @-mention this agent carry a "(mentioned you)" marker: they
 // are addressed to it and expect a reply; unmarked messages are FYI.
-func (s *Server) formatMessageLine(m store.Message) string {
+func formatMessageLine(agent string, m store.Message) string {
 	ts := time.UnixMilli(m.CreatedAt).UTC().Format("15:04:05")
 	sender := m.SenderID
 	if m.Kind != "chat" {
 		sender += " (" + m.Kind + ")"
 	}
-	if m.MentionsAgent(s.agentName) {
+	if m.MentionsAgent(agent) {
 		sender += " (mentioned you)"
 	}
 	return fmt.Sprintf("[%d %s] %s: %s", m.Seq, ts, sender, m.Content)
@@ -620,14 +621,15 @@ func (s *Server) formatMessageLine(m store.Message) string {
 // where to reply.
 func (s *Server) formatNotification(ctx context.Context, msgs []store.Message) string {
 	titles := map[string]string{}
-	if sessions, err := s.client.Sessions(ctx, true); err == nil {
+	if sessions, err := s.use(ctx).client.Sessions(ctx, true); err == nil {
 		for _, sess := range sessions {
 			titles[sess.ID] = sess.Title
 		}
 	}
+	agent := s.use(ctx).agent
 	mentions := 0
 	for _, m := range msgs {
-		if m.MentionsAgent(s.agentName) {
+		if m.MentionsAgent(agent) {
 			mentions++
 		}
 	}
@@ -659,7 +661,7 @@ func (s *Server) formatNotification(ctx context.Context, msgs []store.Message) s
 			fmt.Fprintf(&b, "\n— session %s:\n", sid)
 		}
 		for _, m := range groups[sid] {
-			fmt.Fprintf(&b, "%s\n", s.formatMessageLine(m))
+			fmt.Fprintf(&b, "%s\n", formatMessageLine(agent, m))
 		}
 	}
 	return b.String()

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -46,8 +45,10 @@ func main() {
 	log.SetOutput(os.Stderr)
 
 	// Register with the kind token: the server assigns (and returns) a stable
-	// identity name for this (kind, hostname, workdir) triple and an instance
-	// token used for everything that follows.
+	// identity for this (kind, hostname, workdir) with an empty client_session,
+	// plus an instance token. Codex threads register their own identities
+	// later, on the first tool call that carries _meta.threadId. OpenCode,
+	// Pi and DeepSeek keep using this identity.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	reg, err := client.Register(ctx, *hostname, *workdir)
 	cancel()
@@ -65,60 +66,39 @@ func main() {
 	if statePath == "" {
 		statePath = filepath.Join(*workdir, ".butler", "instance.json")
 	}
-	if err := writeStateFile(statePath, *serverURL, reg); err != nil {
+	if err := mcpserver.WriteInstanceState(statePath, mcpserver.InstanceState{
+		Agent:     reg.Name,
+		Token:     reg.Token,
+		Server:    *serverURL,
+		Kind:      reg.Kind,
+		PID:       os.Getpid(),
+		PPID:      os.Getppid(),
+		WrittenAt: time.Now().Unix(),
+	}); err != nil {
 		log.Printf("warning: state file %s not written: %v (local integrations such as the OpenCode relay plugin cannot act as this instance)", statePath, err)
 	}
 
-	srv := mcp.NewServer(&mcp.Implementation{Name: "butler", Version: version}, nil)
-	mcpserver.RegisterTools(srv, mcpserver.New(client, reg.Name))
+	srvOpts := (*mcp.ServerOptions)(nil)
+	agent := mcpserver.New(client, reg.Name)
+	if reg.Kind == "codex" {
+		// Codex stamps threadId on every tools/call (not at process start,
+		// and not via the environment). Bind each root thread to its own
+		// identity so two sessions in one workdir do not share a token.
+		agent.EnableCodexThreads(mcpserver.CodexThreadConfig{
+			ServerURL: *serverURL,
+			KindToken: *token,
+			Hostname:  *hostname,
+			Workdir:   *workdir,
+			StateDir:  filepath.Join(*workdir, ".butler", "codex"),
+		})
+		srvOpts = &mcp.ServerOptions{Instructions: mcpserver.CodexInstructions}
+	}
+	srv := mcp.NewServer(&mcp.Implementation{Name: "butler", Version: version}, srvOpts)
+	mcpserver.RegisterTools(srv, agent)
 	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		log.Printf("server exited: %v", err)
 		os.Exit(1)
 	}
-}
-
-// writeStateFile records the live instance (identity + token + server URL)
-// next to the working directory so local processes — e.g. the OpenCode relay
-// plugin — can poll and act as this exact agent identity. Each registration
-// overwrites it atomically: the last registered instance owns the file, and
-// readers are expected to re-read it when the butler server rejects their
-// token (401).
-func writeStateFile(path, serverURL string, reg *mcpserver.RegisterResult) error {
-	state := map[string]any{
-		"agent":      reg.Name,
-		"token":      reg.Token,
-		"server":     serverURL,
-		"kind":       reg.Kind,
-		"pid":        os.Getpid(),
-		"ppid":       os.Getppid(),
-		"written_at": time.Now().Unix(),
-	}
-	data, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		return err
-	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, ".instance-*.json")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op once renamed
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
 }
 
 func envOr(key, def string) string {

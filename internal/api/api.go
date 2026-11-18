@@ -408,8 +408,11 @@ func (a *API) agentRoles(w http.ResponseWriter, r *http.Request) {
 // get a system message.
 //
 // Two auth paths:
-//   - kind token: registers the app-level identity (client_session ""). This
-//     is what butler-mcp does at startup.
+//   - kind token: registers an identity for this kind. An empty client_session
+//     is the app-level identity (what butler-mcp does at startup). A non-empty
+//     client_session is a distinct identity with the same kind, hostname and
+//     workdir — Codex threads register this way, with the thread id as
+//     client_session, because each Codex process holds the kind token.
 //   - instance token: registers a per-client-session SIBLING of the caller —
 //     same kind/hostname/workdir, keyed by the body's client_session and
 //     labeled with its display_name (the OpenCode session title). The relay

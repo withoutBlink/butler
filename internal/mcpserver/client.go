@@ -123,12 +123,24 @@ type AgentInfo struct {
 }
 
 type RegisterResult struct {
-	Name     string `json:"name"`
-	Token    string `json:"token"`
-	Kind     string `json:"kind"`
-	Hostname string `json:"hostname"`
-	Workdir  string `json:"workdir"`
-	Replaced bool   `json:"replaced"`
+	Name          string `json:"name"`
+	Token         string `json:"token"`
+	Kind          string `json:"kind"`
+	Hostname      string `json:"hostname"`
+	Workdir       string `json:"workdir"`
+	ClientSession string `json:"client_session,omitempty"`
+	Replaced      bool   `json:"replaced"`
+}
+
+// RegisterParams is the body of POST /api/v1/register. ClientSession empty
+// is the app-level identity. A non-empty ClientSession (a Codex thread id,
+// an OpenCode session id) is its own identity for the same kind, hostname
+// and workdir.
+type RegisterParams struct {
+	Hostname      string
+	Workdir       string
+	ClientSession string
+	DisplayName   string
 }
 
 // Register exchanges a kind token plus hostname and working directory for a
@@ -137,7 +149,20 @@ type RegisterResult struct {
 // and Replaced is true. The caller must SetToken with the returned token
 // before issuing other requests.
 func (c *Client) Register(ctx context.Context, hostname, workdir string) (*RegisterResult, error) {
-	body := map[string]string{"hostname": hostname, "workdir": workdir}
+	return c.RegisterAs(ctx, RegisterParams{Hostname: hostname, Workdir: workdir})
+}
+
+// RegisterAs is Register with an explicit client_session and display name.
+// A kind token may set both. An instance token registers a sibling and
+// ignores hostname and workdir (the server inherits them from the caller).
+func (c *Client) RegisterAs(ctx context.Context, p RegisterParams) (*RegisterResult, error) {
+	body := map[string]string{"hostname": p.Hostname, "workdir": p.Workdir}
+	if p.ClientSession != "" {
+		body["client_session"] = p.ClientSession
+	}
+	if p.DisplayName != "" {
+		body["display_name"] = p.DisplayName
+	}
 	var res RegisterResult
 	if err := c.do(ctx, "POST", "/api/v1/register", body, &res); err != nil {
 		return nil, err

@@ -13,7 +13,9 @@ still come from `butler-mcp`.
 | [`pi/`](pi/) | [Pi](https://pi.dev) (`@earendil-works/pi-coding-agent`) | `pi/index.ts` | [`pi/README.md`](pi/README.md) |
 
 Codex needs no plugin: its push delivery is the Go daemon `butler-mcp relay`
-(`cmd/butler-mcp/relay.go`).
+(`cmd/butler-mcp/relay.go`). The `codex` kind of `butler-mcp` registers one
+Butler identity per Codex thread (from MCP `_meta.threadId`) and the relay
+queues into that thread. See the README section "Automatic delivery into Codex".
 
 ## Install: OpenCode
 

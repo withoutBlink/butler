@@ -12,7 +12,9 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,27 +23,22 @@ import (
 )
 
 // relayCmd is the Codex counterpart of the OpenCode relay plugin
-// (plugins/opencode): it acts as the agent identity recorded in the
-// state file written at registration, long-polls the butler server for new
-// messages, and injects them into a Codex session with `codex queue`. Codex
-// has no in-process plugin API for submitting prompts, but its shared
-// app-server daemon accepts queued messages for existing sessions: running
-// sessions pick them up at the next turn boundary, closed sessions receive
-// them on resume.
+// (plugins/opencode): it long-polls the butler server and injects messages
+// into Codex with `codex queue`. Each bound Codex thread has its own state
+// file under <workdir>/.butler/codex/<threadId>.json and its own loop, so
+// the queue target is that thread id. When nothing is bound (Codex before
+// threadId was added to MCP _meta, or a thread that has not called a Butler
+// tool yet) one loop reads instance.json and falls back to the newest
+// rollout in the workdir, which is what older releases always did.
 func relayCmd(args []string) {
 	fs := flag.NewFlagSet("butler-mcp relay", flag.ExitOnError)
-	workdir := fs.String("workdir", envOr("BUTLER_WORKDIR", defaultWorkdir()), "working directory of the identity (also used to find the codex session to deliver to)")
-	stateFile := fs.String("state-file", envOr("BUTLER_STATE_FILE", ""), "instance state JSON written by butler-mcp at registration (default <workdir>/.butler/instance.json)")
-	thread := fs.String("thread", "", "explicit codex thread id to deliver to (default: most recently active codex session in the workdir)")
+	workdir := fs.String("workdir", envOr("BUTLER_WORKDIR", defaultWorkdir()), "working directory whose .butler/codex thread bindings are relayed")
+	stateFile := fs.String("state-file", envOr("BUTLER_STATE_FILE", ""), "relay only this state file (default: every <workdir>/.butler/codex/<threadId>.json, else <workdir>/.butler/instance.json)")
+	thread := fs.String("thread", "", "pin delivery to this codex thread. With --state-file it overrides the file; in auto mode only that thread's state file is relayed")
 	codexBin := fs.String("codex-bin", envOr("BUTLER_CODEX_BIN", "codex"), "codex CLI binary invoked to queue messages")
-	codexHome := fs.String("codex-home", envOr("CODEX_HOME", defaultCodexHome()), "CODEX_HOME whose sessions/ directory is scanned for the target thread")
+	codexHome := fs.String("codex-home", envOr("CODEX_HOME", defaultCodexHome()), "CODEX_HOME whose sessions/ directory is scanned when no thread is bound")
 	once := fs.Bool("once", false, "exit after delivering one batch of messages (testing)")
 	fs.Parse(args)
-
-	statePath := *stateFile
-	if statePath == "" {
-		statePath = filepath.Join(*workdir, ".butler", "instance.json")
-	}
 
 	log.SetFlags(0)
 	log.SetPrefix("butler-relay: ")
@@ -50,49 +47,331 @@ func relayCmd(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	state := waitStateFile(ctx, statePath)
+	cfg := relayConfig{
+		workdir:   *workdir,
+		stateFile: *stateFile,
+		thread:    *thread,
+		codexBin:  *codexBin,
+		codexHome: *codexHome,
+		once:      *once,
+	}
+	if err := runRelay(ctx, cfg); err != nil && !errors.Is(err, context.Canceled) {
+		log.Fatalf("%v", err)
+	}
+}
+
+type relayConfig struct {
+	workdir     string
+	stateFile   string
+	thread      string
+	codexBin    string
+	codexHome   string
+	once        bool
+	waitSeconds int
+	scanEvery   time.Duration
+	onReady     func()
+}
+
+type loopConfig struct {
+	statePath   string
+	threadPin   string
+	codexBin    string
+	codexHome   string
+	workdir     string
+	once        bool
+	waitSeconds int
+	onReady     func()
+}
+
+func runRelay(ctx context.Context, cfg relayConfig) error {
+	if cfg.waitSeconds <= 0 {
+		cfg.waitSeconds = 25
+	}
+	if cfg.scanEvery <= 0 {
+		cfg.scanEvery = 2 * time.Second
+	}
+	if cfg.stateFile != "" {
+		return relayLoop(ctx, loopFrom(cfg, cfg.stateFile, cfg.thread))
+	}
+	if cfg.once {
+		return relayOnce(ctx, cfg)
+	}
+	return relayWatch(ctx, cfg)
+}
+
+func loopFrom(cfg relayConfig, path, pin string) loopConfig {
+	return loopConfig{
+		statePath:   path,
+		threadPin:   pin,
+		codexBin:    cfg.codexBin,
+		codexHome:   cfg.codexHome,
+		workdir:     cfg.workdir,
+		once:        cfg.once,
+		waitSeconds: cfg.waitSeconds,
+		onReady:     cfg.onReady,
+	}
+}
+
+// relayOnce delivers a single batch for every thread bound right now, or
+// one guessed batch when none are.
+func relayOnce(ctx context.Context, cfg relayConfig) error {
+	paths, err := boundThreadFiles(codexThreadDir(cfg.workdir))
+	if err != nil {
+		return err
+	}
+	paths = filterThreadFiles(paths, cfg.thread)
+	if len(paths) == 0 {
+		return relayLoop(ctx, loopFrom(cfg, instanceStatePath(cfg.workdir), cfg.thread))
+	}
+	var wg sync.WaitGroup
+	errc := make(chan error, len(paths))
+	for _, path := range paths {
+		wg.Add(1)
+		go func(path string) {
+			defer wg.Done()
+			if err := relayLoop(ctx, loopFrom(cfg, path, "")); err != nil && !errors.Is(err, context.Canceled) {
+				errc <- err
+			}
+		}(path)
+	}
+	wg.Wait()
+	close(errc)
+	for err := range errc {
+		return err
+	}
+	return nil
+}
+
+type loopSlot struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func (s loopSlot) running() bool {
+	if s.done == nil {
+		return false
+	}
+	select {
+	case <-s.done:
+		return false
+	default:
+		return true
+	}
+}
+
+// relayWatch scans for new thread bindings until ctx is cancelled. A
+// fallback loop (instance.json, newest rollout unless --thread is set)
+// runs only while no thread file matches.
+func relayWatch(ctx context.Context, cfg relayConfig) error {
+	var mu sync.Mutex
+	running := map[string]loopSlot{}
+	var fallback loopSlot
+	var wg sync.WaitGroup
+
+	start := func(path, pin string, slot *loopSlot) {
+		if slot.running() {
+			return
+		}
+		lctx, cancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+		*slot = loopSlot{cancel: cancel, done: done}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer close(done)
+			if err := relayLoop(lctx, loopFrom(cfg, path, pin)); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("%s: %v", path, err)
+			}
+		}()
+	}
+
+	scan := func() error {
+		paths, err := boundThreadFiles(codexThreadDir(cfg.workdir))
+		if err != nil {
+			return err
+		}
+		matched := filterThreadFiles(paths, cfg.thread)
+		mu.Lock()
+		defer mu.Unlock()
+		if len(matched) == 0 {
+			for path, slot := range running {
+				slot.cancel()
+				delete(running, path)
+			}
+			if !fallback.running() {
+				log.Printf("no codex thread bindings; delivering from %s", instanceStatePath(cfg.workdir))
+				start(instanceStatePath(cfg.workdir), cfg.thread, &fallback)
+			}
+			return nil
+		}
+		if fallback.running() {
+			log.Printf("%d codex thread binding(s); stopping unscoped delivery", len(matched))
+			fallback.cancel()
+			fallback = loopSlot{}
+		}
+		want := map[string]bool{}
+		for _, path := range matched {
+			want[path] = true
+			slot := running[path]
+			if slot.running() {
+				continue
+			}
+			log.Printf("relaying bound thread state %s", path)
+			start(path, "", &slot)
+			running[path] = slot
+		}
+		for path, slot := range running {
+			if !want[path] {
+				slot.cancel()
+				delete(running, path)
+			}
+		}
+		return nil
+	}
+
+	if err := scan(); err != nil {
+		return err
+	}
+	tick := time.NewTicker(cfg.scanEvery)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			mu.Lock()
+			if fallback.cancel != nil {
+				fallback.cancel()
+			}
+			for _, slot := range running {
+				slot.cancel()
+			}
+			mu.Unlock()
+			wg.Wait()
+			log.Printf("shutting down")
+			return nil
+		case <-tick.C:
+			if err := scan(); err != nil {
+				log.Printf("scan codex threads: %v", err)
+			}
+		}
+	}
+}
+
+func codexThreadDir(workdir string) string {
+	return filepath.Join(workdir, ".butler", "codex")
+}
+
+func instanceStatePath(workdir string) string {
+	return filepath.Join(workdir, ".butler", "instance.json")
+}
+
+// boundThreadFiles returns state files that name a Codex thread. Files that
+// are not readable yet (a writer mid-rename is atomic, so this is a bad
+// file) are skipped.
+func boundThreadFiles(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		st, err := readState(path)
+		if err != nil || st.ThreadID == "" {
+			continue
+		}
+		out = append(out, path)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func filterThreadFiles(paths []string, thread string) []string {
+	if thread == "" {
+		return paths
+	}
+	var out []string
+	for _, path := range paths {
+		st, err := readState(path)
+		if err != nil || st.ThreadID != thread {
+			continue
+		}
+		out = append(out, path)
+	}
+	return out
+}
+
+func relayLoop(ctx context.Context, cfg loopConfig) error {
+	waitFor := cfg.waitSeconds
+	if waitFor <= 0 {
+		waitFor = 25
+	}
+	state, err := waitStateFile(ctx, cfg.statePath)
+	if err != nil {
+		return err
+	}
 	client, err := mcpserver.NewClient(state.Server, state.Token)
 	if err != nil {
-		log.Fatalf("invalid server URL %q: %v", state.Server, err)
+		return fmt.Errorf("invalid server URL %q: %w", state.Server, err)
 	}
-	log.Printf("relaying as %s -> codex sessions in %s (state: %s)", state.Agent, *workdir, statePath)
+	label := state.Agent
+	if state.ThreadID != "" {
+		label = state.Agent + " thread " + state.ThreadID
+	}
+	log.Printf("relaying as %s (state: %s)", label, cfg.statePath)
 
-	var cursor int64 = -1 // set on first successful poll: never replay history
+	var cursor int64 = -1
 	backoff := time.Second
 	failing := false
 	lastFailLog := time.Now().Add(-time.Hour)
+	ready := false
 
 	for {
 		if ctx.Err() != nil {
-			log.Printf("shutting down")
-			return
+			return nil
 		}
 		if cursor < 0 {
 			seq, err := client.LatestSeq(ctx)
 			if err != nil {
-				log.Printf("initializing cursor: %v", err)
+				if ctx.Err() != nil {
+					return nil
+				}
+				if st, ok := takeRotated(client, cfg.statePath, state, err); ok {
+					state = st
+					continue
+				}
+				log.Printf("%s: initializing cursor: %v", label, err)
 				sleep(ctx, backoff)
 				backoff = minDuration(backoff*2, time.Minute)
 				continue
 			}
 			cursor = seq
-			log.Printf("cursor initialized to %d (old messages are never replayed)", cursor)
+			log.Printf("%s: cursor initialized to %d (old messages are never replayed)", label, cursor)
+			if !ready && cfg.onReady != nil {
+				ready = true
+				cfg.onReady()
+			}
 		}
 
-		msgs, latest, err := client.Wait(ctx, cursor, 25)
+		msgs, latest, err := client.Wait(ctx, cursor, waitFor)
 		if err != nil {
-			// The token rotates whenever a newer instance of this identity
-			// re-registers (e.g. codex restarted): the state file is rewritten
-			// by the last registrant — re-read it and continue.
-			if isUnauthorized(err) {
-				if st, rerr := readState(statePath); rerr == nil && st.Token != state.Token {
-					log.Printf("token rotated — continuing as %s", st.Agent)
-					state = st
-					client.SetToken(st.Token)
-					continue
-				}
+			if ctx.Err() != nil {
+				return nil
 			}
-			log.Printf("wait: %v", err)
+			if st, ok := takeRotated(client, cfg.statePath, state, err); ok {
+				log.Printf("%s: token rotated — continuing as %s", label, st.Agent)
+				state = st
+				if st.ThreadID != "" {
+					label = st.Agent + " thread " + st.ThreadID
+				}
+				continue
+			}
+			log.Printf("%s: wait: %v", label, err)
 			sleep(ctx, backoff)
 			backoff = minDuration(backoff*2, time.Minute)
 			continue
@@ -106,18 +385,22 @@ func relayCmd(args []string) {
 		}
 
 		if err := deliver(ctx, deliverables, deliveryConfig{
-			client:    client,
-			self:      state.Agent,
-			thread:    *thread,
-			codexBin:  *codexBin,
-			codexHome: *codexHome,
-			workdir:   *workdir,
+			client:      client,
+			self:        state.Agent,
+			boundThread: state.ThreadID,
+			threadPin:   cfg.threadPin,
+			codexBin:    cfg.codexBin,
+			codexHome:   cfg.codexHome,
+			workdir:     cfg.workdir,
 		}); err != nil {
-			// Do not advance the cursor: the batch is retried on the next
-			// poll (at-least-once delivery; thread discovery often only
-			// succeeds once codex has been started in the workdir).
+			if ctx.Err() != nil {
+				return nil
+			}
+			// Do not advance the cursor: the batch is retried (at-least-once).
+			// Thread discovery often only succeeds once codex has been
+			// started in the workdir.
 			if !failing || time.Since(lastFailLog) > time.Minute {
-				log.Printf("delivery failed (will retry): %v", err)
+				log.Printf("%s: delivery failed (will retry): %v", label, err)
 				lastFailLog = time.Now()
 				failing = true
 			}
@@ -126,20 +409,36 @@ func relayCmd(args []string) {
 		}
 		failing = false
 		cursor = latest
-		if *once {
-			log.Printf("delivered one batch (--once), exiting")
-			return
+		if cfg.once {
+			log.Printf("%s: delivered one batch (--once), exiting", label)
+			return nil
 		}
 	}
 }
 
+// takeRotated re-reads the state file after a 401. The last registrant owns
+// the file; when its token differs, keep using this client with the new
+// token. Same token means the file was not updated, so the caller backs off.
+func takeRotated(client *mcpserver.Client, path string, state mcpserver.InstanceState, err error) (mcpserver.InstanceState, bool) {
+	if !isUnauthorized(err) {
+		return state, false
+	}
+	st, rerr := readState(path)
+	if rerr != nil || st.Token == "" || st.Token == state.Token {
+		return state, false
+	}
+	client.SetToken(st.Token)
+	return st, true
+}
+
 type deliveryConfig struct {
-	client    *mcpserver.Client
-	self      string
-	thread    string
-	codexBin  string
-	codexHome string
-	workdir   string
+	client      *mcpserver.Client
+	self        string
+	boundThread string
+	threadPin   string
+	codexBin    string
+	codexHome   string
+	workdir     string
 }
 
 // filterRelay drops messages the codex agent must not see: its own
@@ -156,13 +455,9 @@ func filterRelay(msgs []store.Message, self string) []store.Message {
 }
 
 func deliver(ctx context.Context, msgs []store.Message, cfg deliveryConfig) error {
-	threadID := cfg.thread
-	if threadID == "" {
-		var err error
-		threadID, err = latestCodexThread(cfg.codexHome, cfg.workdir)
-		if err != nil {
-			return err
-		}
+	threadID, err := deliveryThread(cfg.boundThread, cfg.threadPin, cfg.codexHome, cfg.workdir)
+	if err != nil {
+		return err
 	}
 	text := formatRelay(ctx, cfg.client, msgs, cfg.self)
 	qctx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -173,6 +468,20 @@ func deliver(ctx context.Context, msgs []store.Message, cfg deliveryConfig) erro
 	}
 	log.Printf("delivered %d message(s) to codex thread %s", len(msgs), threadID)
 	return nil
+}
+
+// deliveryThread chooses the codex thread a batch is queued to.
+// An explicit pin (--thread on a single state file) wins, then the thread
+// id recorded when that identity registered, then the newest rollout whose
+// cwd matches the workdir.
+func deliveryThread(bound, pin, codexHome, workdir string) (string, error) {
+	if pin != "" {
+		return pin, nil
+	}
+	if bound != "" {
+		return bound, nil
+	}
+	return latestCodexThread(codexHome, workdir)
 }
 
 // formatRelay renders a batch of butler messages as one prompt for the codex
@@ -245,21 +554,10 @@ func clip(s string, n int) string {
 	return string(r[:n]) + "… (truncated — read_session has the full text)"
 }
 
-type relayState struct {
-	Agent  string `json:"agent"`
-	Token  string `json:"token"`
-	Server string `json:"server"`
-	Kind   string `json:"kind"`
-}
-
-func readState(path string) (relayState, error) {
-	var st relayState
-	b, err := os.ReadFile(path)
+func readState(path string) (mcpserver.InstanceState, error) {
+	st, err := mcpserver.ReadInstanceState(path)
 	if err != nil {
 		return st, err
-	}
-	if err := json.Unmarshal(b, &st); err != nil {
-		return st, fmt.Errorf("parse %s: %w", path, err)
 	}
 	if st.Agent == "" || st.Token == "" || st.Server == "" {
 		return st, fmt.Errorf("%s: missing agent/token/server fields", path)
@@ -267,21 +565,31 @@ func readState(path string) (relayState, error) {
 	return st, nil
 }
 
-func waitStateFile(ctx context.Context, path string) relayState {
+func waitStateFile(ctx context.Context, path string) (mcpserver.InstanceState, error) {
+	logged := false
 	for {
-		if st, err := readState(path); err == nil {
-			return st
-		} else if !os.IsNotExist(err) {
-			log.Fatalf("%v", err)
+		if ctx.Err() != nil {
+			return mcpserver.InstanceState{}, ctx.Err()
 		}
-		log.Printf("waiting for %s — start codex with the butler MCP server configured first", path)
+		st, err := readState(path)
+		if err == nil {
+			return st, nil
+		}
+		if !os.IsNotExist(err) {
+			return st, err
+		}
+		if !logged {
+			log.Printf("waiting for %s — start codex with the butler MCP server configured first", path)
+			logged = true
+		}
 		sleep(ctx, 5*time.Second)
 	}
 }
 
 // latestCodexThread scans CODEX_HOME/sessions for the most recently modified
 // rollout whose recorded working directory matches workdir — the codex
-// equivalent of "the most recently active session".
+// equivalent of "the most recently active session". Used only when no
+// thread binding and no --thread pin exist.
 func latestCodexThread(codexHome, workdir string) (string, error) {
 	root := filepath.Join(codexHome, "sessions")
 	cutoff := time.Now().AddDate(0, 0, -30)

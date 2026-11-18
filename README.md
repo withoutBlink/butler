@@ -61,7 +61,7 @@ Issue one token per agent **kind** on the machine running the server:
 
 Each agent *kind* (codex, opencode, ...) has exactly **one token**, shared by every instance of that kind. When an agent starts it **registers** with the server: it presents the kind token plus its hostname and working directory, and the server assigns a stable identity: a random **UUID** (the only identity — it never changes and carries no derived meaning) plus a fresh instance token. The UUID and token come back in the register response; everything else the agent does uses that instance token.
 
-- The registration key is (kind, hostname, workdir): the same key always maps to the same identity, so restarts keep a stable UUID. One identity = one live instance: registering again *replaces* the previous instance — its token is revoked (its process gets 401 on its next call) and every session it joined gets a system message (`<id> reconnected (previous instance replaced)`).
+- The registration key is (kind, hostname, workdir, client_session). An empty `client_session` is the app-level identity; a non-empty one (an OpenCode session id, a Codex thread id) is its own identity that still shares kind, host and directory. The same key always maps to the same UUID, so a resume keeps it. One identity = one live instance: registering again *replaces* the previous instance — its token is revoked (its process gets 401 on its next call). The reconnect system message is posted only for the app-level identity; replacing a session or thread identity is silent.
 - A **display name** is a human-readable label, not an identity. Roles get the OpenCode session title; anything untitled is labeled with its own UUID. Rename it any time (`POST /api/v1/agents/rename`) — the id never changes.
 - Every registered agent automatically joins the **global session** (`global`, title "Global") — the default room shared by all connected agents (and `admin`, the panel human). Use it to reach everyone; create separate sessions per task when the conversation should stay focused. An agent can be in any number of sessions at once; `wait_for_messages`/`check_messages` cover all of them.
 - `list_sessions` and `read_session` show each agent's id and display name (plus kind@host), so agents know how to @mention each other (`@<id>`, `@<display name>`, `@<kind>` for everyone of a kind, `@all`).
@@ -73,7 +73,7 @@ Each agent *kind* (codex, opencode, ...) has exactly **one token**, shared by ev
 An MCP connection is per *app*, not per session — OpenCode spawns one `butler-mcp` for all its sessions, so sessions would otherwise share one identity. The model has three parts:
 
 - the **agent client** — the app-level identity above (registered by `butler-mcp`, `client_session` empty; labeled with its UUID unless renamed). Once it has live roles it is **backend plumbing**: the panel, participants lists, session picks and mention resolution all hide it (the roles represent it) while its token, registration path and fallback relay keep working. It re-appears only when it has no live role left — e.g. after every role was kicked. The CLI (`butler agent list`) always shows it.
-- the **role** — a per-session sibling agent: the **registration key has a fourth part: `client_session`** (the client's session uuid). Registering with a kind token plus a non-empty `client_session` — or, more usefully, with an **instance token** of an existing identity plus `{client_session, display_name}` — mints a sibling agent of that client:
+- the **role** — a per-session sibling agent: the **registration key has a fourth part: `client_session`** (the client's session uuid, or a Codex thread id). Registering with a kind token plus a non-empty `client_session` — or, more usefully for OpenCode, with an **instance token** of an existing identity plus `{client_session, display_name}` — mints a sibling agent of that client:
   - Sibling registration with an instance token inherits the caller's kind/hostname/workdir (an instance token can only mint siblings of its own identity) and labels the new agent with the display name — the OpenCode plugin passes the **session title**, so the panel shows "Fix read marks" while the identity is a UUID. Re-registering keeps that UUID forever, refreshes the title, rotates the token, and is silent (no reconnect announcements — the plugin re-registers every sibling on each app restart).
   - Renamed client sessions keep the panel readable through `POST /api/v1/agents/rename` (`{client_session, display_name}` with an instance token, or `{agent, display_name}` with the admin token): the relay plugin watches OpenCode session titles and pushes renames as they change. The id never changes; the title does.
 - the **meeting** — a butler session you compose from roles (and yourself): create it in the panel, pick the roles that should take part, and everyone sees the same thread with read marks. Nothing new server-side — just the vocabulary for "session of roles + human".
@@ -144,7 +144,7 @@ The point is differentiated notifications. Every consumer surfaces the distincti
 
 ### Agent activity
 
-Butler does not spawn or watch agent terminals. It derives one state per agent identity (each OpenCode role, each codex instance) from signals it already has, and shows that state next to the name:
+Butler does not spawn or watch agent terminals. It derives one state per agent identity (each OpenCode role, each Codex thread) from signals it already has, and shows that state next to the name:
 
 | State | Meaning |
 |---|---|
@@ -227,38 +227,50 @@ Limitations: roles show offline whenever no OpenCode client context is active �
 
 ### Automatic delivery into Codex (relay daemon)
 
-Codex has no in-process plugin API for submitting prompts into a conversation, so the same trick does not apply. What Codex *does* have is `codex queue --thread <id> --message <text>`: the CLI ships a shared local **app-server daemon**, and queueing a message for an existing session delivers it to a running session at its next turn boundary — or holds it (persisted by the daemon) until that session is resumed. That is the injection primitive; `butler-mcp relay` is the poller built on it:
+Codex has no in-process plugin API for submitting prompts into a conversation. What it does have is `codex queue --thread <id> --message <text>`: the CLI's shared app-server daemon delivers a queued message to a running session at its next turn boundary, or holds it until that session is resumed. `butler-mcp relay` is the poller built on that.
+
+Codex (since about 0.123) stamps `_meta.threadId` and `_meta.sessionId` (the root session) on every MCP `tools/call`. It does not pass the thread id through the environment or MCP initialize. By default each thread starts its own MCP process, but the off-by-default `mcp_connection_sharing` feature can share one process across threads, so butler-mcp keys the Butler identity on the per-call thread id rather than on the process. This is enabled only when the registered kind is `codex`; OpenCode, Pi and DeepSeek keep the single identity from startup.
+
+- The first Butler tool call in a root thread (`threadId` equal to `sessionId`, or `sessionId` absent) registers an identity whose `client_session` is that thread id — same kind, hostname and workdir, its own UUID and instance token. Resume is the same thread id, so the same identity. A fork is a new thread id and a new identity.
+- A sub-agent call (`threadId` different from `sessionId`) does not get its own roster row. The call acts as the root thread, and the relay queues to that root, because `codex queue` rejects many sub-agent threads.
+- The process keeps a thread → token map and uses that token for the call, with a separate wait cursor per identity. Two Codex sessions in one workdir no longer revoke each other's tokens. A 401 on a thread call adopts a newer token already written to the state file, or re-registers once.
+- The binding is written to `<workdir>/.butler/codex/<threadId>.json` (`agent`, `token`, `server`, `kind`, `thread_id`, `session_id`, `pid`, mode 0600). `<workdir>/.butler/instance.json` is still written for the app-level identity, so an older relay and the other harnesses keep working.
+
+The relay watches `.butler/codex/`. One long-poll per state file queues with `codex queue --thread <that id>`. Messages are still grouped into one prompt per batch, framed `ADDRESSED TO YOU (reply expected):` or `FYI:`. A failed queue does not advance that loop's cursor (at-least-once). A 401 re-reads the state file. When no thread file is bound — Codex before thread ids existed in `_meta`, or no thread has called a Butler tool yet — the relay falls back to `instance.json` and the previous guess: the newest rollout under `~/.codex/sessions/` whose recorded cwd matches the workdir. As soon as any thread is bound, that guess stops, so a newer `codex exec` rollout does not steal delivery.
 
 ```
 panel / opencode / another agent
         │ message (seq N)
         ▼
-   butler server ──► butler-mcp relay (long-poll, identity from the state file)
-                            │ new message arrives
+   butler server ──► one long-poll per bound Codex thread
+                            │
                             ▼
-                  codex queue --thread <most-recently-active-session-for-the-workdir>
+                  codex queue --thread <the thread that registered>
                             ▼
-                  codex session picks it up (live) or gets it on resume
+                  that Codex thread (live, or on resume)
 ```
 
-Setup — two pieces, both per working directory:
+A thread is not bound until its first Butler tool call. Codex does not tell us the thread id at process start. The MCP instructions for the `codex` kind ask the agent to call `list_sessions` once at session start (or `get_context` on the `global` session). That is best-effort: anything sent before that call cannot be routed to the thread, and a thread that never calls a Butler tool is invisible to the relay.
 
-1. Wire the MCP server into `~/.codex/config.toml` (above). Every codex start registers the identity for its launch directory and writes `<workdir>/.butler/instance.json`.
-2. Run the relay for that directory:
+Setup, per working directory:
+
+1. Wire the MCP server into `~/.codex/config.toml` (above), kind `codex`. Startup still registers the app-level identity and writes `instance.json`. The per-thread file appears on the first Butler tool call.
+2. Run one relay for that directory:
 
 ```
 ./butler-mcp relay --workdir /path/to/project
 ```
 
-The relay never registers: it reuses the identity + instance token from the state file (the last codex registration owns it), long-polls `/api/v1/wait` with the same cursor semantics as the OpenCode plugin (initialized to *now*, no history replay, skips its own and `system` messages, re-reads the state file on 401 token rotation), and on each new message finds the target thread by scanning `~/.codex/sessions/` for the **most recently modified rollout whose recorded cwd matches the workdir** — the codex analogue of "most recently active session". Messages are grouped per butler session into one queued prompt, framed mention-aware: `ADDRESSED TO YOU (reply expected):` for messages that @-mention the agent, `FYI:` for the rest. Failed delivery (e.g. codex has never run in that directory) does not advance the cursor: the batch is retried until a target exists.
+`--thread <id>` relays only that bound thread (or, when nothing is bound, pins the fallback). `--state-file` relays one file; with that flag, `--thread` overrides the id stored in the file. `--codex-home` / `--codex-bin` locate the CLI, `--once` delivers one batch per thread currently bound and exits. Keep it running with launchd (see `deploy/com.butler.relay.example.plist`).
 
-Useful flags: `--thread <id>` pins an explicit session, `--codex-home`/`--codex-bin` override the CLI location, `--once` delivers a single batch and exits (testing). Keep it running with launchd (see `deploy/com.butler.relay.example.plist`).
+The panel groups the threads the way it groups OpenCode roles: one teammate per Codex install in the project, the live or most recently seen thread. `@codex` still reaches every Codex participant in the room, and each thread's loop delivers into that thread.
 
 Caveats:
 
-- One relay per working directory (one butler identity each). Run several for several projects.
-- The relay targets whatever codex session was most recently active in the directory — if you have moved on to a different project, the message queues into the old session and surfaces when you resume it.
-- `codex queue` works for any session recorded under `~/.codex/sessions`, but delivery into a *running* session needs that session to be connected to the shared daemon (CLI TUI and `codex exec` are; check your setup for app-hosted sessions).
+- One relay per working directory. It picks up new thread files while it runs. Two relays for one directory would each queue every message.
+- `codex queue` rejects ephemeral threads (a `codex exec` that is not a resumable session) and many sub-agent threads. That loop retries the batch and does not block the others. A queued message for a thread the daemon has not loaded is delivered when the thread resumes.
+- Delivery into a *running* session needs that session connected to the shared app-server daemon (the CLI TUI is; a headless `codex exec` may fail for account or model reasons that have nothing to do with queueing).
+- Two Codex processes still replace the shared app-level token on startup. Tool calls after the first thread bind do not use that token. OpenCode, Pi and DeepSeek are unchanged: they do not send `threadId`, and thread binding is not installed for their kinds.
 
 ### Automatic delivery into Pi (extension)
 
@@ -321,7 +333,7 @@ All endpoints take `Authorization: Bearer <token>` unless noted. Tokens: admin (
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| POST | /api/v1/register | kind or instance | exchange a kind token + `{hostname, workdir}` for a stable agent UUID and an instance token; with an instance token, `{client_session, display_name}` registers a per-session **sibling** of the caller's identity (labeled with the title). Re-registering an identity replaces its previous instance (old token revoked, sessions notified; sibling replacement is silent) |
+| POST | /api/v1/register | kind or instance | exchange a kind token + `{hostname, workdir}` for a stable agent UUID and an instance token. Optional `client_session` (a Codex thread id) is part of the registration key and mints that thread's identity. With an instance token, `{client_session, display_name}` registers a per-session **sibling** of the caller (the OpenCode path, labeled with the title). Re-registering replaces the previous instance token; the reconnect notice is posted only when `client_session` is empty |
 | POST | /api/v1/kinds | admin | create kind; the single kind token is returned once |
 | GET | /api/v1/kinds | any non-kind | list kinds |
 | POST | /api/v1/kinds/{id}/rotate | admin | reissue kind token (new registrations only) |

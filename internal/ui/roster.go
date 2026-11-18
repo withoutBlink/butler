@@ -117,7 +117,10 @@ func groupRoster(agents []store.Agent, activity map[string]store.ActivityView, k
 		b.teams[k] = append(b.teams[k], a)
 	}
 	// An app-level identity joins its roles when that install already has
-	// some. Otherwise it is its own teammate (Codex, Pi, DeepSeek).
+	// some. Otherwise it is its own teammate (Pi, DeepSeek, or a Codex
+	// process that has not bound a thread). Codex threads register with
+	// client_session set and collapse like OpenCode roles: one teammate
+	// per install, the live or most recently seen thread.
 	var out []rosterIdentity
 	for _, dir := range projectOrder {
 		b := projects[dir]
